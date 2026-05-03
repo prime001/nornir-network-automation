@@ -1,189 +1,174 @@
 ```python
-#!/usr/bin/env python3
-"""
-Device Health Status Reporter.
+"""BGP Neighbor Summary Script
 
-Purpose:
-    Gathers and reports on device health metrics including uptime, CPU
-    utilization, interface status across a network inventory using nornir.
+Connects to network devices via Nornir and generates a comprehensive BGP neighbor
+summary report. Supports Cisco IOS/XE, Juniper, and other platforms via NAPALM.
 
 Usage:
-    python 012_device_health_status.py -i ./inventory -g core-routers
-    python 012_device_health_status.py -d router01 -v
+    python bgp_summary.py --group production --format table
+    python bgp_summary.py --devices router1 router2 --format json
 
 Prerequisites:
-    - nornir >= 3.0
-    - nornir_netmiko or nornir_napalm
-    - Network devices accessible via SSH with valid credentials configured
-      in inventory/hosts.yaml and inventory/group_vars
+    - Nornir inventory configured at ./nornir_config.yaml or NORNIR_CONFIG_FILE env var
+    - Device credentials configured in inventory
+    - NAPALM driver installed for target device types
+    - Python packages: nornir, napalm, pyyaml
+
+Output:
+    - Displays BGP neighbor status, uptime, and route counts
+    - Supports table (human-readable) and JSON formats
+    - Returns exit code 0 on success, 1 on failure
 """
 
-import argparse
+import json
 import logging
+import argparse
+from typing import Dict, Any
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir.plugins.tasks.napalm import napalm_get
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def gather_health(task):
-    """Collect device health metrics: uptime, CPU, interfaces."""
-    host = task.host.name
-    metrics = {'device': host, 'status': 'down'}
-
+def get_bgp_neighbors(task) -> Dict[str, Any]:
+    """Retrieve BGP neighbors using NAPALM getter."""
     try:
-        r1 = task.run(netmiko_send_command, command_string='show version')
-        r2 = task.run(netmiko_send_command, command_string='show processes cpu')
-        r3 = task.run(netmiko_send_command, command_string='show interfaces brief')
-
-        metrics['status'] = 'up'
-        metrics['uptime'] = parse_uptime(r1.result)
-        metrics['cpu'] = parse_cpu(r2.result)
-        metrics['interfaces'] = count_interfaces(r3.result)
-        metrics['health'] = calculate_score(metrics)
-
+        result = task.run(napalm_get, getters=["bgp_neighbors"])
+        return result.result.get("bgp_neighbors", {})
     except Exception as e:
-        logger.error(f"{host}: {e}")
-        metrics['error'] = str(e)
-
-    return metrics
+        logger.error(f"Failed to get BGP neighbors: {e}")
+        return {}
 
 
-def parse_uptime(output):
-    """Extract uptime information from show version output."""
-    for line in output.split('\n'):
-        if 'uptime' in line.lower():
-            return line.strip()
-    return 'unknown'
+def print_table_format(device: str, bgp_data: Dict[str, Any]) -> None:
+    """Print BGP data in table format."""
+    if not bgp_data:
+        logger.warning(f"{device}: No BGP data available")
+        return
+
+    print(f"\n{'='*110}")
+    print(f"BGP Summary: {device}")
+    print(f"{'='*110}")
+    print(f"{'ASN':<12} {'Neighbor':<18} {'State':<15} {'Uptime':<20} "
+          f"{'IPv4 PFX':<12} {'IPv6 PFX':<12}")
+    print("-" * 110)
+
+    for asn, neighbors in bgp_data.items():
+        for peer_ip, peer_data in neighbors.items():
+            state = "UP" if peer_data.get("up", False) else "DOWN"
+            uptime = str(peer_data.get("uptime", "N/A"))
+
+            address_families = peer_data.get("address_family", {})
+            ipv4_pfx = address_families.get("ipv4", {}).get("sent_prefixes", 0)
+            ipv6_pfx = address_families.get("ipv6", {}).get("sent_prefixes", 0)
+
+            print(f"{asn:<12} {peer_ip:<18} {state:<15} {uptime:<20} "
+                  f"{ipv4_pfx:<12} {ipv6_pfx:<12}")
+
+    print("=" * 110)
 
 
-def parse_cpu(output):
-    """Extract CPU usage percentage from show processes cpu output."""
-    for line in output.split('\n'):
-        if '%' in line:
-            try:
-                return float(line.split()[-1].replace('%', ''))
-            except (ValueError, IndexError):
-                pass
-    return 0.0
+def print_json_format(device: str, bgp_data: Dict[str, Any]) -> None:
+    """Print BGP data in JSON format."""
+    output = {
+        "device": device,
+        "bgp_neighbors": bgp_data
+    }
+    print(json.dumps(output, indent=2, default=str))
 
 
-def count_interfaces(output):
-    """Count up/down interfaces from show interfaces brief output."""
-    lines = [
-        l for l in output.split('\n')
-        if l.strip() and ('up' in l or 'down' in l)
-    ]
-    up_count = sum(1 for l in lines if l.rstrip().endswith('up'))
-    down_count = sum(1 for l in lines if l.rstrip().endswith('down'))
-    return {'up': up_count, 'down': down_count}
-
-
-def calculate_score(metrics):
-    """Calculate device health score (0-100) based on collected metrics."""
-    if metrics['status'] == 'down':
-        return 0
-
-    score = 100
-    cpu = metrics.get('cpu', 0)
-    if cpu > 80:
-        score -= 30
-    elif cpu > 60:
-        score -= 15
-
-    interfaces = metrics.get('interfaces', {})
-    score -= interfaces.get('down', 0) * 10
-
-    return max(0, score)
-
-
-def main():
-    """Main entry point for device health checker."""
+def main() -> int:
+    """Execute BGP summary retrieval and reporting."""
     parser = argparse.ArgumentParser(
-        description='Collect and report device health metrics'
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        '-i', '--inventory-dir',
-        default='./inventory',
-        help='Path to nornir inventory directory'
+        "--group",
+        type=str,
+        help="Filter devices by inventory group"
     )
     parser.add_argument(
-        '-g', '--groups',
-        help='Filter by device groups (comma-separated)'
+        "--devices",
+        nargs="+",
+        help="Specific device names (space-separated)"
     )
     parser.add_argument(
-        '-d', '--device',
-        help='Target specific device by name'
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)"
     )
     parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='Enable verbose logging'
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable debug logging"
     )
+
     args = parser.parse_args()
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+
+    if not args.group and not args.devices:
+        logger.error("Specify either --group or --devices")
+        parser.print_help()
+        return 1
 
     try:
-        nr = InitNornir(config_file=f'{args.inventory_dir}/config.yaml')
+        nr = InitNornir(config_file="nornir_config.yaml")
 
-        if args.device:
-            nr = nr.filter(name=args.device)
-        elif args.groups:
-            groups = [g.strip() for g in args.groups.split(',')]
-            nr = nr.filter(F(groups__contains=groups))
+        if args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+        else:
+            nr = nr.filter(F(name__in=args.devices))
 
-        logger.info(f"Checking {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=gather_health)
+        if len(nr.inventory.hosts) == 0:
+            logger.error("No devices matched selection criteria")
+            return 1
 
-        print('\n' + '='*75)
-        print('DEVICE HEALTH REPORT')
-        print('='*75)
+        logger.info(f"Processing {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=get_bgp_neighbors)
 
-        healthy = warning = critical = 0
+        failed_count = 0
+        success_count = 0
 
-        for host_name, host_result in results.items():
-            metrics = host_result[0].result
-            status = metrics.get('status', 'unknown')
-            health = metrics.get('health', 0)
-            cpu = metrics.get('cpu', 0)
-            interfaces = metrics.get('interfaces', {})
+        for device_name in results.keys():
+            task_result = results[device_name]
 
-            if health >= 80:
-                icon = '✓'
-                healthy += 1
-            elif health >= 50:
-                icon = '⚠'
-                warning += 1
+            if task_result.failed:
+                logger.error(f"{device_name}: Task failed")
+                failed_count += 1
+                continue
+
+            bgp_data = task_result[0].result
+
+            if args.format == "table":
+                print_table_format(device_name, bgp_data)
             else:
-                icon = '✗'
-                critical += 1
+                print_json_format(device_name, bgp_data)
 
-            up_count = interfaces.get('up', 0)
-            down_count = interfaces.get('down', 0)
+            success_count += 1
 
-            print(
-                f'{icon} {host_name:20} {status:8} score={health:3d} '
-                f'cpu={cpu:5.1f}% up={up_count:2d} down={down_count:2d}'
-            )
+        logger.info(f"Completed: {success_count} succeeded, {failed_count} failed")
 
-        print('='*75)
-        print(
-            f'Summary: {healthy} healthy, {warning} warning, {critical} critical'
-        )
-        print('='*75 + '\n')
+        return 0 if failed_count == 0 else 1
 
+    except FileNotFoundError:
+        logger.error("Nornir config file not found (nornir_config.yaml)")
+        return 1
     except Exception as e:
-        logger.error(f'Fatal error: {e}', exc_info=args.verbose)
-        exit(1)
+        logger.error(f"Unexpected error: {e}", exc_info=args.verbose)
+        return 1
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    exit(main())
 ```
