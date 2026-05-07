@@ -1,179 +1,206 @@
 ```python
 """
-Device Inventory & Version Tracking
+Device Health Monitor
 
-Gathers device facts (vendor, model, OS version, serial) to track
-hardware/software versions and identify mismatches across the network.
-Useful for planning upgrades and compliance verification.
-
-Prerequisites:
-  - Nornir configured with valid inventory
-  - Devices support NAPALM 'facts' getter
-  - SSH credentials configured in Nornir
+Collects and analyzes health metrics (CPU, memory, temperature, uptime) from
+network devices using NAPALM. Generates reports and alerts when thresholds
+are exceeded.
 
 Usage:
-  python script.py --config config.yaml
-  python script.py --group core --output inventory.json
-  python script.py --vendor cisco --verbose
+    python 031_device_health_monitor.py --inventory inventory.yml --warn-cpu 75
+
+Prerequisites:
+    - nornir configured with NAPALM driver
+    - Device SSH connectivity
+    - YAML inventory file with device groups
 """
 
-import logging
 import argparse
-import json
-from datetime import datetime
-from collections import defaultdict
+import logging
+from pathlib import Path
+from typing import Dict, Any, List
+
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.core.task import Task, Result
+from nornir_napalm.plugins.tasks import napalm_get
 
 
 logger = logging.getLogger(__name__)
 
 
-def gather_device_facts(task):
-    """Retrieve device facts from target device."""
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging output."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+
+def collect_health_metrics(task: Task) -> Result:
+    """Gather device facts and environment data via NAPALM."""
+    return task.run(
+        napalm_get,
+        getters=["facts", "environment"],
+        severity_level=logging.WARNING,
+    )
+
+
+def analyze_health(
+    device: str,
+    data: Dict[str, Any],
+    warn_cpu: int,
+    crit_cpu: int,
+    warn_mem: int,
+    crit_mem: int,
+) -> Dict[str, Any]:
+    """Analyze health metrics against thresholds."""
+    analysis = {"device": device, "status": "healthy", "alerts": [], "metrics": {}}
+    
     try:
-        result = task.run(napalm_get, getters=["facts"])
-        facts = result[0].result.get("facts", {})
-        logger.info(f"{task.host.name}: Successfully gathered facts")
-        return {
-            "ip": task.host.hostname,
-            "vendor": facts.get("vendor", "unknown"),
-            "model": facts.get("model", "unknown"),
-            "os_version": facts.get("os_version", "unknown"),
-            "serial": facts.get("serial_number", "unknown"),
-            "uptime": facts.get("uptime_seconds", 0),
-        }
-    except Exception as e:
-        logger.error(f"{task.host.name}: {str(e)}")
-        return {
-            "ip": task.host.hostname,
-            "error": str(e),
-        }
+        facts = data.get("facts", {})
+        env = data.get("environment", {})
+        
+        # Uptime
+        uptime_sec = facts.get("uptime", 0)
+        analysis["metrics"]["uptime_days"] = round(uptime_sec / 86400, 2)
+        
+        # Temperature checks
+        if "temperature" in env:
+            for sensor, info in env["temperature"].items():
+                if isinstance(info, dict) and info.get("is_alert"):
+                    analysis["status"] = "warning"
+                    analysis["alerts"].append(
+                        f"Temperature alert: {sensor} at {info.get('current_temperature')}°C"
+                    )
+        
+        # CPU checks
+        if "cpu" in env:
+            for cpu_name, util_dict in env["cpu"].items():
+                if isinstance(util_dict, dict):
+                    util = util_dict.get("%usage", 0)
+                    analysis["metrics"][f"cpu_{cpu_name}"] = util
+                    
+                    if util >= crit_cpu:
+                        analysis["status"] = "critical"
+                        analysis["alerts"].append(f"CPU {cpu_name} critical: {util}%")
+                    elif util >= warn_cpu and analysis["status"] != "critical":
+                        analysis["status"] = "warning"
+                        analysis["alerts"].append(f"CPU {cpu_name} warning: {util}%")
+        
+        # Memory checks
+        if "memory" in env:
+            mem_dict = env["memory"]
+            if isinstance(mem_dict, dict):
+                used = mem_dict.get("used_ram", 0)
+                total = mem_dict.get("total_ram", 1)
+                mem_pct = (used / total * 100) if total > 0 else 0
+                analysis["metrics"]["memory_used_pct"] = round(mem_pct, 1)
+                
+                if mem_pct >= crit_mem:
+                    analysis["status"] = "critical"
+                    analysis["alerts"].append(f"Memory critical: {mem_pct:.1f}%")
+                elif mem_pct >= warn_mem and analysis["status"] != "critical":
+                    analysis["status"] = "warning"
+                    analysis["alerts"].append(f"Memory warning: {mem_pct:.1f}%")
+    
+    except (KeyError, TypeError, ZeroDivisionError) as e:
+        logger.warning(f"Error parsing data for {device}: {e}")
+        analysis["status"] = "unknown"
+    
+    return analysis
 
 
-def collect_inventory(nr):
-    """Collect inventory data from all devices in inventory."""
-    inventory = {}
+def generate_report(analyses: List[Dict[str, Any]], output_file: str = None) -> str:
+    """Generate formatted health report."""
+    report = "=" * 75 + "\n" + "DEVICE HEALTH REPORT\n" + "=" * 75 + "\n\n"
     
-    for device_name, device in nr.inventory.hosts.items():
-        logger.debug(f"Processing {device_name}")
-        from nornir.core.task import Task
+    counts = {"healthy": 0, "warning": 0, "critical": 0, "unknown": 0}
+    
+    for a in analyses:
+        counts[a["status"]] += 1
+        symbol = "✓" if a["status"] == "healthy" else "⚠" if a["status"] == "warning" else "✗"
         
-        task = Task(name="gather_facts")
-        task.host = device
-        facts = gather_device_facts(task)
-        
-        inventory[device_name] = facts
+        report += f"{symbol} {a['device']:<20} [{a['status'].upper()}]\n"
+        for alert in a["alerts"]:
+            report += f"    {alert}\n"
+        if a["metrics"]:
+            report += f"    Uptime: {a['metrics'].get('uptime_days', 0):.1f} days\n"
+        report += "\n"
     
-    return inventory
-
-
-def generate_report(inventory, vendor_filter=None):
-    """Generate formatted inventory report."""
-    print("\n" + "="*80)
-    print("NETWORK DEVICE INVENTORY REPORT")
-    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*80)
+    report += "=" * 75 + "\n"
+    report += f"Summary: {counts['healthy']} healthy, {counts['warning']} warning, "
+    report += f"{counts['critical']} critical, {counts['unknown']} unknown\n"
+    report += "=" * 75 + "\n"
     
-    by_vendor = defaultdict(list)
-    by_version = defaultdict(list)
-    errors = []
+    if output_file:
+        Path(output_file).write_text(report)
+        logger.info(f"Report saved to {output_file}")
     
-    for device, data in inventory.items():
-        if "error" in data:
-            errors.append((device, data["error"]))
-            continue
-        
-        vendor = data.get("vendor", "unknown")
-        if vendor_filter and vendor.lower() != vendor_filter.lower():
-            continue
-        
-        by_vendor[vendor].append((device, data))
-        by_version[data.get("os_version", "unknown")].append(device)
-    
-    # Device listing by vendor
-    for vendor in sorted(by_vendor.keys()):
-        devices = by_vendor[vendor]
-        print(f"\n{vendor.upper()} ({len(devices)} devices)")
-        print("-" * 80)
-        
-        for device, data in devices:
-            print(f"  {device:20} {data['model']:20} {data['os_version']:15} "
-                  f"{data['serial']}")
-    
-    # Version distribution
-    if by_version:
-        print("\n" + "="*80)
-        print("OS VERSION DISTRIBUTION")
-        print("="*80)
-        
-        for version in sorted(by_version.keys(), 
-                              key=lambda v: len(by_version[v]), reverse=True):
-            count = len(by_version[version])
-            pct = (count / (len(inventory) - len(errors))) * 100
-            print(f"  {version:30} {count:3} devices ({pct:5.1f}%)")
-    
-    # Error summary
-    if errors:
-        print("\n" + "="*80)
-        print(f"ERRORS ({len(errors)} devices)")
-        print("="*80)
-        
-        for device, error in errors:
-            print(f"  {device:20} {error}")
-    
-    print("\n" + "="*80 + "\n")
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Monitor device health metrics across network infrastructure"
     )
-    parser.add_argument("--config", "-c", default="config.yaml",
-                        help="Nornir config file (default: config.yaml)")
-    parser.add_argument("--group", "-g", 
-                        help="Filter devices by group (e.g., core, access)")
-    parser.add_argument("--vendor", "-v",
-                        help="Filter report by vendor (e.g., cisco, juniper)")
-    parser.add_argument("--output", "-o",
-                        help="Export inventory to JSON file")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
+    parser.add_argument(
+        "-i", "--inventory", default="inventory.yml", help="Inventory file path"
+    )
+    parser.add_argument("-f", "--filter", help="Filter devices by name pattern")
+    parser.add_argument("--warn-cpu", type=int, default=75, help="CPU warning %%")
+    parser.add_argument("--crit-cpu", type=int, default=90, help="CPU critical %%")
+    parser.add_argument("--warn-mem", type=int, default=80, help="Memory warning %%")
+    parser.add_argument("--crit-mem", type=int, default=95, help="Memory critical %%")
+    parser.add_argument("-o", "--output", help="Output file for report")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     
     args = parser.parse_args()
-    
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
+    setup_logging(args.verbose)
     
     try:
-        logger.info(f"Loading Nornir config: {args.config}")
-        nr = InitNornir(config_file=args.config)
+        nr = InitNornir(config_file=args.inventory)
+        if args.filter:
+            nr = nr.filter(name=args.filter)
         
-        if args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-            logger.info(f"Filtered to group '{args.group}'")
+        if not nr.inventory.hosts:
+            logger.error(f"No devices match filter: {args.filter}")
+            return 1
         
-        logger.info(f"Collecting facts from {len(nr.inventory.hosts)} devices")
-        inventory = collect_inventory(nr)
+        logger.info(f"Collecting health from {len(nr.inventory.hosts)} devices...")
+        results = nr.run(task=collect_health_metrics)
         
-        generate_report(inventory, args.vendor)
+        analyses = []
+        for device_name, task_result in results.items():
+            if task_result[0].failed:
+                logger.error(f"Failed to collect from {device_name}")
+                analyses.append({
+                    "device": device_name,
+                    "status": "unknown",
+                    "alerts": ["Collection failed"],
+                    "metrics": {},
+                })
+            else:
+                analysis = analyze_health(
+                    device_name,
+                    task_result[0].result,
+                    args.warn_cpu,
+                    args.crit_cpu,
+                    args.warn_mem,
+                    args.crit_mem,
+                )
+                analyses.append(analysis)
         
-        if args.output:
-            with open(args.output, "w") as f:
-                json.dump(inventory, f, indent=2)
-            logger.info(f"Inventory exported to {args.output}")
+        report = generate_report(analyses, args.output)
+        print(report)
         
-        return 0
+        critical_count = sum(1 for a in analyses if a["status"] == "critical")
+        warning_count = sum(1 for a in analyses if a["status"] == "warning")
         
-    except FileNotFoundError as e:
-        logger.error(f"Config file not found: {e}")
-        return 1
+        return 2 if critical_count > 0 else (1 if warning_count > 0 else 0)
+    
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
+        logger.error(f"Execution failed: {e}", exc_info=args.verbose)
         return 1
 
 
