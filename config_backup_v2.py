@@ -1,28 +1,27 @@
-The write was blocked by permissions. Here's the script content:
+config_diff.py — Nornir configuration change detection and unified diff reporter.
 
-```python
-"""
-Config Backup with Change Detection and Rotation
-
-Backs up running configurations from network devices using NAPALM, compares
-each backup against the previous version via MD5 checksum, and only writes
-a new timestamped archive when the config has actually changed.  A summary
-report is printed at the end listing which devices changed, which were
-unchanged, and which failed.
+Purpose:
+    Connects to network devices, retrieves their running configurations, and
+    compares them against previously saved baselines. Reports a unified diff
+    for every device where the configuration has changed since the last run.
+    Useful for detecting unauthorized changes, auditing drift, or validating
+    that a change window actually modified what was intended.
 
 Usage:
-    python 034_config_backup.py --inventory hosts.yaml --groups-file groups.yaml \
-        --backup-dir ./backups --keep 10 [--filter-group core_routers]
+    python config_diff.py --inventory config.yaml --baseline-dir ./baselines
+    python config_diff.py --inventory config.yaml --baseline-dir ./baselines --save
+    python config_diff.py --inventory config.yaml --filter site=dc1 --report-file changes.txt
 
 Prerequisites:
-    pip install nornir nornir-napalm napalm
-    Inventory files: hosts.yaml, groups.yaml, defaults.yaml (standard Nornir layout)
+    pip install nornir nornir-netmiko nornir-utils
+    A nornir inventory (config.yaml referencing hosts.yaml / groups.yaml /
+    defaults.yaml) targeting devices that respond to 'show running-config'.
+    Run once with --save to establish the initial baseline.
 """
 
 import argparse
-import hashlib
+import difflib
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,137 +29,165 @@ from pathlib import Path
 from nornir import InitNornir
 from nornir.core.filter import F
 from nornir.core.task import Result, Task
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger("config_backup")
+logger = logging.getLogger(__name__)
 
 
-def _md5(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+def fetch_running_config(task: Task) -> Result:
+    result = task.run(
+        task=netmiko_send_command,
+        command_string="show running-config",
+        use_textfsm=False,
+    )
+    return Result(host=task.host, result=result.result)
 
 
-def _latest_backup(device_dir: Path) -> Path | None:
-    backups = sorted(device_dir.glob("*.cfg"))
-    return backups[-1] if backups else None
+def load_baseline(host_name: str, baseline_dir: Path) -> str | None:
+    path = baseline_dir / f"{host_name}.cfg"
+    return path.read_text(encoding="utf-8") if path.exists() else None
 
 
-def _rotate(device_dir: Path, keep: int) -> None:
-    backups = sorted(device_dir.glob("*.cfg"))
-    for old in backups[:-keep]:
-        old.unlink()
-        log.debug("Rotated out %s", old)
+def save_baseline(host_name: str, config: str, baseline_dir: Path) -> None:
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    path = baseline_dir / f"{host_name}.cfg"
+    path.write_text(config, encoding="utf-8")
+    logger.info("Saved baseline: %s", path)
 
 
-def backup_config(task: Task, backup_dir: Path, keep: int) -> Result:
-    device_dir = backup_dir / task.host.name
-    device_dir.mkdir(parents=True, exist_ok=True)
-
-    result = task.run(task=napalm_get, getters=["config"])
-    running = result[0].result["config"].get("running", "")
-
-    if not running:
-        return Result(host=task.host, result="empty", failed=True)
-
-    current_md5 = _md5(running)
-    latest = _latest_backup(device_dir)
-
-    if latest:
-        prev_md5 = _md5(latest.read_text())
-        if current_md5 == prev_md5:
-            return Result(host=task.host, result="unchanged")
-
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    backup_path = device_dir / f"{ts}.cfg"
-    backup_path.write_text(running)
-    _rotate(device_dir, keep)
-
-    return Result(host=task.host, result=f"saved:{backup_path}")
+def compute_diff(old: str, new: str, host_name: str) -> list[str]:
+    return list(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"{host_name}/baseline",
+            tofile=f"{host_name}/current",
+        )
+    )
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Nornir config backup with change detection")
-    p.add_argument("--inventory", default="hosts.yaml", help="Path to hosts inventory file")
-    p.add_argument("--groups-file", default="groups.yaml", help="Path to groups file")
-    p.add_argument("--defaults-file", default="defaults.yaml", help="Path to defaults file")
-    p.add_argument("--backup-dir", default="./backups", help="Root directory for backups")
-    p.add_argument("--keep", type=int, default=10, help="Number of backup revisions to retain per device")
-    p.add_argument("--filter-group", help="Only back up hosts in this Nornir group")
-    p.add_argument("--workers", type=int, default=10, help="Parallel worker threads")
-    p.add_argument("--debug", action="store_true")
-    return p.parse_args(argv)
+def run_diff(args: argparse.Namespace) -> int:
+    baseline_dir = Path(args.baseline_dir)
+    diff_sections: list[str] = []
+    changed: list[str] = []
+    unchanged: list[str] = []
+    new_devices: list[str] = []
+    errors: list[str] = []
+
+    nr = InitNornir(config_file=args.inventory)
+
+    if args.filter:
+        key, _, value = args.filter.partition("=")
+        nr = nr.filter(F(**{key: value}))
+
+    logger.info("Connecting to %d device(s)...", len(nr.inventory.hosts))
+    results = nr.run(task=fetch_running_config)
+
+    for host_name, multi_result in results.items():
+        if multi_result.failed:
+            logger.error("Failed to retrieve config from %s", host_name)
+            errors.append(host_name)
+            continue
+
+        current_config: str = multi_result[0].result or ""
+        if not current_config.strip():
+            logger.warning("Empty config returned from %s", host_name)
+            errors.append(host_name)
+            continue
+
+        baseline = load_baseline(host_name, baseline_dir)
+
+        if baseline is None:
+            new_devices.append(host_name)
+            logger.info("No baseline for %s — treating as new device", host_name)
+            if args.save:
+                save_baseline(host_name, current_config, baseline_dir)
+            continue
+
+        diff = compute_diff(baseline, current_config, host_name)
+
+        if diff:
+            changed.append(host_name)
+            diff_sections.append(f"\n{'=' * 60}")
+            diff_sections.append(f"CHANGED: {host_name}")
+            diff_sections.append(f"{'=' * 60}")
+            diff_sections.extend(diff)
+            if args.save:
+                save_baseline(host_name, current_config, baseline_dir)
+        else:
+            unchanged.append(host_name)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    summary_lines = [
+        f"\n{'=' * 60}",
+        f"Config Diff Report — {timestamp}",
+        f"{'=' * 60}",
+        f"  Changed  : {len(changed):>3}  {', '.join(changed) or '—'}",
+        f"  Unchanged: {len(unchanged):>3}",
+        f"  New      : {len(new_devices):>3}  {', '.join(new_devices) or '—'}",
+        f"  Errors   : {len(errors):>3}  {', '.join(errors) or '—'}",
+    ]
+
+    if diff_sections:
+        print("".join(diff_sections))
+    print("\n".join(summary_lines))
+
+    if args.report_file:
+        report_path = Path(args.report_file)
+        report_path.write_text(
+            "\n".join(summary_lines) + "\n" + "".join(diff_sections),
+            encoding="utf-8",
+        )
+        logger.info("Report written to %s", report_path)
+
+    return 1 if (changed or errors) else 0
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Detect and report running-config drift across network devices."
+    )
+    parser.add_argument(
+        "--inventory",
+        default="config.yaml",
+        help="Nornir config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        default="./baselines",
+        help="Directory of baseline .cfg files (default: ./baselines)",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Update baselines with current configs after comparing",
+    )
+    parser.add_argument(
+        "--filter",
+        metavar="KEY=VALUE",
+        help="Filter inventory by host attribute, e.g. site=dc1",
+    )
+    parser.add_argument(
+        "--report-file",
+        metavar="PATH",
+        help="Write the full diff report to a file",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    for f in (args.inventory, args.groups_file, args.defaults_file):
-        if not os.path.exists(f):
-            log.error("Required file not found: %s", f)
-            sys.exit(1)
-
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.inventory,
-                "group_file": args.groups_file,
-                "defaults_file": args.defaults_file,
-            },
-        },
-    )
-
-    if args.filter_group:
-        nr = nr.filter(F(groups__contains=args.filter_group))
-
-    if not nr.inventory.hosts:
-        log.error("No hosts matched the inventory / filter")
-        sys.exit(1)
-
-    log.info("Starting backup for %d host(s)", len(nr.inventory.hosts))
-    backup_dir = Path(args.backup_dir)
-
-    results = nr.run(task=backup_config, backup_dir=backup_dir, keep=args.keep)
-
-    saved, unchanged, failed = [], [], []
-    for host, multi in results.items():
-        agg = multi[0]
-        if agg.failed:
-            failed.append(host)
-        elif isinstance(agg.result, str) and agg.result.startswith("saved:"):
-            saved.append((host, agg.result.split(":", 1)[1]))
-        else:
-            unchanged.append(host)
-
-    print("\n=== Backup Summary ===")
-    print(f"Changed   ({len(saved)}): {', '.join(h for h, _ in saved) or 'none'}")
-    print(f"Unchanged ({len(unchanged)}): {', '.join(unchanged) or 'none'}")
-    print(f"Failed    ({len(failed)}): {', '.join(failed) or 'none'}")
-
-    if saved:
-        print("\nNew backup paths:")
-        for host, path in saved:
-            print(f"  {host}: {path}")
-
-    return 1 if failed else 0
+    sys.exit(run_diff(args))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-```
-
-Key design choices that differentiate this from the existing 004/014/024 backup scripts:
-
-- **MD5 change detection** — skips writing if running config hasn't changed since the last backup, avoiding noise in the archive
-- **Timestamped rotation** — backups named `20260429T120000Z.cfg`, kept to `--keep` (default 10) revisions per device
-- **Tri-state summary** — explicitly reports changed / unchanged / failed at the end, useful for cron job output
-- **NAPALM via `napalm_get`** — pulls structured config, works across IOS/EOS/NXOS/JunOS without per-vendor commands
-- **`--filter-group`** — lets you target a subset of inventory (e.g. `core_routers`) without editing the inventory file
+    main()
