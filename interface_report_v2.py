@@ -1,48 +1,50 @@
-Now I'll write the script. Since 003 and 013 are already interface reports, I'll make 023 focused on error-threshold monitoring with multi-format export — a distinct, practical use case.
+All three existing scripts are: basic status (003), neighbor discovery (013), error-threshold monitoring (023). I'll write 033 as an **interface flap detection and stability scorer** using NAPALM's `last_flapped` data — a distinct operational use case.
 
 ```python
 """
-023_interface_report.py — Interface Error Threshold Monitor
+033_interface_report.py — Interface Flap Detection and Stability Analysis
 
 Purpose:
-    Polls network devices via NAPALM/Nornir and reports interface error
-    counters (input errors, output errors, CRC errors, resets, discards).
-    Flags any interface whose error rate exceeds configurable thresholds.
-    Useful for proactive fault detection before circuits fully degrade.
+    Polls network devices via NAPALM and reports interface stability based on
+    last-flap time. Categorizes each interface into stability tiers (stable,
+    degraded, critical) and optionally runs two timed polls to catch live
+    flaps in a narrow observation window. Useful for identifying unstable links
+    that are currently up but causing intermittent user impact.
 
 Usage:
-    # Single device, print table
-    python 023_interface_report.py --host 192.168.1.1 --username admin
+    # Single device, print stability table
+    python 033_interface_report.py --host 192.168.1.1 --username admin
 
-    # Multiple hosts from inventory, export CSV
-    python 023_interface_report.py --inventory hosts.yaml \
-        --group core-routers --output csv --out-file errors.csv
+    # Show only interfaces that flapped within the last 4 hours
+    python 033_interface_report.py --host 192.168.1.1 --username admin \
+        --window-hours 4 --unstable-only
 
-    # Raise alert threshold to 0.5% error rate
-    python 023_interface_report.py --host 192.168.1.1 \
-        --username admin --error-pct 0.5
+    # Two-poll live-flap detection with 60-second interval
+    python 033_interface_report.py --host 192.168.1.1 --username admin \
+        --live-poll --poll-interval 60
 
-    # Only show interfaces with errors above threshold (quiet mode)
-    python 023_interface_report.py --host 192.168.1.1 \
-        --username admin --errors-only
+    # Full inventory, export JSON
+    python 033_interface_report.py --inventory hosts.yaml \
+        --group core --output json --out-file flaps.json
 
 Prerequisites:
     pip install nornir nornir-napalm napalm tabulate
     NAPALM-compatible device (IOS, EOS, NXOS, JunOS, IOS-XR)
+    Devices must support 'last_flapped' via NAPALM get_interfaces()
 """
 
 import argparse
-import csv
 import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, asdict
-from typing import Optional
+import time
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional
 
 from nornir import InitNornir
-from nornir.core.inventory import Defaults, Host, Hosts, Groups, Group
-from nornir.core.task import Task, Result
+from nornir.core.inventory import Defaults, Groups, Host
+from nornir.core.task import Result, Task
 from nornir_napalm.plugins.tasks import napalm_get
 from tabulate import tabulate
 
@@ -50,154 +52,131 @@ logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("interface_error_monitor")
+logger = logging.getLogger("interface_flap_detector")
+
+TIER_STABLE = "STABLE"
+TIER_DEGRADED = "DEGRADED"
+TIER_CRITICAL = "CRITICAL"
+TIER_UNKNOWN = "UNKNOWN"
 
 
 @dataclass
-class InterfaceErrorRow:
+class InterfaceFlapRow:
     host: str
     interface: str
     is_up: bool
+    is_enabled: bool
     speed_mbps: Optional[float]
-    rx_errors: int
-    tx_errors: int
-    rx_discards: int
-    tx_discards: int
-    rx_packets: int
-    crc_errors: int
-    error_pct: float
-    threshold_exceeded: bool
+    last_flapped_sec: Optional[float]
+    last_flapped_hrs: Optional[float]
+    tier: str
+    live_flap_detected: bool
 
 
-def _parse_speed(speed_val) -> Optional[float]:
-    """Convert NAPALM speed value (bps or -1) to Mbps."""
-    try:
-        bps = float(speed_val)
-        return round(bps / 1_000_000, 1) if bps > 0 else None
-    except (TypeError, ValueError):
-        return None
+def _tier(last_sec: Optional[float], window_hours: float) -> str:
+    if last_sec is None or last_sec < 0:
+        return TIER_UNKNOWN
+    hours = last_sec / 3600
+    if hours < 1:
+        return TIER_CRITICAL
+    if hours < window_hours:
+        return TIER_DEGRADED
+    return TIER_STABLE
 
 
-def collect_interface_errors(task: Task, error_pct_threshold: float) -> Result:
-    results = task.run(
-        task=napalm_get,
-        getters=["interfaces", "interfaces_counters"],
-    )
+def collect_interfaces(task: Task, window_hours: float,
+                       baseline: Optional[Dict[str, float]]) -> Result:
+    r = task.run(task=napalm_get, getters=["interfaces"])
+    ifaces = r[0].result.get("interfaces", {})
 
-    interfaces = results[0].result.get("interfaces", {})
-    counters = results[0].result.get("interfaces_counters", {})
+    rows: List[InterfaceFlapRow] = []
+    for name, data in ifaces.items():
+        raw_flapped = data.get("last_flapped")
+        last_sec: Optional[float] = None
+        if raw_flapped is not None:
+            try:
+                last_sec = float(raw_flapped)
+                if last_sec < 0:
+                    last_sec = None
+            except (TypeError, ValueError):
+                pass
 
-    rows = []
-    for iface, stats in counters.items():
-        meta = interfaces.get(iface, {})
-        rx_pkts = stats.get("rx_unicast_packets", 0) or 0
-        rx_err = stats.get("rx_errors", 0) or 0
-        tx_err = stats.get("tx_errors", 0) or 0
-        rx_disc = stats.get("rx_discards", 0) or 0
-        tx_disc = stats.get("tx_discards", 0) or 0
-        crc = stats.get("rx_no_buffer", 0) or 0  # proxy; driver-dependent
+        speed = None
+        try:
+            bps = float(data.get("speed", -1))
+            if bps > 0:
+                speed = round(bps / 1_000_000, 1)
+        except (TypeError, ValueError):
+            pass
 
-        total_err = rx_err + tx_err
-        pct = (total_err / rx_pkts * 100) if rx_pkts > 0 else 0.0
+        live_flap = False
+        if baseline and last_sec is not None:
+            prev = baseline.get(f"{task.host.name}:{name}")
+            if prev is not None and last_sec < prev:
+                live_flap = True
 
-        rows.append(InterfaceErrorRow(
+        rows.append(InterfaceFlapRow(
             host=task.host.name,
-            interface=iface,
-            is_up=meta.get("is_up", False),
-            speed_mbps=_parse_speed(meta.get("speed")),
-            rx_errors=rx_err,
-            tx_errors=tx_err,
-            rx_discards=rx_disc,
-            tx_discards=tx_disc,
-            rx_packets=rx_pkts,
-            crc_errors=crc,
-            error_pct=round(pct, 4),
-            threshold_exceeded=(pct >= error_pct_threshold),
+            interface=name,
+            is_up=bool(data.get("is_up", False)),
+            is_enabled=bool(data.get("is_enabled", True)),
+            speed_mbps=speed,
+            last_flapped_sec=last_sec,
+            last_flapped_hrs=round(last_sec / 3600, 2) if last_sec is not None else None,
+            tier=_tier(last_sec, window_hours),
+            live_flap_detected=live_flap,
         ))
 
-    rows.sort(key=lambda r: (-r.error_pct, r.interface))
+    rows.sort(key=lambda r: (
+        [TIER_CRITICAL, TIER_DEGRADED, TIER_UNKNOWN, TIER_STABLE].index(r.tier),
+        r.last_flapped_sec if r.last_flapped_sec is not None else float("inf"),
+    ))
     return Result(host=task.host, result=rows)
 
 
-def build_single_host_nornir(host: str, username: str, password: str,
-                              platform: str) -> "InitNornir":
-    return InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": 1}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": None,
-                "group_file": None,
-                "defaults_file": None,
-            },
-        },
-        logging={"enabled": False},
-    )
+def build_baseline(nr) -> Dict[str, float]:
+    baseline: Dict[str, float] = {}
+    results = nr.run(task=napalm_get, getters=["interfaces"])
+    for host_name, multi in results.items():
+        if multi.failed:
+            continue
+        ifaces = multi[0].result.get("interfaces", {})
+        for name, data in ifaces.items():
+            try:
+                val = float(data.get("last_flapped", -1))
+                if val >= 0:
+                    baseline[f"{host_name}:{name}"] = val
+            except (TypeError, ValueError):
+                pass
+    return baseline
 
 
-def build_nornir_from_hosts(host: str, username: str, password: str,
-                             platform: str):
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": 1}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {"host_file": None},
-        },
-        logging={"enabled": False},
-    )
-    nr.inventory.hosts[host] = Host(
-        name=host,
-        hostname=host,
-        username=username,
-        password=password,
-        platform=platform,
-        groups=[],
-        defaults=Defaults(),
-    )
-    nr.inventory.hosts[host].groups = Groups()
-    return nr
-
-
-def print_table(rows, errors_only: bool) -> None:
-    display = [r for r in rows if r.threshold_exceeded] if errors_only else rows
+def print_table(rows: List[InterfaceFlapRow], unstable_only: bool) -> None:
+    tier_order = {TIER_CRITICAL: 0, TIER_DEGRADED: 1, TIER_UNKNOWN: 2, TIER_STABLE: 3}
+    display = [r for r in rows if r.tier in (TIER_CRITICAL, TIER_DEGRADED)] if unstable_only else rows
     if not display:
         print("No interfaces to display.")
         return
-
-    headers = ["Host", "Interface", "Up", "Speed(M)", "RxErr", "TxErr",
-               "RxDisc", "TxDisc", "RxPkts", "Err%", "!"]
+    headers = ["Host", "Interface", "Up", "En", "Speed(M)",
+               "LastFlap(h)", "Tier", "LiveFlap"]
     table = [
         [
-            r.host, r.interface, "Y" if r.is_up else "N",
-            r.speed_mbps or "-",
-            r.rx_errors, r.tx_errors, r.rx_discards, r.tx_discards,
-            r.rx_packets,
-            f"{r.error_pct:.4f}",
-            "<<" if r.threshold_exceeded else "",
+            r.host, r.interface,
+            "Y" if r.is_up else "N",
+            "Y" if r.is_enabled else "N",
+            r.speed_mbps if r.speed_mbps is not None else "-",
+            f"{r.last_flapped_hrs:.2f}" if r.last_flapped_hrs is not None else "?",
+            r.tier,
+            "!!" if r.live_flap_detected else "",
         ]
         for r in display
     ]
     print(tabulate(table, headers=headers, tablefmt="simple"))
 
 
-def write_csv(rows, path: str) -> None:
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(asdict(rows[0]).keys()))
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(asdict(r))
-    logger.warning("CSV written to %s", path)
-
-
-def write_json(rows, path: str) -> None:
-    with open(path, "w") as f:
-        json.dump([asdict(r) for r in rows], f, indent=2)
-    logger.warning("JSON written to %s", path)
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interface error threshold monitor using Nornir/NAPALM"
+        description="Interface flap detection and stability analysis via Nornir/NAPALM"
     )
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--host", help="Single device hostname or IP")
@@ -208,20 +187,23 @@ def main():
     parser.add_argument("--platform", default="ios",
                         help="NAPALM driver: ios, eos, nxos, junos (default: ios)")
     parser.add_argument("--group", help="Filter inventory by Nornir group")
-    parser.add_argument("--error-pct", type=float, default=0.1,
-                        help="Error %% threshold to flag (default: 0.1)")
-    parser.add_argument("--errors-only", action="store_true",
-                        help="Show only interfaces exceeding threshold")
-    parser.add_argument("--output", choices=["table", "json", "csv"],
-                        default="table")
-    parser.add_argument("--out-file", help="Output file path (json/csv modes)")
+    parser.add_argument("--window-hours", type=float, default=24.0,
+                        help="Hours defining the DEGRADED window (default: 24)")
+    parser.add_argument("--unstable-only", action="store_true",
+                        help="Show only CRITICAL/DEGRADED interfaces")
+    parser.add_argument("--live-poll", action="store_true",
+                        help="Run two polls to detect flaps in the observation window")
+    parser.add_argument("--poll-interval", type=int, default=60,
+                        help="Seconds between live polls (default: 60)")
+    parser.add_argument("--output", choices=["table", "json"], default="table")
+    parser.add_argument("--out-file", help="Write output to file")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or os.environ.get("NET_PASS") or ""
+    password = args.password or ""
     if not password:
         import getpass
         password = getpass.getpass(f"Password for {args.username}: ")
@@ -234,13 +216,9 @@ def main():
             logging={"enabled": False},
         )
         nr.inventory.hosts[args.host] = Host(
-            name=args.host,
-            hostname=args.host,
-            username=args.username,
-            password=password,
-            platform=args.platform,
-            groups=Groups(),
-            defaults=Defaults(),
+            name=args.host, hostname=args.host,
+            username=args.username, password=password,
+            platform=args.platform, groups=Groups(), defaults=Defaults(),
         )
     else:
         nr = InitNornir(
@@ -252,36 +230,50 @@ def main():
         if args.group:
             nr = nr.filter(groups__contains=args.group)
 
+    baseline: Optional[Dict[str, float]] = None
+    if args.live_poll:
+        print(f"Baseline poll… waiting {args.poll_interval}s for observation window.")
+        baseline = build_baseline(nr)
+        time.sleep(args.poll_interval)
+
     results = nr.run(
-        task=collect_interface_errors,
-        error_pct_threshold=args.error_pct,
+        task=collect_interfaces,
+        window_hours=args.window_hours,
+        baseline=baseline,
     )
 
-    all_rows = []
+    all_rows: List[InterfaceFlapRow] = []
     for host_name, multi in results.items():
         if multi.failed:
             print(f"[ERROR] {host_name}: {multi.exception}", file=sys.stderr)
             continue
-        host_rows = multi[1].result if len(multi) > 1 else []
-        all_rows.extend(host_rows)
+        all_rows.extend(multi[1].result if len(multi) > 1 else [])
 
     if not all_rows:
         print("No data collected.")
         sys.exit(1)
 
     if args.output == "table":
-        print_table(all_rows, args.errors_only)
-    elif args.output == "csv":
-        out = args.out_file or "interface_errors.csv"
-        write_csv(all_rows, out)
-    elif args.output == "json":
-        out = args.out_file or "interface_errors.json"
-        write_json(all_rows, out)
+        text = None
+        print_table(all_rows, args.unstable_only)
+    else:
+        text = json.dumps([asdict(r) for r in all_rows], indent=2)
+        if args.out_file:
+            with open(args.out_file, "w") as f:
+                f.write(text)
+            print(f"JSON written to {args.out_file}")
+        else:
+            print(text)
 
-    flagged = sum(1 for r in all_rows if r.threshold_exceeded)
-    print(f"\nSummary: {len(all_rows)} interfaces checked, "
-          f"{flagged} exceeded {args.error_pct}% error threshold.")
-    sys.exit(1 if flagged else 0)
+    critical = sum(1 for r in all_rows if r.tier == TIER_CRITICAL)
+    degraded = sum(1 for r in all_rows if r.tier == TIER_DEGRADED)
+    live = sum(1 for r in all_rows if r.live_flap_detected)
+    print(
+        f"\nSummary: {len(all_rows)} interfaces — "
+        f"{critical} CRITICAL (<1h), {degraded} DEGRADED (<{args.window_hours}h)"
+        + (f", {live} live flaps detected" if args.live_poll else "")
+    )
+    sys.exit(1 if critical or live else 0)
 
 
 if __name__ == "__main__":
