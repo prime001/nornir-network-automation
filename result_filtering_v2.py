@@ -1,176 +1,119 @@
 ```python
 """
-Network Device Health Check with Result Filtering
+Result Filtering and Report Generation for Nornir Task Execution
 
-Purpose:
-    Connects to network devices, executes multiple diagnostic commands
-    (interface status, routing table, system info), filters results for
-    warnings/errors, and generates a health report with actionable insights.
+This script executes network tasks across a device inventory and provides
+flexible filtering of results based on device properties, task status, and
+output patterns. Useful for targeting specific devices, identifying failures,
+and generating compliance reports.
 
 Usage:
-    python health_check_filter.py --inventory inventory.yaml \
-        --device "core-router-01" --format json
+    python result_filtering.py --task "show_version" --group "core"
+    python result_filtering.py --task "show_bgp" --status failed --format json
+    python result_filtering.py --task "show_interfaces" --pattern "up" --devices router1 router2
 
 Prerequisites:
-    - nornir installed (pip install nornir)
-    - netmiko and napalm backends configured
-    - Inventory file in YAML format with device definitions
-    - SSH/CLI access to target devices with credentials
-
-Features:
-    - Multi-command execution with timeout handling
-    - Severity-based result filtering
-    - JSON and text output formats
-    - Detailed logging and error handling
+    - Nornir installed with netmiko/paramiko drivers
+    - Inventory file (hosts.yaml) with device definitions
+    - Network connectivity to target devices
+    - Appropriate credentials (via environment or inventory)
 """
 
+import logging
 import argparse
 import json
-import logging
-import sys
-from datetime import datetime
-from typing import Any, Dict
-
+import re
+from pathlib import Path
+from typing import Optional
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
 from nornir.tasks.networking import netmiko_send_command
-
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
-def run_diagnostics(task: Task) -> Result:
-    """Execute diagnostic commands on the device."""
-    commands = {
-        "version": "show version",
-        "interfaces": "show interfaces brief",
-        "routing": "show ip route summary",
-        "bgp": "show bgp summary",
-    }
-
-    results = {}
-    for key, cmd in commands.items():
-        try:
-            r = task.run(
-                netmiko_send_command,
-                command_string=cmd,
-                timeout_short=10
-            )
-            results[key] = r.result if r else ""
-        except Exception as e:
-            results[key] = f"COMMAND_ERROR: {str(e)}"
-            logger.debug(f"{task.host}: {cmd} failed - {e}")
-
-    return Result(host=task.host, result=results)
+def execute_task(nornir_obj, task_name: str, command: str):
+    """Execute network command across inventory."""
+    logger.info(f"Executing task: {task_name} with command: {command}")
+    
+    def task(task):
+        return task.run(
+            netmiko_send_command,
+            command_string=command,
+            name=task_name
+        )
+    
+    return nornir_obj.run(task=task)
 
 
-def parse_results(output: str, check_type: str) -> Dict[str, Any]:
-    """Extract and categorize issues from command output."""
-    issues = []
-    warnings = []
+def filter_results(results, status: Optional[str] = None, 
+                  pattern: Optional[str] = None,
+                  exclude_hosts: Optional[list] = None):
+    """Filter nornir results based on status and output pattern."""
+    filtered = {}
+    
+    for host, result in results.items():
+        if exclude_hosts and host in exclude_hosts:
+            continue
+        
+        task_result = result[0] if result else None
+        if not task_result:
+            continue
+        
+        # Filter by status
+        if status:
+            if status == "failed" and task_result.ok:
+                continue
+            elif status == "passed" and not task_result.ok:
+                continue
+        
+        # Filter by output pattern
+        if pattern:
+            output = str(task_result.result)
+            if not re.search(pattern, output, re.IGNORECASE):
+                continue
+        
+        filtered[host] = result
+    
+    return filtered
 
-    error_patterns = {
-        "down": ("critical", "interface down"),
-        "disabled": ("warning", "interface disabled"),
-        "error": ("critical", "error detected"),
-        "failed": ("critical", "command failed"),
-        "unreachable": ("critical", "route unreachable"),
-    }
 
-    for pattern, (severity, description) in error_patterns.items():
-        if pattern.lower() in output.lower():
-            item = {
-                "severity": severity,
-                "pattern": pattern,
-                "type": check_type,
+def format_output(filtered_results, format_type: str = "table"):
+    """Format results for display."""
+    if format_type == "json":
+        output = {}
+        for host, result in filtered_results.items():
+            task_result = result[0]
+            output[host] = {
+                "status": "passed" if task_result.ok else "failed",
+                "output": str(task_result.result),
+                "exception": str(task_result.exception) if task_result.exception else None
             }
-            if severity == "critical":
-                issues.append(item)
-            else:
-                warnings.append(item)
-
-    return {"issues": issues, "warnings": warnings}
-
-
-def filter_device_results(
-    diagnostics: Dict[str, str], threshold: int = 0
-) -> Dict[str, Any]:
-    """Filter and summarize diagnostic results."""
-    summary = {
-        "timestamp": datetime.now().isoformat(),
-        "total_commands": len(diagnostics),
-        "passed": 0,
-        "issues": [],
-        "warnings": [],
-    }
-
-    for check_type, output in diagnostics.items():
-        if isinstance(output, str):
-            if "COMMAND_ERROR" in output:
-                summary["issues"].append({
-                    "severity": "critical",
-                    "check": check_type,
-                    "message": output,
-                })
-            else:
-                parsed = parse_results(output, check_type)
-                summary["issues"].extend(parsed["issues"])
-                summary["warnings"].extend(parsed["warnings"])
-
-                if not parsed["issues"] and not parsed["warnings"]:
-                    summary["passed"] += 1
-
-    if threshold == 0:
-        return summary
-
-    return {
-        k: v for k, v in summary.items()
-        if k != "issues" or v
-    }
-
-
-def format_output(
-    device_name: str,
-    filtered: Dict[str, Any],
-    output_format: str
-) -> str:
-    """Format filtered results for display."""
-    if output_format == "json":
-        return json.dumps({device_name: filtered}, indent=2)
-
-    lines = [
-        f"\n{'='*50}",
-        f"Device: {device_name}",
-        f"Timestamp: {filtered['timestamp']}",
-        f"{'='*50}",
-        f"Commands Passed: {filtered['passed']}/{filtered['total_commands']}",
-    ]
-
-    if filtered["issues"]:
-        lines.append(f"\n⚠ CRITICAL ISSUES ({len(filtered['issues'])}):")
-        for issue in filtered["issues"]:
-            lines.append(
-                f"  [{issue.get('severity', 'unknown').upper()}] "
-                f"{issue.get('check', issue.get('type', 'unknown'))}"
-            )
-
-    if filtered["warnings"]:
-        lines.append(f"\n⚠ WARNINGS ({len(filtered['warnings'])}):")
-        for warn in filtered["warnings"][:5]:
-            lines.append(
-                f"  [{warn.get('severity', 'warning').upper()}] "
-                f"{warn.get('pattern', 'unknown')}"
-            )
-
-    if not filtered["issues"] and not filtered["warnings"]:
-        lines.append("\n✓ All checks passed - device healthy")
-
-    return "\n".join(lines)
+        return json.dumps(output, indent=2)
+    
+    elif format_type == "csv":
+        lines = ["hostname,status,output"]
+        for host, result in filtered_results.items():
+            task_result = result[0]
+            status = "passed" if task_result.ok else "failed"
+            output = str(task_result.result).replace(",", ";").replace("\n", " ")
+            lines.append(f"{host},{status},\"{output}\"")
+        return "\n".join(lines)
+    
+    else:  # table format
+        output = []
+        output.append(f"{'Hostname':<20} {'Status':<10} {'Output':<50}")
+        output.append("-" * 80)
+        for host, result in filtered_results.items():
+            task_result = result[0]
+            status = "PASS" if task_result.ok else "FAIL"
+            result_text = str(task_result.result)[:47] + "..." if len(str(task_result.result)) > 50 else str(task_result.result)
+            output.append(f"{host:<20} {status:<10} {result_text:<50}")
+        return "\n".join(output)
 
 
 def main():
@@ -179,64 +122,76 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--inventory",
-        default="inventory.yaml",
-        help="Path to nornir inventory file (default: inventory.yaml)"
+        "--task", required=True, help="Task name for execution"
     )
     parser.add_argument(
-        "--device",
-        help="Filter by device name"
+        "--command", required=True, help="Network command to execute"
     )
     parser.add_argument(
-        "--format",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (default: text)"
+        "--group", help="Filter by device group"
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=0,
-        help="Severity threshold: 0=all, 1=critical only (default: 0)"
+        "--devices", nargs="+", help="Specific devices to target"
     )
-
+    parser.add_argument(
+        "--status", choices=["passed", "failed"],
+        help="Filter results by execution status"
+    )
+    parser.add_argument(
+        "--pattern", help="Filter output by regex pattern"
+    )
+    parser.add_argument(
+        "--format", choices=["table", "json", "csv"], default="table",
+        help="Output format (default: table)"
+    )
+    parser.add_argument(
+        "--inventory", default="inventory",
+        help="Path to nornir inventory directory"
+    )
+    
     args = parser.parse_args()
-
+    
     try:
+        # Initialize Nornir
         logger.info(f"Loading inventory from {args.inventory}")
-        nr = InitNornir(config_file=args.inventory)
-
-        if args.device:
-            nr = nr.filter(F(name=args.device))
-            if not nr.inventory.hosts:
-                logger.error(f"Device '{args.device}' not found")
-                sys.exit(1)
-
-        logger.info(
-            f"Running health checks on {len(nr.inventory.hosts)} device(s)"
+        nornir_obj = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        
+        # Apply device filters
+        if args.devices:
+            nornir_obj = nornir_obj.filter(F(name__in=args.devices))
+        elif args.group:
+            nornir_obj = nornir_obj.filter(F(groups__contains=args.group))
+        
+        logger.info(f"Targeting {len(nornir_obj.inventory.hosts)} device(s)")
+        
+        # Execute task
+        results = execute_task(nornir_obj, args.task, args.command)
+        
+        # Filter results
+        filtered = filter_results(
+            results,
+            status=args.status,
+            pattern=args.pattern
         )
-        results = nr.run(task=run_diagnostics)
-
-        for device_name, task_result in results.items():
-            if task_result.failed:
-                logger.error(f"Health check failed for {device_name}")
-                continue
-
-            diagnostics = task_result[0].result
-            filtered = filter_device_results(diagnostics, args.threshold)
-            output = format_output(device_name, filtered, args.format)
-            print(output)
-
-        logger.info("Health check complete")
-
-    except FileNotFoundError:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        sys.exit(1)
+        
+        logger.info(f"Results after filtering: {len(filtered)} host(s)")
+        
+        # Format and output
+        output = format_output(filtered, args.format)
+        print(output)
+        
+        # Summary
+        passed = sum(1 for h, r in filtered.items() if r[0].ok)
+        failed = len(filtered) - passed
+        logger.info(f"Summary - Passed: {passed}, Failed: {failed}")
+        
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"Error during execution: {e}", exc_info=True)
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
