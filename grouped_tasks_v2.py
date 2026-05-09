@@ -1,209 +1,221 @@
 ```python
 """
-Device Health Monitor
+Device Uptime and Health Report - Network Automation Script
 
-Collects and analyzes health metrics (CPU, memory, temperature, uptime) from
-network devices using NAPALM. Generates reports and alerts when thresholds
-are exceeded.
+Purpose:
+    Collects device uptime, system information, and health metrics
+    from network devices to generate a comprehensive health report.
 
 Usage:
-    python 031_device_health_monitor.py --inventory inventory.yml --warn-cpu 75
+    python device_uptime_report.py --inventory inventory/ --device-group routers
+    python device_uptime_report.py --inventory inventory/ --device host-rtr-01
 
 Prerequisites:
-    - nornir configured with NAPALM driver
-    - Device SSH connectivity
-    - YAML inventory file with device groups
+    - Nornir with napalm plugin
+    - Network devices with SSH access configured
+    - Inventory YAML files properly configured
 """
 
 import argparse
 import logging
-from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict
 
 from nornir import InitNornir
-from nornir.core.task import Task, Result
+from nornir.core.filter import F
 from nornir_napalm.plugins.tasks import napalm_get
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbose: bool = False) -> None:
-    """Configure logging output."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+def calculate_uptime_days(uptime_seconds: int) -> float:
+    """Convert uptime in seconds to days."""
+    return uptime_seconds / 86400
+
+
+def assess_health(uptime_days: float, cpu_percent: float) -> str:
+    """
+    Assess device health based on uptime and CPU usage.
+    
+    Args:
+        uptime_days: Device uptime in days
+        cpu_percent: CPU utilization percentage
+        
+    Returns:
+        Health status string
+    """
+    if uptime_days < 1:
+        return "CRITICAL - Recently rebooted"
+    if cpu_percent > 80:
+        return "WARNING - High CPU utilization"
+    if uptime_days < 30:
+        return "CAUTION - Recent reboot"
+    return "HEALTHY"
+
+
+def collect_device_health(nr, device_filter=None):
+    """
+    Collect health metrics from devices.
+    
+    Args:
+        nr: Nornir inventory
+        device_filter: Optional device name or group filter
+        
+    Returns:
+        Dictionary of device health data
+    """
+    if device_filter:
+        filtered = nr.filter(name=device_filter)
+        if not filtered.inventory.hosts:
+            filtered = nr.filter(F(groups__contains=device_filter))
+    else:
+        filtered = nr
+    
+    logger.info(f"Collecting health data from {len(filtered.inventory.hosts)} device(s)")
+    
+    results = filtered.run(
+        task=napalm_get,
+        getters=['get_facts', 'get_environment']
     )
-
-
-def collect_health_metrics(task: Task) -> Result:
-    """Gather device facts and environment data via NAPALM."""
-    return task.run(
-        napalm_get,
-        getters=["facts", "environment"],
-        severity_level=logging.WARNING,
-    )
-
-
-def analyze_health(
-    device: str,
-    data: Dict[str, Any],
-    warn_cpu: int,
-    crit_cpu: int,
-    warn_mem: int,
-    crit_mem: int,
-) -> Dict[str, Any]:
-    """Analyze health metrics against thresholds."""
-    analysis = {"device": device, "status": "healthy", "alerts": [], "metrics": {}}
     
-    try:
-        facts = data.get("facts", {})
-        env = data.get("environment", {})
+    health_data = {}
+    
+    for device_name, task_result in results.items():
+        if task_result.failed:
+            logger.warning(f"{device_name}: Failed to retrieve health data")
+            health_data[device_name] = {'status': 'FAILED'}
+            continue
         
-        # Uptime
-        uptime_sec = facts.get("uptime", 0)
-        analysis["metrics"]["uptime_days"] = round(uptime_sec / 86400, 2)
-        
-        # Temperature checks
-        if "temperature" in env:
-            for sensor, info in env["temperature"].items():
-                if isinstance(info, dict) and info.get("is_alert"):
-                    analysis["status"] = "warning"
-                    analysis["alerts"].append(
-                        f"Temperature alert: {sensor} at {info.get('current_temperature')}°C"
-                    )
-        
-        # CPU checks
-        if "cpu" in env:
-            for cpu_name, util_dict in env["cpu"].items():
-                if isinstance(util_dict, dict):
-                    util = util_dict.get("%usage", 0)
-                    analysis["metrics"][f"cpu_{cpu_name}"] = util
-                    
-                    if util >= crit_cpu:
-                        analysis["status"] = "critical"
-                        analysis["alerts"].append(f"CPU {cpu_name} critical: {util}%")
-                    elif util >= warn_cpu and analysis["status"] != "critical":
-                        analysis["status"] = "warning"
-                        analysis["alerts"].append(f"CPU {cpu_name} warning: {util}%")
-        
-        # Memory checks
-        if "memory" in env:
-            mem_dict = env["memory"]
-            if isinstance(mem_dict, dict):
-                used = mem_dict.get("used_ram", 0)
-                total = mem_dict.get("total_ram", 1)
-                mem_pct = (used / total * 100) if total > 0 else 0
-                analysis["metrics"]["memory_used_pct"] = round(mem_pct, 1)
-                
-                if mem_pct >= crit_mem:
-                    analysis["status"] = "critical"
-                    analysis["alerts"].append(f"Memory critical: {mem_pct:.1f}%")
-                elif mem_pct >= warn_mem and analysis["status"] != "critical":
-                    analysis["status"] = "warning"
-                    analysis["alerts"].append(f"Memory warning: {mem_pct:.1f}%")
+        try:
+            facts = task_result[0].result.get('get_facts', {})
+            env = task_result[0].result.get('get_environment', {})
+            
+            uptime_sec = facts.get('uptime', 0)
+            uptime_days = calculate_uptime_days(uptime_sec)
+            
+            cpu_percent = 0.0
+            if env.get('cpu') and isinstance(env['cpu'], list) and env['cpu']:
+                cpu_percent = env['cpu'][0].get('%usage', 0.0)
+            
+            health_status = assess_health(uptime_days, cpu_percent)
+            
+            health_data[device_name] = {
+                'hostname': facts.get('hostname', 'N/A'),
+                'os': facts.get('os_version', 'N/A'),
+                'model': facts.get('model', 'N/A'),
+                'serial': facts.get('serial_number', 'N/A'),
+                'uptime_days': round(uptime_days, 2),
+                'cpu_percent': cpu_percent,
+                'status': health_status,
+                'vendor': facts.get('vendor', 'N/A')
+            }
+            
+            logger.info(f"{device_name}: {health_status}")
+            
+        except (KeyError, TypeError, IndexError) as e:
+            logger.error(f"{device_name}: Failed to parse health data - {e}")
+            health_data[device_name] = {'status': 'PARSE_ERROR'}
     
-    except (KeyError, TypeError, ZeroDivisionError) as e:
-        logger.warning(f"Error parsing data for {device}: {e}")
-        analysis["status"] = "unknown"
-    
-    return analysis
+    return health_data
 
 
-def generate_report(analyses: List[Dict[str, Any]], output_file: str = None) -> str:
-    """Generate formatted health report."""
-    report = "=" * 75 + "\n" + "DEVICE HEALTH REPORT\n" + "=" * 75 + "\n\n"
+def print_health_report(health_data: Dict):
+    """
+    Print formatted health report.
     
-    counts = {"healthy": 0, "warning": 0, "critical": 0, "unknown": 0}
+    Args:
+        health_data: Dictionary of health metrics by device
+    """
+    if not health_data:
+        print("No health data collected")
+        return
     
-    for a in analyses:
-        counts[a["status"]] += 1
-        symbol = "✓" if a["status"] == "healthy" else "⚠" if a["status"] == "warning" else "✗"
+    print("\n" + "=" * 90)
+    print("DEVICE HEALTH REPORT")
+    print("=" * 90)
+    print(f"{'Device':<20} {'Status':<30} {'Uptime (Days)':<15} {'CPU %':<10}")
+    print("-" * 90)
+    
+    for device, data in sorted(health_data.items()):
+        status = data.get('status', 'UNKNOWN')
+        uptime = data.get('uptime_days', 'N/A')
+        cpu = data.get('cpu_percent', 'N/A')
         
-        report += f"{symbol} {a['device']:<20} [{a['status'].upper()}]\n"
-        for alert in a["alerts"]:
-            report += f"    {alert}\n"
-        if a["metrics"]:
-            report += f"    Uptime: {a['metrics'].get('uptime_days', 0):.1f} days\n"
-        report += "\n"
+        if isinstance(uptime, float):
+            uptime_str = f"{uptime:.2f}"
+        else:
+            uptime_str = str(uptime)
+        
+        if isinstance(cpu, float):
+            cpu_str = f"{cpu:.1f}"
+        else:
+            cpu_str = str(cpu)
+        
+        print(f"{device:<20} {status:<30} {uptime_str:<15} {cpu_str:<10}")
     
-    report += "=" * 75 + "\n"
-    report += f"Summary: {counts['healthy']} healthy, {counts['warning']} warning, "
-    report += f"{counts['critical']} critical, {counts['unknown']} unknown\n"
-    report += "=" * 75 + "\n"
+    print("-" * 90)
     
-    if output_file:
-        Path(output_file).write_text(report)
-        logger.info(f"Report saved to {output_file}")
+    if health_data:
+        print("\nDetailed Information:")
+        for device, data in sorted(health_data.items()):
+            if data.get('status') in ['FAILED', 'PARSE_ERROR']:
+                continue
+            
+            print(f"\n{device}:")
+            print(f"  Hostname: {data.get('hostname', 'N/A')}")
+            print(f"  Vendor: {data.get('vendor', 'N/A')}")
+            print(f"  Model: {data.get('model', 'N/A')}")
+            print(f"  OS Version: {data.get('os', 'N/A')}")
+            print(f"  Serial: {data.get('serial', 'N/A')}")
     
-    return report
+    print("\n" + "=" * 90)
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Monitor device health metrics across network infrastructure"
+        description='Generate device uptime and health report'
     )
     parser.add_argument(
-        "-i", "--inventory", default="inventory.yml", help="Inventory file path"
+        '--inventory',
+        required=True,
+        help='Path to Nornir inventory directory'
     )
-    parser.add_argument("-f", "--filter", help="Filter devices by name pattern")
-    parser.add_argument("--warn-cpu", type=int, default=75, help="CPU warning %%")
-    parser.add_argument("--crit-cpu", type=int, default=90, help="CPU critical %%")
-    parser.add_argument("--warn-mem", type=int, default=80, help="Memory warning %%")
-    parser.add_argument("--crit-mem", type=int, default=95, help="Memory critical %%")
-    parser.add_argument("-o", "--output", help="Output file for report")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    parser.add_argument(
+        '--device',
+        help='Analyze specific device by name'
+    )
+    parser.add_argument(
+        '--device-group',
+        help='Analyze devices in specific group'
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug logging'
+    )
     
     args = parser.parse_args()
-    setup_logging(args.verbose)
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        nr = InitNornir(config_file=args.inventory)
-        if args.filter:
-            nr = nr.filter(name=args.filter)
+        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
         
-        if not nr.inventory.hosts:
-            logger.error(f"No devices match filter: {args.filter}")
-            return 1
+        device_filter = args.device or args.device_group
+        health_data = collect_device_health(nr, device_filter)
+        print_health_report(health_data)
         
-        logger.info(f"Collecting health from {len(nr.inventory.hosts)} devices...")
-        results = nr.run(task=collect_health_metrics)
-        
-        analyses = []
-        for device_name, task_result in results.items():
-            if task_result[0].failed:
-                logger.error(f"Failed to collect from {device_name}")
-                analyses.append({
-                    "device": device_name,
-                    "status": "unknown",
-                    "alerts": ["Collection failed"],
-                    "metrics": {},
-                })
-            else:
-                analysis = analyze_health(
-                    device_name,
-                    task_result[0].result,
-                    args.warn_cpu,
-                    args.crit_cpu,
-                    args.warn_mem,
-                    args.crit_mem,
-                )
-                analyses.append(analysis)
-        
-        report = generate_report(analyses, args.output)
-        print(report)
-        
-        critical_count = sum(1 for a in analyses if a["status"] == "critical")
-        warning_count = sum(1 for a in analyses if a["status"] == "warning")
-        
-        return 2 if critical_count > 0 else (1 if warning_count > 0 else 0)
-    
     except Exception as e:
-        logger.error(f"Execution failed: {e}", exc_info=args.verbose)
-        return 1
+        logger.error(f"Fatal error: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
