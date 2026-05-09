@@ -1,222 +1,229 @@
-```python
-"""
-Device Health Check - Multi-threaded health metric collection.
+Here is the script:
 
-Purpose:
-    Collects CPU, memory, disk, and uptime metrics from network devices
-    across the inventory using nornir's threaded execution model.
+```python
+"""NTP Synchronization Verifier
+
+Connects to network devices via Nornir and verifies NTP synchronization status
+across the inventory. Reports stratum level, reference clock, and offset for
+each device, and flags any device that is unsynchronized or unreachable.
 
 Usage:
-    python 028_device_health_check.py --device all --format table
-    python 028_device_health_check.py --device router1 --format json
-    python 028_device_health_check.py --device site1 --group --threshold 80
+    python ntp_check.py --group core --format table
+    python ntp_check.py --devices router1 router2 --format json
+    python ntp_check.py --group distribution --stratum-warn 3
 
 Prerequisites:
-    - nornir and nornir_netmiko
-    - inventory configured with device credentials
-    - devices supporting 'show system resources' or equivalent
-    - ssh/netmiko connectivity to all devices
+    - Nornir inventory configured at ./nornir_config.yaml
+    - Device SSH credentials configured in inventory
+    - netmiko driver installed for target device types
+    - Python packages: nornir, nornir-netmiko, pyyaml
 
-Output formats: table, json
+Output:
+    - Table or JSON report of NTP sync status per device
+    - Stratum, reference server, and offset columns
+    - Exit code 1 if any device is unsynchronized or unreachable
 """
 
-import argparse
 import json
 import logging
+import argparse
+import re
 from typing import Dict, Any, Optional
 
 from nornir import InitNornir
+from nornir.core.filter import F
 from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir_netmiko.tasks import netmiko_send_command
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def parse_health_metrics(output: str, device_type: str) -> Optional[Dict[str, Any]]:
-    """Parse device health metrics from command output."""
-    metrics = {
-        "cpu": None,
-        "memory": None,
-        "disk": None,
-        "uptime": None,
+def collect_ntp_data(task: Task) -> Result:
+    """Collect NTP status and associations from a single device."""
+    status_result = task.run(
+        task=netmiko_send_command,
+        command_string='show ntp status',
+        name='ntp_status',
+    )
+    assoc_result = task.run(
+        task=netmiko_send_command,
+        command_string='show ntp associations',
+        name='ntp_associations',
+    )
+    return Result(
+        host=task.host,
+        result={
+            'status': status_result.result,
+            'associations': assoc_result.result,
+        }
+    )
+
+
+def parse_ntp_status(output: str) -> Dict[str, Any]:
+    """Extract sync state, stratum, reference, and offset from 'show ntp status'."""
+    data: Dict[str, Any] = {
+        'synced': False,
+        'stratum': None,
+        'reference': '',
+        'offset_ms': None,
     }
 
-    if not output:
-        return None
+    first_line = output.splitlines()[0].lower() if output.strip() else ''
+    data['synced'] = 'synchronized' in first_line and 'unsynchronized' not in first_line
 
-    if "ios" in device_type.lower():
-        for line in output.split("\n"):
-            if "CPU utilization" in line:
-                try:
-                    parts = line.split()
-                    cpu_str = parts[-1].rstrip("%")
-                    metrics["cpu"] = float(cpu_str)
-                except (ValueError, IndexError):
-                    pass
-    elif "juniper" in device_type.lower():
-        for line in output.split("\n"):
-            if "user" in line.lower() and "%" in line:
-                try:
-                    parts = line.split()
-                    cpu_idx = next(i for i, p in enumerate(parts) if "%" in p)
-                    metrics["cpu"] = float(parts[cpu_idx].rstrip("%"))
-                except (ValueError, IndexError, StopIteration):
-                    pass
+    m = re.search(r'stratum\s+(\d+)', output, re.IGNORECASE)
+    if m:
+        data['stratum'] = int(m.group(1))
 
-    return metrics
+    m = re.search(r'reference\s+is\s+(\S+)', output, re.IGNORECASE)
+    if m:
+        data['reference'] = m.group(1).rstrip(',')
+
+    m = re.search(r'offset\s+([-\d.]+)', output, re.IGNORECASE)
+    if m:
+        try:
+            data['offset_ms'] = float(m.group(1))
+        except ValueError:
+            pass
+
+    return data
 
 
-def collect_health_metrics(task: Task) -> Result:
-    """Collect health metrics from a device."""
-    try:
-        device = task.host
-        device_type = device.platform or "ios"
-
-        cmd = "show processes cpu | include CPU"
-        if "juniper" in device_type.lower():
-            cmd = "show system processes extensive | head 5"
-        elif "arista" in device_type.lower():
-            cmd = "show processes cpu"
-
-        proc_result = task.run(
-            netmiko_send_command,
-            command_string=cmd,
-            use_textfsm=False,
-        )
-
-        metrics = parse_health_metrics(proc_result[0].result, device_type)
-
-        version_result = task.run(
-            netmiko_send_command,
-            command_string="show version | include uptime",
-            use_textfsm=False,
-        )
-
-        if version_result[0].result:
-            uptime_line = version_result[0].result.strip().split("\n")[0]
-            metrics["uptime"] = uptime_line
-
-        return Result(
-            host=device,
-            result=metrics,
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to collect metrics from {task.host}: {e}")
-        return Result(
-            host=task.host,
-            result={"error": str(e)},
-            failed=True,
-        )
+def parse_ntp_servers(output: str) -> list:
+    """Extract configured NTP server IPs from 'show ntp associations'."""
+    servers = []
+    for line in output.splitlines():
+        stripped = line.lstrip('*+~- \t')
+        ip_match = re.match(r'^(\d{1,3}(?:\.\d{1,3}){3})', stripped)
+        if ip_match:
+            servers.append(ip_match.group(1))
+    return servers
 
 
-def format_table_output(results: Dict[str, Dict[str, Any]]) -> str:
-    """Format results as table."""
-    lines = [
-        f"{'Device':<20} {'CPU %':<10} {'Status':<15}",
-        "-" * 45,
-    ]
+def format_table(device: str, info: Dict[str, Any], stratum_warn: int) -> None:
+    """Print a single device row to the console table."""
+    synced_str = 'YES' if info.get('synced') else 'NO '
+    stratum = info.get('stratum')
+    stratum_str = str(stratum) if stratum is not None else 'N/A'
+    offset = info.get('offset_ms')
+    offset_str = f'{offset:.3f}' if offset is not None else 'N/A'
+    reference = info.get('reference') or 'N/A'
+    servers = ', '.join(info.get('servers', [])[:2]) or 'none'
+    warn = ''
+    if not info.get('synced'):
+        warn = '  [!] UNSYNCED'
+    elif stratum is not None and stratum > stratum_warn:
+        warn = f'  [!] STRATUM>{stratum_warn}'
+    print(
+        f"{device:<22} {synced_str:<8} {stratum_str:<9} "
+        f"{reference:<18} {offset_str:<12} {servers}{warn}"
+    )
 
-    for device, data in results.items():
-        if isinstance(data, dict) and "error" not in data:
-            cpu = data.get("cpu")
-            cpu_str = f"{cpu:.1f}%" if isinstance(cpu, float) else "N/A"
-            status = "OK" if cpu is not None else "UNKNOWN"
-            lines.append(f"{device:<20} {cpu_str:<10} {status:<15}")
+
+def print_table_format(results: Dict[str, Any], stratum_warn: int) -> None:
+    """Render full results table to stdout."""
+    header = (
+        f"{'DEVICE':<22} {'SYNCED':<8} {'STRATUM':<9} "
+        f"{'REFERENCE':<18} {'OFFSET(ms)':<12} SERVERS"
+    )
+    print(f"\n{header}")
+    print('-' * len(header))
+    for device in sorted(results):
+        info = results[device]
+        if info.get('error'):
+            print(f"{device:<22} ERROR: {info['error']}")
         else:
-            lines.append(f"{device:<20} {'ERROR':<10} {'FAILED':<15}")
+            format_table(device, info, stratum_warn)
+    print()
 
-    return "\n".join(lines)
+
+def print_json_format(results: Dict[str, Any]) -> None:
+    """Dump full results as JSON."""
+    print(json.dumps(results, indent=2, default=str))
 
 
-def format_json_output(results: Dict[str, Dict[str, Any]]) -> str:
-    """Format results as JSON."""
-    return json.dumps(results, indent=2, default=str)
+def build_results(nr_results, stratum_warn: int) -> Dict[str, Any]:
+    """Aggregate per-host results into a flat dict."""
+    out = {}
+    for device_name, host_result in nr_results.items():
+        if host_result.failed:
+            out[device_name] = {'error': str(host_result.exception or 'task failed')}
+            continue
+        raw = host_result[0].result
+        ntp_info = parse_ntp_status(raw.get('status', ''))
+        ntp_info['servers'] = parse_ntp_servers(raw.get('associations', ''))
+        out[device_name] = ntp_info
+    return out
 
 
 def main() -> int:
-    """Main execution."""
+    """Execute NTP verification across selected inventory."""
     parser = argparse.ArgumentParser(
-        description="Collect device health metrics from network devices"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--device",
-        default="all",
-        help="Device name, group, or 'all' (default: all)",
-    )
-    parser.add_argument(
-        "--group",
-        action="store_true",
-        help="Filter by group name instead of device name",
-    )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=90,
-        help="Alert threshold for CPU/memory (default: 90)",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=4,
-        help="Number of worker threads (default: 4)",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging",
-    )
+    parser.add_argument('--group', help='Filter devices by inventory group')
+    parser.add_argument('--devices', nargs='+', help='Specific device names (space-separated)')
+    parser.add_argument('--format', choices=['table', 'json'], default='table',
+                        help='Output format (default: table)')
+    parser.add_argument('--stratum-warn', type=int, default=4,
+                        help='Flag devices at or above this stratum (default: 4)')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    if not args.group and not args.devices:
+        logger.error('Specify either --group or --devices')
+        parser.print_help()
+        return 1
 
     try:
-        nr = InitNornir(config_file="config.yaml")
+        nr = InitNornir(config_file='nornir_config.yaml')
 
-        if args.device != "all":
-            if args.group:
-                nr = nr.filter(group=args.device)
-            else:
-                nr = nr.filter(name=args.device)
-
-        logger.info(f"Collecting health metrics from {len(nr.inventory.hosts)} devices")
-
-        results = nr.run(
-            task=collect_health_metrics,
-            num_workers=args.threads,
-        )
-
-        output_data = {}
-        for device_name, task_result in results.items():
-            if task_result[0].result:
-                output_data[device_name] = task_result[0].result
-            else:
-                output_data[device_name] = {"error": "No result"}
-
-        if args.format == "json":
-            print(format_json_output(output_data))
+        if args.group:
+            nr = nr.filter(F(groups__contains=args.group))
         else:
-            print(format_table_output(output_data))
+            nr = nr.filter(F(name__in=args.devices))
 
-        logger.info("Health check completed successfully")
-        return 0
+        if not nr.inventory.hosts:
+            logger.error('No devices matched selection criteria')
+            return 1
 
+        logger.info(f'Checking NTP on {len(nr.inventory.hosts)} device(s)')
+        nr_results = nr.run(task=collect_ntp_data)
+
+        results = build_results(nr_results, args.stratum_warn)
+
+        if args.format == 'table':
+            print_table_format(results, args.stratum_warn)
+        else:
+            print_json_format(results)
+
+        problem_count = sum(
+            1 for v in results.values()
+            if v.get('error') or not v.get('synced')
+        )
+        if problem_count:
+            logger.warning(f'{problem_count} device(s) unsynchronized or unreachable')
+
+        return 0 if problem_count == 0 else 1
+
+    except FileNotFoundError:
+        logger.error('Nornir config file not found (nornir_config.yaml)')
+        return 1
     except Exception as e:
-        logger.error(f"Execution failed: {e}", exc_info=True)
+        logger.error(f'Unexpected error: {e}', exc_info=args.verbose)
         return 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     exit(main())
 ```
