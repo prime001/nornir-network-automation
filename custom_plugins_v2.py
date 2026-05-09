@@ -1,257 +1,202 @@
-```python
-"""
-Device Configuration Audit and Compliance Checker
+The user wants the script output directly. I'll write it now.
 
-Purpose:
-    Audits network device configurations against compliance rules and generates
-    a detailed report of deviations, missing configurations, and risk items.
-    Useful for identifying unauthorized changes, missing standards, and
-    configuration drift across multi-vendor device fleets.
+```
+"""
+CDP/LLDP Network Topology Discovery
+
+Collects neighbor discovery protocol data (CDP or LLDP) from one or more seed
+devices via Nornir/Netmiko, builds a layer-2 topology map, and writes it as
+JSON. An optional Graphviz DOT file can also be emitted for visualization
+with `dot -Tpng topology.dot -o topology.png`.
 
 Usage:
-    python 031_config_audit.py --inventory inventory.yaml --group router \
-        --rules compliance_rules.json --output audit_report.json
+    python topology_discovery.py \
+        --hosts 10.0.0.1,10.0.0.2 \
+        --username admin --password secret \
+        --protocol cdp --output topology.json --dot topology.dot
 
 Prerequisites:
-    - Nornir inventory file (YAML format)
-    - Compliance rules file (JSON format, see sample below)
-    - Network connectivity to all devices
-    - Credentials via environment variables or SSH keys
-
-Compliance Rules Format (JSON):
-    {
-        "required_lines": ["logging level info", "no shut"],
-        "forbidden_lines": ["service unsecured-http"],
-        "interface_checks": {
-            "Ethernet1/1": {"speed": "100", "mtu": "1500"}
-        }
-    }
+    pip install nornir nornir-netmiko netmiko
+    CDP or LLDP must be enabled on target devices.
+    User account requires at minimum read-only (show) access.
 """
 
+import argparse
 import json
 import logging
-import argparse
-from pathlib import Path
-from typing import Dict, List, Any
+import re
+import sys
+from typing import Any
 
-from nornir import InitNornir
-from nornir.core.filter import F
+from nornir.core import Nornir
+from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
+from nornir.core.plugins.runners import ThreadedRunner
 from nornir.core.task import Result, Task
-from nornir.tasks.networking import netmiko_send_command
+from nornir_netmiko.tasks import netmiko_send_command
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("topology_discovery")
 
 
-def load_compliance_rules(rules_file: str) -> Dict[str, Any]:
-    """Load compliance rules from JSON file."""
-    try:
-        with open(rules_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error(f"Rules file not found: {rules_file}")
-        raise
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in rules file: {e}")
-        raise
-
-
-def check_device_config(task: Task, rules: Dict[str, Any]) -> Result:
-    """
-    Retrieve device config and audit against compliance rules.
-    """
-    device_name = task.host.name
-    results = {
-        "device": device_name,
-        "compliant": True,
-        "findings": []
+def build_nornir(
+    hosts: list[str], username: str, password: str, platform: str, workers: int
+) -> Nornir:
+    host_dict = {
+        h: Host(name=h, hostname=h, username=username, password=password, platform=platform)
+        for h in hosts
     }
+    return Nornir(
+        inventory=Inventory(hosts=Hosts(host_dict), groups=Groups({}), defaults=Defaults()),
+        runner=ThreadedRunner(num_workers=workers),
+    )
 
-    try:
-        # Retrieve running configuration
-        config_result = task.run(
-            netmiko_send_command,
-            command_string="show running-config",
-            use_textfsm=False,
-        )
 
-        config_text = config_result[0].result
-        config_lines = [line.strip() for line in config_text.split('\n')]
+def collect_cdp(task: Task) -> Result:
+    r = task.run(
+        task=netmiko_send_command,
+        command_string="show cdp neighbors detail",
+        use_textfsm=True,
+    )
+    return Result(host=task.host, result=r.result)
 
-        # Check required lines
-        for required in rules.get("required_lines", []):
-            found = any(required.lower() in line.lower() for line in config_lines)
-            if not found:
-                results["compliant"] = False
-                results["findings"].append({
-                    "type": "missing_required",
-                    "item": required,
-                    "severity": "high"
-                })
 
-        # Check forbidden lines
-        for forbidden in rules.get("forbidden_lines", []):
-            found = any(forbidden.lower() in line.lower() for line in config_lines)
-            if found:
-                results["compliant"] = False
-                results["findings"].append({
-                    "type": "forbidden_line_found",
-                    "item": forbidden,
-                    "severity": "critical"
-                })
+def collect_lldp(task: Task) -> Result:
+    r = task.run(
+        task=netmiko_send_command,
+        command_string="show lldp neighbors detail",
+        use_textfsm=True,
+    )
+    return Result(host=task.host, result=r.result)
 
-        # Check interface-specific rules
-        if_rules = rules.get("interface_checks", {})
-        if if_rules:
-            int_result = task.run(
-                netmiko_send_command,
-                command_string="show interfaces",
-                use_textfsm=False,
+
+def _parse_cdp_raw(text: str) -> list[dict]:
+    """Regex fallback when TextFSM template is unavailable."""
+    neighbors = []
+    for block in re.split(r"-{20,}", text):
+        device_id = re.search(r"Device ID:\s*(\S+)", block)
+        local_if = re.search(r"Interface:\s*(\S+),", block)
+        remote_if = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
+        platform = re.search(r"Platform:\s*(.+?),", block)
+        if device_id and local_if:
+            neighbors.append(
+                {
+                    "neighbor": device_id.group(1),
+                    "local_interface": local_if.group(1),
+                    "neighbor_interface": remote_if.group(1) if remote_if else "unknown",
+                    "platform": platform.group(1).strip() if platform else "unknown",
+                }
             )
-            int_text = int_result[0].result
-
-            for interface, checks in if_rules.items():
-                for check_key, check_value in checks.items():
-                    pattern = f"{interface}.*{check_key}.*{check_value}"
-                    found = any(
-                        check_key.lower() in line.lower()
-                        and check_value.lower() in line.lower()
-                        for line in int_text.split('\n')
-                        if interface.lower() in line.lower()
-                    )
-                    if not found:
-                        results["compliant"] = False
-                        results["findings"].append({
-                            "type": "interface_compliance",
-                            "interface": interface,
-                            "check": f"{check_key}={check_value}",
-                            "severity": "medium"
-                        })
-
-        logger.info(
-            f"{device_name}: "
-            f"{'COMPLIANT' if results['compliant'] else 'NON-COMPLIANT'} "
-            f"({len(results['findings'])} findings)"
-        )
-
-    except Exception as e:
-        logger.error(f"Error auditing {device_name}: {e}")
-        results["compliant"] = False
-        results["findings"].append({
-            "type": "audit_error",
-            "error": str(e),
-            "severity": "critical"
-        })
-
-    return Result(host=task.host, result=results)
+    return neighbors
 
 
-def run_audit(nr, rules: Dict[str, Any], group_filter: str = None) -> Dict[str, Any]:
-    """Execute config audit across filtered device group."""
-    if group_filter:
-        nr = nr.filter(F(groups__contains=group_filter))
-
-    logger.info(f"Starting audit on {len(nr.inventory.hosts)} devices")
-
-    results = nr.run(task=check_device_config, rules=rules)
-
-    audit_summary = {
-        "total_devices": len(nr.inventory.hosts),
-        "compliant_devices": 0,
-        "non_compliant_devices": 0,
-        "devices": {}
-    }
-
-    for hostname, task_result in results.items():
-        device_result = task_result[0].result
-        audit_summary["devices"][hostname] = device_result
-
-        if device_result["compliant"]:
-            audit_summary["compliant_devices"] += 1
-        else:
-            audit_summary["non_compliant_devices"] += 1
-
-    audit_summary["compliance_percentage"] = (
-        audit_summary["compliant_devices"] / audit_summary["total_devices"] * 100
-        if audit_summary["total_devices"] > 0 else 0
-    )
-
-    return audit_summary
+def normalize(raw: Any, protocol: str) -> list[dict]:
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        return _parse_cdp_raw(raw) if protocol == "cdp" else []
+    return []
 
 
-def main():
+def build_topology(data: dict[str, list[dict]]) -> dict:
+    topology: dict = {"nodes": {}, "edges": []}
+    seen: set = set()
+
+    for hostname, neighbors in data.items():
+        topology["nodes"].setdefault(hostname, {"hostname": hostname})
+        for nbr in neighbors:
+            nid = nbr.get("neighbor") or nbr.get("dest_host", "unknown")
+            local = nbr.get("local_interface") or nbr.get("local_port", "")
+            remote = nbr.get("neighbor_interface") or nbr.get("neighbor_port", "")
+            plat = nbr.get("platform") or nbr.get("capabilities", "")
+
+            topology["nodes"].setdefault(nid, {"hostname": nid, "platform": plat})
+
+            key = tuple(sorted([f"{hostname}:{local}", f"{nid}:{remote}"]))
+            if key not in seen:
+                seen.add(key)
+                topology["edges"].append(
+                    {
+                        "source": hostname,
+                        "source_interface": local,
+                        "target": nid,
+                        "target_interface": remote,
+                    }
+                )
+
+    return topology
+
+
+def write_dot(topology: dict, path: str) -> None:
+    lines = ['graph topology {', '    rankdir=LR;', '    node [shape=box];']
+    for node in topology["nodes"]:
+        lines.append(f'    "{node}";')
+    for edge in topology["edges"]:
+        label = f'{edge["source_interface"]} -- {edge["target_interface"]}'
+        lines.append(f'    "{edge["source"]}" -- "{edge["target"]}" [label="{label}"];')
+    lines.append("}")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    logger.info("DOT file written: %s", path)
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Network device configuration compliance auditor"
+        description="Discover network topology via CDP or LLDP using Nornir"
     )
-    parser.add_argument(
-        "--inventory",
-        required=True,
-        help="Path to Nornir inventory YAML file"
-    )
-    parser.add_argument(
-        "--rules",
-        required=True,
-        help="Path to compliance rules JSON file"
-    )
-    parser.add_argument(
-        "--group",
-        help="Filter audit to specific device group"
-    )
-    parser.add_argument(
-        "--output",
-        help="Output file for audit results (JSON)"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
-
+    parser.add_argument("--hosts", required=True, help="Comma-separated seed device IPs/hostnames")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
+    parser.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp")
+    parser.add_argument("--output", default="topology.json", help="JSON output path")
+    parser.add_argument("--dot", help="Optional Graphviz DOT output path")
+    parser.add_argument("--workers", type=int, default=10, help="Parallel workers (default: 10)")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    if args.verbose:
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    try:
-        # Initialize Nornir
-        nr = InitNornir(config_file=args.inventory)
-        logger.info(f"Loaded inventory: {len(nr.inventory.hosts)} hosts")
+    host_list = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    nr = build_nornir(host_list, args.username, args.password, args.platform, args.workers)
 
-        # Load compliance rules
-        rules = load_compliance_rules(args.rules)
-        logger.info(f"Loaded compliance rules with {len(rules)} rule sets")
+    task_fn = collect_cdp if args.protocol == "cdp" else collect_lldp
+    logger.info("Collecting %s neighbors from %d host(s)", args.protocol.upper(), len(host_list))
 
-        # Run audit
-        audit_results = run_audit(nr, rules, args.group)
+    agg = nr.run(task=task_fn)
 
-        # Output results
-        if args.output:
-            output_path = Path(args.output)
-            output_path.write_text(json.dumps(audit_results, indent=2))
-            logger.info(f"Audit results saved to {args.output}")
-        else:
-            print(json.dumps(audit_results, indent=2))
+    neighbor_data: dict[str, list[dict]] = {}
+    failed: list[str] = []
+    for host, multi in agg.items():
+        if multi.failed:
+            logger.warning("Failed on %s: %s", host, multi[0].exception)
+            failed.append(host)
+            continue
+        neighbor_data[host] = normalize(multi[0].result, args.protocol)
 
-        # Summary
-        print(f"\n{'='*60}")
-        print(f"Audit Summary")
-        print(f"{'='*60}")
-        print(f"Total Devices: {audit_results['total_devices']}")
-        print(f"Compliant: {audit_results['compliant_devices']}")
-        print(f"Non-Compliant: {audit_results['non_compliant_devices']}")
-        print(f"Compliance Rate: {audit_results['compliance_percentage']:.1f}%")
-        print(f"{'='*60}\n")
+    if failed:
+        logger.warning("Unreachable hosts (%d): %s", len(failed), ", ".join(failed))
 
-        # Exit with appropriate code
-        exit(0 if audit_results["non_compliant_devices"] == 0 else 1)
+    if not neighbor_data:
+        logger.error("No neighbor data collected; check connectivity and credentials")
+        sys.exit(1)
 
-    except Exception as e:
-        logger.exception(f"Fatal error: {e}")
-        exit(2)
+    topology = build_topology(neighbor_data)
+
+    with open(args.output, "w") as fh:
+        json.dump(topology, fh, indent=2)
+    logger.info(
+        "Topology saved to %s — %d nodes, %d edges",
+        args.output,
+        len(topology["nodes"]),
+        len(topology["edges"]),
+    )
+
+    if args.dot:
+        write_dot(topology, args.dot)
 
 
 if __name__ == "__main__":
