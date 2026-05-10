@@ -1,248 +1,202 @@
 ```python
 """
-Route Table Analysis - Nornir Network Automation Script
+Configuration Change Audit - Detect and Report Configuration Drifts
 
-Purpose:
-  Analyzes device routing tables to identify potential issues including
-  missing routes, default route presence, high route counts, and routing
-  inconsistencies. Useful for network troubleshooting and convergence
-  verification across the network infrastructure.
+Compares current device configurations against baseline/golden configurations
+to identify unauthorized changes and configuration drift. Useful for compliance
+verification and change management.
 
 Usage:
-  python route_analysis.py --devices r1,r2,r3 --format json
-  python route_analysis.py --group core --check-default
-  python route_analysis.py --all --output route_audit.json
+    python config_change_audit.py --inventory hosts.yaml --baseline baselines/
+    python config_change_audit.py --inventory hosts.yaml --baseline baselines/ --device router1
+    python config_change_audit.py --inventory hosts.yaml --baseline baselines/ --show-diff
 
 Prerequisites:
-  - Nornir with NAPALM support (pip install nornir[napalm])
-  - SSH access to network devices with configured credentials
-  - inventory.yaml with device definitions and groups
-  - Device types supported: Cisco IOS/XE/XR, NXOS, Juniper, Arista
-  - Requires route_details getter support on target devices
-
-Examples:
-  Check core routers for missing default routes:
-    python route_analysis.py --group core --check-default --format table
-
-  Export all routes to JSON for analysis:
-    python route_analysis.py --all --output routes.json --format json
-
-  Check specific devices with verbose output:
-    python route_analysis.py --devices r1,r2,r3 --verbose
+    - Nornir installed with netmiko plugin
+    - Baseline configurations stored locally (baseline_dir/device_name.conf)
+    - Inventory in YAML format with device definitions
+    - SSH connectivity to all network devices
 """
 
-import json
-import logging
 import argparse
-from datetime import datetime
-from typing import Dict, Any
+import logging
+import os
+import difflib
+from pathlib import Path
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir.tasks.networking import napalm_get
+from nornir.core.filter import F
+from nornir.core.exceptions import NornirExecutionException
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-def analyze_routing_table(task: Task, check_default: bool = True) -> Result:
-    """
-    Analyze device routing table for anomalies and potential issues.
+def setup_logging(debug=False):
+    """Configure logging output."""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
-    Collects and analyzes route information including default route presence,
-    route count, and protocol distribution. Flags common issues like missing
-    default routes or excessive route table entries.
 
-    Args:
-        task: Nornir task object
-        check_default: Flag if default route is missing
-
-    Returns:
-        Result containing route analysis dictionary
-    """
+def get_running_config(task):
+    """Retrieve running configuration from device via netmiko."""
+    from nornir_netmiko.tasks import netmiko_send_command
+    
     try:
-        route_data = task.run(napalm_get, getters=['route_details'])
-        routes = route_data[0].result.get('route_details', {})
-
-        analysis = {
-            'device': task.host.name,
-            'timestamp': datetime.now().isoformat(),
-            'total_routes': len(routes),
-            'default_route_present': False,
-            'issues': [],
-            'route_summary': {
-                'ipv4_routes': 0,
-                'ipv6_routes': 0,
-                'connected': 0,
-                'static': 0,
-                'bgp': 0,
-                'ospf': 0,
-                'eigrp': 0
-            }
-        }
-
-        # Analyze each route
-        for prefix in routes.keys():
-            if prefix == '0.0.0.0/0':
-                analysis['default_route_present'] = True
-                analysis['route_summary']['ipv4_routes'] += 1
-            elif prefix == '::/0':
-                analysis['default_route_present'] = True
-                analysis['route_summary']['ipv6_routes'] += 1
-            elif ':' in prefix:
-                analysis['route_summary']['ipv6_routes'] += 1
-            else:
-                analysis['route_summary']['ipv4_routes'] += 1
-
-        # Identify potential issues
-        if check_default and not analysis['default_route_present']:
-            analysis['issues'].append('No default route (0.0.0.0/0 or ::/0)')
-
-        total_ipv4 = analysis['route_summary']['ipv4_routes']
-        if total_ipv4 > 5000:
-            analysis['issues'].append(
-                f'Large IPv4 routing table: {total_ipv4} routes'
-            )
-
-        if analysis['total_routes'] == 0:
-            analysis['issues'].append('No routes found (potential device issue)')
-
-        return Result(host=task.host, result=analysis)
-
+        result = task.run(netmiko_send_command, command_string="show running-config")
+        return result.result
     except Exception as e:
-        logger.error(f"Error analyzing routes on {task.host.name}: {e}")
-        return Result(
-            host=task.host,
-            result={'error': str(e), 'device': task.host.name},
-            failed=True
-        )
+        logger.error(f"Failed to retrieve config from {task.host.name}: {e}")
+        return None
 
 
-def print_table_format(results: Dict[str, Any]) -> None:
-    """Display route analysis in table format."""
-    print("\n" + "=" * 110)
-    print(f"{'Device':<18} {'Total Routes':<15} {'IPv4':<10} {'IPv6':<10} "
-          f"{'Default Route':<16} {'Issues':<38}")
-    print("=" * 110)
+def load_baseline_config(baseline_dir, device_name):
+    """Load baseline configuration file for device."""
+    config_file = Path(baseline_dir) / f"{device_name}.conf"
+    if config_file.exists():
+        try:
+            return config_file.read_text()
+        except Exception as e:
+            logger.error(f"Failed to read baseline for {device_name}: {e}")
+            return None
+    logger.warning(f"No baseline found for {device_name}")
+    return None
 
-    for host_name, data in results.items():
-        if isinstance(data, dict) and 'error' not in data:
-            issues_str = '; '.join(data.get('issues', ['None']))[:35]
-            print(f"{data['device']:<18} {data['total_routes']:<15} "
-                  f"{data['route_summary']['ipv4_routes']:<10} "
-                  f"{data['route_summary']['ipv6_routes']:<10} "
-                  f"{'Yes' if data['default_route_present'] else 'No':<16} "
-                  f"{issues_str:<38}")
-        else:
-            print(f"{host_name:<18} ERROR - {data.get('error', 'Unknown')}")
 
-    print("=" * 110)
+def generate_diff(current, baseline):
+    """Generate unified diff between current and baseline configs."""
+    if not baseline:
+        return None
+    
+    current_lines = current.splitlines(keepends=True)
+    baseline_lines = baseline.splitlines(keepends=True)
+    
+    diff = list(difflib.unified_diff(
+        baseline_lines,
+        current_lines,
+        fromfile='baseline',
+        tofile='current',
+        lineterm=''
+    ))
+    
+    return diff if diff else None
+
+
+def audit_device_config(task, baseline_dir, show_diff=False):
+    """Audit device configuration against baseline."""
+    logger.info(f"Auditing {task.host.name}")
+    
+    current_config = get_running_config(task)
+    if not current_config:
+        return {
+            "host": task.host.name,
+            "status": "error",
+            "message": "Failed to retrieve config"
+        }
+    
+    baseline_config = load_baseline_config(baseline_dir, task.host.name)
+    if not baseline_config:
+        return {
+            "host": task.host.name,
+            "status": "no_baseline",
+            "message": "No baseline configuration available"
+        }
+    
+    diff = generate_diff(current_config, baseline_config)
+    
+    return {
+        "host": task.host.name,
+        "status": "drift" if diff else "compliant",
+        "diff_lines": len(diff) if diff else 0,
+        "diff_output": diff if show_diff and diff else None
+    }
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Analyze network device routing tables for anomalies'
+        description="Audit device configurations for drift from baseline"
     )
-    parser.add_argument(
-        '--devices',
-        help='Comma-separated list of device names'
-    )
-    parser.add_argument(
-        '--group',
-        help='Device group from inventory'
-    )
-    parser.add_argument(
-        '--all',
-        action='store_true',
-        help='Analyze all devices'
-    )
-    parser.add_argument(
-        '--check-default',
-        action='store_true',
-        help='Flag devices missing default route'
-    )
-    parser.add_argument(
-        '--format',
-        choices=['table', 'json'],
-        default='table',
-        help='Output format (default: table)'
-    )
-    parser.add_argument(
-        '--output',
-        help='Save results to file'
-    )
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Enable debug logging'
-    )
-
+    parser.add_argument("--inventory", required=True, help="Nornir inventory file path")
+    parser.add_argument("--baseline", required=True, help="Directory containing baseline configs")
+    parser.add_argument("--username", required=True, help="Device username")
+    parser.add_argument("--password", required=True, help="Device password")
+    parser.add_argument("--device", help="Audit specific device by name")
+    parser.add_argument("--group", help="Audit devices in specific group")
+    parser.add_argument("--show-diff", action="store_true", help="Display line-by-line diffs")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    
     args = parser.parse_args()
-
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-
+    setup_logging(args.debug)
+    
+    if not os.path.isdir(args.baseline):
+        logger.error(f"Baseline directory not found: {args.baseline}")
+        return 1
+    
     try:
-        nr = InitNornir(config_file='config.yaml')
-
-        # Filter devices
-        if args.devices:
-            nr = nr.filter(name__in=args.devices.split(','))
+        nr = InitNornir(config_file=args.inventory)
+        nr.inventory.defaults.username = args.username
+        nr.inventory.defaults.password = args.password
+        
+        if args.device:
+            nr = nr.filter(F(name=args.device))
         elif args.group:
-            nr = nr.filter(groups__contains=args.group)
-        elif not args.all:
-            parser.error(
-                'Specify --devices, --group, or use --all'
-            )
-
-        if not nr.inventory.hosts:
-            logger.error('No devices matched filter criteria')
-            return
-
-        logger.info(
-            f'Starting route analysis on {len(nr.inventory.hosts)} device(s)'
-        )
-
-        # Execute analysis
+            nr = nr.filter(F(groups__contains=args.group))
+        
         results = nr.run(
-            task=analyze_routing_table,
-            check_default=args.check_default,
-            num_workers=4
+            task=audit_device_config,
+            baseline_dir=args.baseline,
+            show_diff=args.show_diff
         )
-
-        # Collect output
-        output_data = {}
-        for host_name, multi_result in results.items():
-            if multi_result.failed:
-                output_data[host_name] = {
-                    'error': str(multi_result[0].exception),
-                    'device': host_name
-                }
-            else:
-                output_data[host_name] = multi_result[0].result
-
-        # Display results
-        if args.format == 'json':
-            print(json.dumps(output_data, indent=2))
-        else:
-            print_table_format(output_data)
-
-        # Save to file if requested
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(output_data, f, indent=2)
-            logger.info(f'Results saved to {args.output}')
-
-        logger.info('Route analysis completed successfully')
-
+        
+        print("\n" + "="*50)
+        print("CONFIGURATION AUDIT RESULTS")
+        print("="*50 + "\n")
+        
+        compliant_count = 0
+        drift_count = 0
+        error_count = 0
+        
+        for device_name in sorted(results.keys()):
+            result = results[device_name][0].result
+            status = result["status"]
+            host = result["host"]
+            
+            if status == "compliant":
+                print(f"✓ {host}: Compliant with baseline")
+                compliant_count += 1
+            elif status == "drift":
+                print(f"✗ {host}: Configuration drift detected ({result['diff_lines']} changes)")
+                drift_count += 1
+                if result["diff_output"]:
+                    for line in result["diff_output"]:
+                        print(f"  {line.rstrip()}")
+            elif status == "no_baseline":
+                print(f"? {host}: {result['message']}")
+                error_count += 1
+            elif status == "error":
+                print(f"✗ {host}: {result['message']}")
+                error_count += 1
+        
+        print("\n" + "="*50)
+        print(f"Compliant: {compliant_count} | Drift: {drift_count} | Errors: {error_count}")
+        print("="*50 + "\n")
+        
+        return 0 if drift_count == 0 and error_count == 0 else 1
+        
+    except NornirExecutionException as e:
+        logger.error(f"Nornir execution error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        logger.info("Audit interrupted")
+        return 130
     except Exception as e:
-        logger.error(f'Fatal error: {e}')
-        raise
+        logger.error(f"Unexpected error: {e}", exc_info=args.debug)
+        return 1
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    exit(main())
 ```
