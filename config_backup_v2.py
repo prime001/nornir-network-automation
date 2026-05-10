@@ -1,193 +1,160 @@
-config_diff.py — Nornir configuration change detection and unified diff reporter.
+```python
+#!/usr/bin/env python3
+"""
+Device Health Check
 
-Purpose:
-    Connects to network devices, retrieves their running configurations, and
-    compares them against previously saved baselines. Reports a unified diff
-    for every device where the configuration has changed since the last run.
-    Useful for detecting unauthorized changes, auditing drift, or validating
-    that a change window actually modified what was intended.
+Collects and reports health metrics (uptime, CPU, memory) from network devices
+using Nornir and NAPALM. Displays device status in table or JSON format.
 
 Usage:
-    python config_diff.py --inventory config.yaml --baseline-dir ./baselines
-    python config_diff.py --inventory config.yaml --baseline-dir ./baselines --save
-    python config_diff.py --inventory config.yaml --filter site=dc1 --report-file changes.txt
+    python device_health_check.py --device switch01
+    python device_health_check.py --group core --format json
+    python device_health_check.py --alert-threshold 80 --output health.json
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    A nornir inventory (config.yaml referencing hosts.yaml / groups.yaml /
-    defaults.yaml) targeting devices that respond to 'show running-config'.
-    Run once with --save to establish the initial baseline.
+    Nornir and NAPALM installed. Network devices must support NAPALM get_facts
+    and get_environment getters. Inventory must be configured with device
+    credentials and connection details.
 """
 
 import argparse
-import difflib
+import json
 import logging
 import sys
-from datetime import datetime
-from pathlib import Path
-
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.tasks.networking import napalm_get
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
 
 
-def fetch_running_config(task: Task) -> Result:
-    result = task.run(
-        task=netmiko_send_command,
-        command_string="show running-config",
-        use_textfsm=False,
-    )
-    return Result(host=task.host, result=result.result)
+def collect_health(task):
+    """Gather device facts and environment metrics via NAPALM."""
+    try:
+        result = task.run(napalm_get, getters=["facts", "environment"])
+        facts = result[0].result.get("facts", {})
+        env = result[0].result.get("environment", {})
+
+        cpu = env.get("cpu", [{}])[0].get("%usage", "N/A") if env.get("cpu") else "N/A"
+
+        mem = env.get("memory", [{}])[0] if env.get("memory") else {}
+        used = mem.get("used_ram", 0)
+        total = mem.get("available_ram", 1)
+        mem_pct = round((used / total * 100), 1) if total else "N/A"
+
+        uptime_s = facts.get("uptime_seconds", 0)
+        uptime_h = int(uptime_s) // 3600 if uptime_s else "N/A"
+
+        return {
+            "hostname": task.host.name,
+            "uptime_hours": uptime_h,
+            "os_version": facts.get("os_version", "N/A"),
+            "cpu_percent": cpu,
+            "memory_percent": mem_pct,
+            "status": "OK"
+        }
+    except Exception as e:
+        logging.error(f"Error collecting health from {task.host.name}: {e}")
+        return {
+            "hostname": task.host.name,
+            "status": "ERROR",
+            "error": str(e)
+        }
 
 
-def load_baseline(host_name: str, baseline_dir: Path) -> str | None:
-    path = baseline_dir / f"{host_name}.cfg"
-    return path.read_text(encoding="utf-8") if path.exists() else None
-
-
-def save_baseline(host_name: str, config: str, baseline_dir: Path) -> None:
-    baseline_dir.mkdir(parents=True, exist_ok=True)
-    path = baseline_dir / f"{host_name}.cfg"
-    path.write_text(config, encoding="utf-8")
-    logger.info("Saved baseline: %s", path)
-
-
-def compute_diff(old: str, new: str, host_name: str) -> list[str]:
-    return list(
-        difflib.unified_diff(
-            old.splitlines(keepends=True),
-            new.splitlines(keepends=True),
-            fromfile=f"{host_name}/baseline",
-            tofile=f"{host_name}/current",
-        )
-    )
-
-
-def run_diff(args: argparse.Namespace) -> int:
-    baseline_dir = Path(args.baseline_dir)
-    diff_sections: list[str] = []
-    changed: list[str] = []
-    unchanged: list[str] = []
-    new_devices: list[str] = []
-    errors: list[str] = []
-
-    nr = InitNornir(config_file=args.inventory)
-
-    if args.filter:
-        key, _, value = args.filter.partition("=")
-        nr = nr.filter(F(**{key: value}))
-
-    logger.info("Connecting to %d device(s)...", len(nr.inventory.hosts))
-    results = nr.run(task=fetch_running_config)
-
-    for host_name, multi_result in results.items():
-        if multi_result.failed:
-            logger.error("Failed to retrieve config from %s", host_name)
-            errors.append(host_name)
-            continue
-
-        current_config: str = multi_result[0].result or ""
-        if not current_config.strip():
-            logger.warning("Empty config returned from %s", host_name)
-            errors.append(host_name)
-            continue
-
-        baseline = load_baseline(host_name, baseline_dir)
-
-        if baseline is None:
-            new_devices.append(host_name)
-            logger.info("No baseline for %s — treating as new device", host_name)
-            if args.save:
-                save_baseline(host_name, current_config, baseline_dir)
-            continue
-
-        diff = compute_diff(baseline, current_config, host_name)
-
-        if diff:
-            changed.append(host_name)
-            diff_sections.append(f"\n{'=' * 60}")
-            diff_sections.append(f"CHANGED: {host_name}")
-            diff_sections.append(f"{'=' * 60}")
-            diff_sections.extend(diff)
-            if args.save:
-                save_baseline(host_name, current_config, baseline_dir)
-        else:
-            unchanged.append(host_name)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    summary_lines = [
-        f"\n{'=' * 60}",
-        f"Config Diff Report — {timestamp}",
-        f"{'=' * 60}",
-        f"  Changed  : {len(changed):>3}  {', '.join(changed) or '—'}",
-        f"  Unchanged: {len(unchanged):>3}",
-        f"  New      : {len(new_devices):>3}  {', '.join(new_devices) or '—'}",
-        f"  Errors   : {len(errors):>3}  {', '.join(errors) or '—'}",
+def format_table(devices):
+    """Format health data as ASCII table."""
+    lines = [
+        "Device            Uptime(h)  CPU%    Memory%  OS Version      Status"
     ]
+    lines.append("-" * 75)
 
-    if diff_sections:
-        print("".join(diff_sections))
-    print("\n".join(summary_lines))
+    for device in devices:
+        if device.get("status") == "ERROR":
+            lines.append(
+                f"{device['hostname']:<18} ERROR - {device.get('error', 'Unknown')}"
+            )
+        else:
+            cpu = f"{device['cpu_percent']}%" if device['cpu_percent'] != "N/A" else "N/A"
+            mem = f"{device['memory_percent']}%" if device['memory_percent'] != "N/A" else "N/A"
+            lines.append(
+                f"{device['hostname']:<18} {str(device['uptime_hours']):<10} "
+                f"{cpu:<8} {mem:<9} {str(device.get('os_version', 'N/A')):<15} "
+                f"{device['status']}"
+            )
+    return "\n".join(lines)
 
-    if args.report_file:
-        report_path = Path(args.report_file)
-        report_path.write_text(
-            "\n".join(summary_lines) + "\n" + "".join(diff_sections),
-            encoding="utf-8",
-        )
-        logger.info("Report written to %s", report_path)
 
-    return 1 if (changed or errors) else 0
-
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="Detect and report running-config drift across network devices."
+        description="Collect and report health metrics from network devices"
     )
     parser.add_argument(
-        "--inventory",
-        default="config.yaml",
-        help="Nornir config file (default: config.yaml)",
+        "--device",
+        help="Specific device hostname to check"
     )
     parser.add_argument(
-        "--baseline-dir",
-        default="./baselines",
-        help="Directory of baseline .cfg files (default: ./baselines)",
+        "--group",
+        help="Device group to check"
     )
     parser.add_argument(
-        "--save",
-        action="store_true",
-        help="Update baselines with current configs after comparing",
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)"
     )
     parser.add_argument(
-        "--filter",
-        metavar="KEY=VALUE",
-        help="Filter inventory by host attribute, e.g. site=dc1",
+        "--output",
+        help="Save output to file"
     )
     parser.add_argument(
-        "--report-file",
-        metavar="PATH",
-        help="Write the full diff report to a file",
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent workers (default: 4)"
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
-    )
+
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    try:
+        nr = InitNornir()
+        logging.info("Nornir inventory initialized")
 
-    sys.exit(run_diff(args))
+        if args.device:
+            nr = nr.filter(name=args.device)
+        elif args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+
+        if not nr.inventory.hosts:
+            logging.error("No devices matched the specified filter")
+            sys.exit(1)
+
+        logging.info(f"Running health check on {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=collect_health, num_workers=args.workers)
+
+        data = [results[host][0].result for host in results.keys()]
+
+        if args.format == "json":
+            output = json.dumps(data, indent=2, default=str)
+        else:
+            output = format_table(data)
+
+        print(output)
+
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output)
+            logging.info(f"Output saved to {args.output}")
+
+    except Exception as e:
+        logging.error(f"Execution failed: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+```
