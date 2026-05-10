@@ -1,221 +1,196 @@
 ```python
 """
-Device Uptime and Health Report - Network Automation Script
+Device Facts Gathering and Change Detection Tool
 
 Purpose:
-    Collects device uptime, system information, and health metrics
-    from network devices to generate a comprehensive health report.
+    Collects system facts from network devices using NAPALM and detects changes
+    against a baseline snapshot. Useful for tracking hardware changes, OS upgrades,
+    and device configuration drift.
 
 Usage:
-    python device_uptime_report.py --inventory inventory/ --device-group routers
-    python device_uptime_report.py --inventory inventory/ --device host-rtr-01
+    python device_facts.py --username admin --password secret --collect
+    python device_facts.py --username admin --password secret --compare baseline.json
+    python device_facts.py --host router1 --username admin --password secret --collect
 
 Prerequisites:
-    - Nornir with napalm plugin
-    - Network devices with SSH access configured
-    - Inventory YAML files properly configured
+    - Nornir configured with inventory (config.yaml)
+    - NAPALM installed (pip install napalm)
+    - Network devices accessible via SSH
+    - Valid SSH credentials
 """
 
 import argparse
+import json
 import logging
-from typing import Dict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import napalm_get
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
-def calculate_uptime_days(uptime_seconds: int) -> float:
-    """Convert uptime in seconds to days."""
-    return uptime_seconds / 86400
+def gather_device_facts(task: Task) -> Result:
+    """Retrieve device facts using NAPALM."""
+    try:
+        result = task.run(napalm_get, getters=["facts"])
+        facts = result[0].result.get("facts", {})
 
-
-def assess_health(uptime_days: float, cpu_percent: float) -> str:
-    """
-    Assess device health based on uptime and CPU usage.
-    
-    Args:
-        uptime_days: Device uptime in days
-        cpu_percent: CPU utilization percentage
-        
-    Returns:
-        Health status string
-    """
-    if uptime_days < 1:
-        return "CRITICAL - Recently rebooted"
-    if cpu_percent > 80:
-        return "WARNING - High CPU utilization"
-    if uptime_days < 30:
-        return "CAUTION - Recent reboot"
-    return "HEALTHY"
-
-
-def collect_device_health(nr, device_filter=None):
-    """
-    Collect health metrics from devices.
-    
-    Args:
-        nr: Nornir inventory
-        device_filter: Optional device name or group filter
-        
-    Returns:
-        Dictionary of device health data
-    """
-    if device_filter:
-        filtered = nr.filter(name=device_filter)
-        if not filtered.inventory.hosts:
-            filtered = nr.filter(F(groups__contains=device_filter))
-    else:
-        filtered = nr
-    
-    logger.info(f"Collecting health data from {len(filtered.inventory.hosts)} device(s)")
-    
-    results = filtered.run(
-        task=napalm_get,
-        getters=['get_facts', 'get_environment']
-    )
-    
-    health_data = {}
-    
-    for device_name, task_result in results.items():
-        if task_result.failed:
-            logger.warning(f"{device_name}: Failed to retrieve health data")
-            health_data[device_name] = {'status': 'FAILED'}
-            continue
-        
-        try:
-            facts = task_result[0].result.get('get_facts', {})
-            env = task_result[0].result.get('get_environment', {})
-            
-            uptime_sec = facts.get('uptime', 0)
-            uptime_days = calculate_uptime_days(uptime_sec)
-            
-            cpu_percent = 0.0
-            if env.get('cpu') and isinstance(env['cpu'], list) and env['cpu']:
-                cpu_percent = env['cpu'][0].get('%usage', 0.0)
-            
-            health_status = assess_health(uptime_days, cpu_percent)
-            
-            health_data[device_name] = {
-                'hostname': facts.get('hostname', 'N/A'),
-                'os': facts.get('os_version', 'N/A'),
-                'model': facts.get('model', 'N/A'),
-                'serial': facts.get('serial_number', 'N/A'),
-                'uptime_days': round(uptime_days, 2),
-                'cpu_percent': cpu_percent,
-                'status': health_status,
-                'vendor': facts.get('vendor', 'N/A')
+        return Result(
+            host=task.host,
+            result={
+                "hostname": facts.get("hostname"),
+                "os_version": facts.get("os_version"),
+                "serial_number": facts.get("serial_number"),
+                "model": facts.get("model"),
+                "vendor": facts.get("vendor"),
+                "uptime": facts.get("uptime"),
+                "interface_count": facts.get("interface_count"),
+                "timestamp": datetime.now().isoformat(),
             }
-            
-            logger.info(f"{device_name}: {health_status}")
-            
-        except (KeyError, TypeError, IndexError) as e:
-            logger.error(f"{device_name}: Failed to parse health data - {e}")
-            health_data[device_name] = {'status': 'PARSE_ERROR'}
-    
-    return health_data
+        )
+    except Exception as e:
+        logger.error(f"Failed to retrieve facts from {task.host}: {e}")
+        return Result(host=task.host, failed=True, exception=e)
 
 
-def print_health_report(health_data: Dict):
-    """
-    Print formatted health report.
-    
-    Args:
-        health_data: Dictionary of health metrics by device
-    """
-    if not health_data:
-        print("No health data collected")
-        return
-    
-    print("\n" + "=" * 90)
-    print("DEVICE HEALTH REPORT")
-    print("=" * 90)
-    print(f"{'Device':<20} {'Status':<30} {'Uptime (Days)':<15} {'CPU %':<10}")
-    print("-" * 90)
-    
-    for device, data in sorted(health_data.items()):
-        status = data.get('status', 'UNKNOWN')
-        uptime = data.get('uptime_days', 'N/A')
-        cpu = data.get('cpu_percent', 'N/A')
-        
-        if isinstance(uptime, float):
-            uptime_str = f"{uptime:.2f}"
-        else:
-            uptime_str = str(uptime)
-        
-        if isinstance(cpu, float):
-            cpu_str = f"{cpu:.1f}"
-        else:
-            cpu_str = str(cpu)
-        
-        print(f"{device:<20} {status:<30} {uptime_str:<15} {cpu_str:<10}")
-    
-    print("-" * 90)
-    
-    if health_data:
-        print("\nDetailed Information:")
-        for device, data in sorted(health_data.items()):
-            if data.get('status') in ['FAILED', 'PARSE_ERROR']:
-                continue
-            
-            print(f"\n{device}:")
-            print(f"  Hostname: {data.get('hostname', 'N/A')}")
-            print(f"  Vendor: {data.get('vendor', 'N/A')}")
-            print(f"  Model: {data.get('model', 'N/A')}")
-            print(f"  OS Version: {data.get('os', 'N/A')}")
-            print(f"  Serial: {data.get('serial', 'N/A')}")
-    
-    print("\n" + "=" * 90)
+def detect_changes(
+    current_facts: Dict[str, Any],
+    baseline_facts: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Detect changes between current and baseline facts."""
+    changes = {}
+    tracked_fields = ["os_version", "serial_number", "model", "uptime"]
+
+    for device, current in current_facts.items():
+        if device not in baseline_facts:
+            changes[device] = {"status": "NEW_DEVICE"}
+            continue
+
+        baseline = baseline_facts[device]
+        device_changes = {}
+
+        for field in tracked_fields:
+            current_val = current.get(field)
+            baseline_val = baseline.get(field)
+
+            if current_val != baseline_val:
+                device_changes[field] = {
+                    "previous": baseline_val,
+                    "current": current_val,
+                }
+
+        if device_changes:
+            changes[device] = device_changes
+
+    removed_devices = set(baseline_facts.keys()) - set(current_facts.keys())
+    for device in removed_devices:
+        changes[device] = {"status": "REMOVED"}
+
+    return changes
+
+
+def save_facts(facts: Dict[str, Any], filename: str) -> None:
+    """Save facts to JSON file."""
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    with open(filename, "w") as f:
+        json.dump(facts, f, indent=2)
+    logger.info(f"Facts saved to {filename}")
+
+
+def load_facts(filename: str) -> Optional[Dict[str, Any]]:
+    """Load facts from JSON file."""
+    try:
+        with open(filename) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"File not found: {filename}")
+        return None
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Generate device uptime and health report'
+        description="Collect device facts and detect changes"
+    )
+    parser.add_argument("--host", help="Single device to query")
+    parser.add_argument("--group", help="Device group from inventory")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        help="Collect facts from devices"
     )
     parser.add_argument(
-        '--inventory',
-        required=True,
-        help='Path to Nornir inventory directory'
+        "--compare",
+        metavar="BASELINE_FILE",
+        help="Compare against baseline and report changes"
     )
     parser.add_argument(
-        '--device',
-        help='Analyze specific device by name'
+        "--output",
+        default="device_facts_current.json",
+        help="Output file for collected facts"
     )
-    parser.add_argument(
-        '--device-group',
-        help='Analyze devices in specific group'
-    )
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging'
-    )
-    
+
     args = parser.parse_args()
-    
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
+
+    if not (args.collect or args.compare):
+        parser.error("Use --collect to gather facts or --compare to detect changes")
+
     try:
-        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-        
-        device_filter = args.device or args.device_group
-        health_data = collect_device_health(nr, device_filter)
-        print_health_report(health_data)
-        
+        nr = InitNornir(config_file="config.yaml")
+
+        if args.host:
+            nr = nr.filter(name=args.host)
+        elif args.group:
+            nr = nr.filter(group=args.group)
+
+        if not nr.inventory.hosts:
+            logger.error("No matching devices in inventory")
+            return 1
+
+        logger.info(f"Processing {len(nr.inventory.hosts)} device(s)")
+
+        results = nr.run(task=gather_device_facts)
+
+        collected_facts = {}
+        for device_name, task_result in results.items():
+            if task_result[0].failed:
+                logger.warning(f"Failed to collect facts from {device_name}")
+            else:
+                collected_facts[device_name] = task_result[0].result
+
+        if args.collect:
+            save_facts(collected_facts, args.output)
+
+        if args.compare:
+            baseline = load_facts(args.compare)
+            if not baseline:
+                return 1
+
+            changes = detect_changes(collected_facts, baseline)
+
+            if changes:
+                logger.warning(f"Changes detected in {len(changes)} device(s):")
+                print(json.dumps(changes, indent=2))
+            else:
+                logger.info("No changes detected")
+
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        raise
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
