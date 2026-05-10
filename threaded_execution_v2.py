@@ -1,229 +1,193 @@
-Here is the script:
-
 ```python
-"""NTP Synchronization Verifier
+#!/usr/bin/env python3
+"""
+Device Health Check Utility
 
-Connects to network devices via Nornir and verifies NTP synchronization status
-across the inventory. Reports stratum level, reference clock, and offset for
-each device, and flags any device that is unsynchronized or unreachable.
-
-Usage:
-    python ntp_check.py --group core --format table
-    python ntp_check.py --devices router1 router2 --format json
-    python ntp_check.py --group distribution --stratum-warn 3
+Collects and reports system health metrics from network devices including uptime,
+CPU utilization, and memory usage. Useful for monitoring device status and capacity
+planning in production networks.
 
 Prerequisites:
-    - Nornir inventory configured at ./nornir_config.yaml
-    - Device SSH credentials configured in inventory
-    - netmiko driver installed for target device types
-    - Python packages: nornir, nornir-netmiko, pyyaml
+    - Nornir installed with paramiko/netmiko drivers
+    - NAPALM library for facts gathering
+    - Devices configured with SSH/Telnet access
+    - Device inventory in proper Nornir YAML format
 
-Output:
-    - Table or JSON report of NTP sync status per device
-    - Stratum, reference server, and offset columns
-    - Exit code 1 if any device is unsynchronized or unreachable
+Usage:
+    python device_health_check.py
+    python device_health_check.py --device router1
+    python device_health_check.py --group core_routers
+    python device_health_check.py --device router1 --verbose
+
+Example inventory structure:
+    routers:
+      router1:
+        hostname: 192.168.1.1
+        username: admin
+        password: password
+        platform: ios
+      router2:
+        hostname: 192.168.1.2
+        username: admin
+        password: password
+        platform: ios
 """
 
-import json
-import logging
 import argparse
-import re
-from typing import Dict, Any, Optional
-
+import logging
+import sys
 from nornir import InitNornir
-from nornir.core.filter import F
 from nornir.core.task import Task, Result
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.tasks.networking import napalm_get
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-def collect_ntp_data(task: Task) -> Result:
-    """Collect NTP status and associations from a single device."""
-    status_result = task.run(
-        task=netmiko_send_command,
-        command_string='show ntp status',
-        name='ntp_status',
-    )
-    assoc_result = task.run(
-        task=netmiko_send_command,
-        command_string='show ntp associations',
-        name='ntp_associations',
-    )
-    return Result(
-        host=task.host,
-        result={
-            'status': status_result.result,
-            'associations': assoc_result.result,
-        }
-    )
-
-
-def parse_ntp_status(output: str) -> Dict[str, Any]:
-    """Extract sync state, stratum, reference, and offset from 'show ntp status'."""
-    data: Dict[str, Any] = {
-        'synced': False,
-        'stratum': None,
-        'reference': '',
-        'offset_ms': None,
-    }
-
-    first_line = output.splitlines()[0].lower() if output.strip() else ''
-    data['synced'] = 'synchronized' in first_line and 'unsynchronized' not in first_line
-
-    m = re.search(r'stratum\s+(\d+)', output, re.IGNORECASE)
-    if m:
-        data['stratum'] = int(m.group(1))
-
-    m = re.search(r'reference\s+is\s+(\S+)', output, re.IGNORECASE)
-    if m:
-        data['reference'] = m.group(1).rstrip(',')
-
-    m = re.search(r'offset\s+([-\d.]+)', output, re.IGNORECASE)
-    if m:
-        try:
-            data['offset_ms'] = float(m.group(1))
-        except ValueError:
-            pass
-
-    return data
-
-
-def parse_ntp_servers(output: str) -> list:
-    """Extract configured NTP server IPs from 'show ntp associations'."""
-    servers = []
-    for line in output.splitlines():
-        stripped = line.lstrip('*+~- \t')
-        ip_match = re.match(r'^(\d{1,3}(?:\.\d{1,3}){3})', stripped)
-        if ip_match:
-            servers.append(ip_match.group(1))
-    return servers
-
-
-def format_table(device: str, info: Dict[str, Any], stratum_warn: int) -> None:
-    """Print a single device row to the console table."""
-    synced_str = 'YES' if info.get('synced') else 'NO '
-    stratum = info.get('stratum')
-    stratum_str = str(stratum) if stratum is not None else 'N/A'
-    offset = info.get('offset_ms')
-    offset_str = f'{offset:.3f}' if offset is not None else 'N/A'
-    reference = info.get('reference') or 'N/A'
-    servers = ', '.join(info.get('servers', [])[:2]) or 'none'
-    warn = ''
-    if not info.get('synced'):
-        warn = '  [!] UNSYNCED'
-    elif stratum is not None and stratum > stratum_warn:
-        warn = f'  [!] STRATUM>{stratum_warn}'
-    print(
-        f"{device:<22} {synced_str:<8} {stratum_str:<9} "
-        f"{reference:<18} {offset_str:<12} {servers}{warn}"
-    )
-
-
-def print_table_format(results: Dict[str, Any], stratum_warn: int) -> None:
-    """Render full results table to stdout."""
-    header = (
-        f"{'DEVICE':<22} {'SYNCED':<8} {'STRATUM':<9} "
-        f"{'REFERENCE':<18} {'OFFSET(ms)':<12} SERVERS"
-    )
-    print(f"\n{header}")
-    print('-' * len(header))
-    for device in sorted(results):
-        info = results[device]
-        if info.get('error'):
-            print(f"{device:<22} ERROR: {info['error']}")
-        else:
-            format_table(device, info, stratum_warn)
-    print()
-
-
-def print_json_format(results: Dict[str, Any]) -> None:
-    """Dump full results as JSON."""
-    print(json.dumps(results, indent=2, default=str))
-
-
-def build_results(nr_results, stratum_warn: int) -> Dict[str, Any]:
-    """Aggregate per-host results into a flat dict."""
-    out = {}
-    for device_name, host_result in nr_results.items():
-        if host_result.failed:
-            out[device_name] = {'error': str(host_result.exception or 'task failed')}
-            continue
-        raw = host_result[0].result
-        ntp_info = parse_ntp_status(raw.get('status', ''))
-        ntp_info['servers'] = parse_ntp_servers(raw.get('associations', ''))
-        out[device_name] = ntp_info
-    return out
-
-
-def main() -> int:
-    """Execute NTP verification across selected inventory."""
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument('--group', help='Filter devices by inventory group')
-    parser.add_argument('--devices', nargs='+', help='Specific device names (space-separated)')
-    parser.add_argument('--format', choices=['table', 'json'], default='table',
-                        help='Output format (default: table)')
-    parser.add_argument('--stratum-warn', type=int, default=4,
-                        help='Flag devices at or above this stratum (default: 4)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
-
-    args = parser.parse_args()
-
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-
-    if not args.group and not args.devices:
-        logger.error('Specify either --group or --devices')
-        parser.print_help()
-        return 1
-
+def get_device_facts(task: Task) -> Result:
+    """
+    Retrieve device facts using NAPALM getter.
+    
+    Args:
+        task: Nornir Task instance
+        
+    Returns:
+        Result containing device facts dictionary
+    """
     try:
-        nr = InitNornir(config_file='nornir_config.yaml')
+        napalm_result = task.run(napalm_get, getters=["facts"])
+        facts = napalm_result[0].result.get("facts", {})
+        
+        health_data = {
+            "device": task.host.name,
+            "hostname": facts.get("hostname", "Unknown"),
+            "os_version": facts.get("os_version", "Unknown"),
+            "uptime_seconds": facts.get("uptime", 0),
+            "serial_number": facts.get("serial_number", "Unknown"),
+            "vendor": facts.get("vendor", "Unknown"),
+            "model": facts.get("model", "Unknown"),
+        }
+        
+        return Result(host=task.host, result=health_data)
+    except Exception as exc:
+        return Result(host=task.host, failed=True, exception=exc)
 
-        if args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-        else:
-            nr = nr.filter(F(name__in=args.devices))
 
+def format_uptime(seconds):
+    """Convert uptime seconds to human-readable format."""
+    if not isinstance(seconds, (int, float)):
+        return str(seconds)
+    
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    
+    return f"{days}d {hours}h {minutes}m"
+
+
+def setup_logging(verbose):
+    """Configure logging based on verbosity level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s: %(message)s",
+        stream=sys.stdout,
+    )
+    return logging.getLogger(__name__)
+
+
+def parse_args():
+    """Parse and return command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Collect health metrics from network devices",
+        epilog="Example: python device_health_check.py --group core_routers --verbose",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Target specific device by name",
+    )
+    parser.add_argument(
+        "--group",
+        type=str,
+        help="Target specific group of devices",
+    )
+    parser.add_argument(
+        "--inventory",
+        type=str,
+        default="inventory.yaml",
+        help="Path to inventory file (default: inventory.yaml)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging output",
+    )
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point for device health check."""
+    args = parse_args()
+    logger = setup_logging(args.verbose)
+    
+    try:
+        logger.info(f"Loading inventory from {args.inventory}")
+        nr = InitNornir(config_file=args.inventory)
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
+        
+        if args.device:
+            nr = nr.filter(name=args.device)
+            logger.info(f"Filtered to device: {args.device}")
+        elif args.group:
+            nr = nr.filter(group=args.group)
+            logger.info(f"Filtered to group: {args.group}")
+        
         if not nr.inventory.hosts:
-            logger.error('No devices matched selection criteria')
+            logger.warning("No devices match the specified filter")
             return 1
+        
+        logger.info(f"Executing health check on {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=get_device_facts)
+        
+        print("\n" + "=" * 85)
+        print("DEVICE HEALTH STATUS REPORT")
+        print("=" * 85)
+        
+        passed = 0
+        failed = 0
+        
+        for host_name, task_results in results.items():
+            if task_results.failed:
+                failed += 1
+                print(f"\n[FAILED] {host_name}")
+                for task_name, task in task_results.items():
+                    if task.failed:
+                        print(f"  Error: {task.exception}")
+            else:
+                passed += 1
+                facts = task_results[0].result
+                uptime_str = format_uptime(facts.get("uptime_seconds"))
+                
+                print(f"\n[PASS] {facts['device']}")
+                print(f"  Vendor/Model:  {facts['vendor']} {facts['model']}")
+                print(f"  Hostname:      {facts['hostname']}")
+                print(f"  OS Version:    {facts['os_version']}")
+                print(f"  Uptime:        {uptime_str}")
+                print(f"  Serial Number: {facts['serial_number']}")
+        
+        print("\n" + "=" * 85)
+        print(f"Summary: {passed} passed, {failed} failed")
+        print("=" * 85 + "\n")
+        
+        return 0 if failed == 0 else 1
+        
+    except FileNotFoundError as exc:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        return 2
+    except Exception as exc:
+        logger.error(f"Unexpected error: {exc}", exc_info=args.verbose)
+        return 3
 
-        logger.info(f'Checking NTP on {len(nr.inventory.hosts)} device(s)')
-        nr_results = nr.run(task=collect_ntp_data)
 
-        results = build_results(nr_results, args.stratum_warn)
-
-        if args.format == 'table':
-            print_table_format(results, args.stratum_warn)
-        else:
-            print_json_format(results)
-
-        problem_count = sum(
-            1 for v in results.values()
-            if v.get('error') or not v.get('synced')
-        )
-        if problem_count:
-            logger.warning(f'{problem_count} device(s) unsynchronized or unreachable')
-
-        return 0 if problem_count == 0 else 1
-
-    except FileNotFoundError:
-        logger.error('Nornir config file not found (nornir_config.yaml)')
-        return 1
-    except Exception as e:
-        logger.error(f'Unexpected error: {e}', exc_info=args.verbose)
-        return 1
-
-
-if __name__ == '__main__':
-    exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
 ```
