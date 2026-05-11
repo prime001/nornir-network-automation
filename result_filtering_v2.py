@@ -1,200 +1,223 @@
-route_filter.py — Nornir Route Table Filter
-============================================
-Query routing tables from one or more network devices and filter the results
-by routing protocol, prefix string, or next-hop address.
+```python
+"""
+Nornir Task Result Filter and Reporter
+
+Executes tasks across network devices and filters/analyzes results based on
+device criteria, execution status, and output patterns. Generates detailed
+reports in multiple formats for network validation and troubleshooting.
 
 Usage:
-    python route_filter.py --protocol ospf
-    python route_filter.py --prefix 10.0.0 --filter-group core-routers
-    python route_filter.py --next-hop 192.168.1.1
+    python 051_task_result_filter.py --task "show version" --format json
+    python 051_task_result_filter.py --task "show interfaces" --device-type ios
+    python 051_task_result_filter.py --devices router1,router2 --task "show ip route"
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    Inventory files: hosts.yaml, groups.yaml, defaults.yaml
-    Devices must accept 'show ip route' (Cisco IOS / IOS-XE / NX-OS compatible).
+    - Nornir installed and configured with inventory
+    - Network connectivity to all target devices
+    - Device credentials configured in inventory
+    - Netmiko support for target device platforms
 """
 
-import argparse
+import json
 import logging
-import re
+import argparse
 import sys
-from typing import Dict, List, Optional
-
+from typing import Dict, Any, Optional
 from nornir import InitNornir
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import netmiko_send_command
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
-
-log = logging.getLogger(__name__)
-
-PROTOCOL_MAP = {
-    "ospf": r"^O",
-    "bgp": r"^B",
-    "static": r"^S",
-    "connected": r"^C",
-    "eigrp": r"^D",
-    "rip": r"^R",
-    "isis": r"^i",
-}
 
 
-def parse_routes(raw: str) -> List[Dict[str, str]]:
-    """Parse 'show ip route' text into a list of route dicts."""
-    routes: List[Dict[str, str]] = []
-    proto_code = ""
-    current_prefix = ""
-
-    for line in raw.splitlines():
-        # Primary route line: protocol code + prefix + metric
-        m = re.match(
-            r"^([A-Z][A-Z0-9 *]*?)\s+([\d./]+(?:/\d+)?)\s+\[", line
-        )
-        if m:
-            proto_code = m.group(1).strip()
-            current_prefix = m.group(2).strip()
-            nh = re.search(r"via\s+([\d.]+)", line)
-            iface = re.search(r"via\s+[\d.]+,\s+(\S+)", line)
-            routes.append(
-                {
-                    "prefix": current_prefix,
-                    "protocol": proto_code,
-                    "next_hop": nh.group(1) if nh else "directly connected",
-                    "interface": iface.group(1).rstrip(",") if iface else "",
-                }
-            )
-        elif current_prefix and re.match(r"^\s+\[", line):
-            # ECMP continuation line for the same prefix
-            nh = re.search(r"via\s+([\d.]+)", line)
-            iface = re.search(r"via\s+[\d.]+,\s+(\S+)", line)
-            routes.append(
-                {
-                    "prefix": current_prefix,
-                    "protocol": proto_code,
-                    "next_hop": nh.group(1) if nh else "directly connected",
-                    "interface": iface.group(1).rstrip(",") if iface else "",
-                }
-            )
-
-    return routes
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def apply_filters(
-    routes: List[Dict[str, str]],
-    protocol: Optional[str],
-    prefix: Optional[str],
-    next_hop: Optional[str],
-) -> List[Dict[str, str]]:
-    result = routes
-    if protocol:
-        pattern = PROTOCOL_MAP.get(protocol.lower(), protocol)
-        result = [r for r in result if re.match(pattern, r["protocol"], re.IGNORECASE)]
-    if prefix:
-        result = [r for r in result if prefix in r["prefix"]]
-    if next_hop:
-        result = [r for r in result if next_hop in r["next_hop"]]
-    return result
+class ResultFilter:
+    """Filters and analyzes Nornir task execution results with chainable methods."""
+    
+    def __init__(self, results: Dict):
+        self.results = results
+        self.filtered = results.copy()
+    
+    def by_status(self, status: str) -> 'ResultFilter':
+        """Filter results by execution status (ok/failed)."""
+        self.filtered = {
+            name: res for name, res in self.filtered.items()
+            if (status == "ok" and not res.failed) or (status == "failed" and res.failed)
+        }
+        return self
+    
+    def by_device_type(self, device_type: str) -> 'ResultFilter':
+        """Filter results by device platform."""
+        filtered = {}
+        for name, res in self.filtered.items():
+            host = res.host if hasattr(res, 'host') else None
+            if host and hasattr(host, 'platform') and host.platform == device_type:
+                filtered[name] = res
+        self.filtered = filtered
+        return self
+    
+    def by_pattern(self, pattern: str) -> 'ResultFilter':
+        """Filter results containing specific text pattern (regex)."""
+        import re
+        filtered = {}
+        for name, res in self.filtered.items():
+            try:
+                output = self._extract_output(res)
+                if re.search(pattern, output, re.IGNORECASE):
+                    filtered[name] = res
+            except Exception:
+                pass
+        self.filtered = filtered
+        return self
+    
+    @staticmethod
+    def _extract_output(result) -> str:
+        """Extract text output from result object."""
+        if hasattr(result, 'result'):
+            return str(result.result)
+        return str(result)
+    
+    def get(self) -> Dict:
+        """Return filtered results."""
+        return self.filtered
 
 
-def fetch_routes(task: Task) -> Result:
-    """Nornir task: run 'show ip route' and return raw output."""
-    r = task.run(
-        task=netmiko_send_command,
-        command_string="show ip route",
-        use_textfsm=False,
-    )
-    return Result(host=task.host, result=r.result)
-
-
-def print_table(hostname: str, routes: List[Dict[str, str]]) -> None:
-    if not routes:
-        print(f"  {hostname}: no matching routes\n")
-        return
-    print(f"  {hostname}  ({len(routes)} route{'s' if len(routes) != 1 else ''})")
-    print(f"  {'PREFIX':<22} {'PROTOCOL':<12} {'NEXT-HOP':<20} INTERFACE")
-    print("  " + "-" * 70)
-    for r in routes:
-        print(
-            f"  {r['prefix']:<22} {r['protocol']:<12} {r['next_hop']:<20} {r['interface']}"
-        )
-    print()
-
-
-def build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Filter routing tables across network devices with Nornir",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--inventory", default="hosts.yaml", metavar="FILE")
-    p.add_argument("--groups-file", default="groups.yaml", metavar="FILE")
-    p.add_argument("--defaults-file", default="defaults.yaml", metavar="FILE")
-    p.add_argument("--filter-group", metavar="GROUP", help="Limit to a Nornir host group")
-    p.add_argument(
-        "--protocol",
-        choices=list(PROTOCOL_MAP.keys()),
-        metavar="PROTO",
-        help=f"Routing protocol: {', '.join(PROTOCOL_MAP)}",
-    )
-    p.add_argument("--prefix", metavar="STR", help="Substring match on prefix (e.g. '10.0.0')")
-    p.add_argument("--next-hop", metavar="IP", help="Exact or partial next-hop IP match")
-    p.add_argument("--workers", type=int, default=10, help="Parallel thread count")
-    p.add_argument("--debug", action="store_true")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = build_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
+def run_command_task(task: Task, command: str) -> Result:
+    """Execute command via Netmiko."""
+    return task.run(
+        netmiko_send_command,
+        command_string=command
     )
 
-    if not any([args.protocol, args.prefix, args.next_hop]):
-        log.warning("No filter specified — all routes will be shown")
 
+def generate_text_report(results: Dict, title: str = "Task Results") -> str:
+    """Generate human-readable text report."""
+    lines = [
+        "=" * 70,
+        title,
+        "=" * 70,
+        f"Total Devices: {len(results)}",
+    ]
+    
+    ok_count = sum(1 for r in results.values() if not r.failed)
+    failed_count = len(results) - ok_count
+    lines.append(f"Successful: {ok_count} | Failed: {failed_count}")
+    
+    if len(results) > 0:
+        lines.append(f"Success Rate: {(ok_count/len(results)*100):.1f}%")
+    lines.append("=" * 70)
+    
+    for device, result in sorted(results.items()):
+        status = "✓" if not result.failed else "✗"
+        lines.append(f"\n[{status}] {device}")
+        
+        try:
+            output = ResultFilter._extract_output(result)
+            if output:
+                output_lines = output.split('\n')[:5]
+                for line in output_lines:
+                    lines.append(f"    {line}")
+                if len(output.split('\n')) > 5:
+                    lines.append(f"    ... ({len(output.split(chr(10))) - 5} more lines)")
+        except Exception as e:
+            lines.append(f"    Error: {e}")
+    
+    return "\n".join(lines)
+
+
+def generate_json_report(results: Dict) -> str:
+    """Generate JSON format report."""
+    report = {
+        "summary": {
+            "total": len(results),
+            "successful": sum(1 for r in results.values() if not r.failed),
+            "failed": sum(1 for r in results.values() if r.failed),
+        },
+        "devices": {}
+    }
+    
+    for device, result in sorted(results.items()):
+        try:
+            output = ResultFilter._extract_output(result)
+            report["devices"][device] = {
+                "status": "ok" if not result.failed else "failed",
+                "output": output[:500]
+            }
+        except Exception as e:
+            report["devices"][device] = {
+                "status": "error",
+                "error": str(e)
+            }
+    
+    return json.dumps(report, indent=2)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Filter and analyze Nornir task execution results"
+    )
+    parser.add_argument("--task", required=True, help="Command to execute on devices")
+    parser.add_argument("--devices", help="Comma-separated device list (default: all)")
+    parser.add_argument("--device-type", help="Filter by device platform (ios, eos, etc.)")
+    parser.add_argument("--status", choices=["ok", "failed"], help="Filter by execution status")
+    parser.add_argument("--pattern", help="Filter by output pattern (regex)")
+    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
+    parser.add_argument("--output", help="Write to file instead of stdout")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     try:
-        nr = InitNornir(
-            runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-            inventory={
-                "plugin": "SimpleInventory",
-                "options": {
-                    "host_file": args.inventory,
-                    "group_file": args.groups_file,
-                    "defaults_file": args.defaults_file,
-                },
-            },
-        )
-    except Exception as exc:
-        log.error("Nornir init failed: %s", exc)
-        sys.exit(1)
-
-    if args.filter_group:
-        nr = nr.filter(F(groups__contains=args.filter_group))
-        if not nr.inventory.hosts:
-            log.error("No hosts found in group '%s'", args.filter_group)
-            sys.exit(1)
-
-    log.info("Querying %d device(s)", len(nr.inventory.hosts))
-    agg = nr.run(task=fetch_routes, name="fetch_routes")
-
-    failed = [h for h, r in agg.items() if r.failed]
-    if failed:
-        log.warning("Unreachable: %s", ", ".join(failed))
-
-    print("\nRoute Filter Results")
-    print("=" * 72)
-    total = 0
-    for hostname, multi in agg.items():
-        if multi.failed:
-            print(f"  {hostname}: ERROR — {multi[0].exception}\n")
-            continue
-        routes = parse_routes(multi[0].result)
-        filtered = apply_filters(routes, args.protocol, args.prefix, args.next_hop)
-        print_table(hostname, filtered)
-        total += len(filtered)
-
-    print(f"Total matching routes: {total}  |  Devices queried: {len(agg)}"
-          f"  |  Failures: {len(failed)}")
+        logger.info("Initializing Nornir")
+        nr = InitNornir()
+        
+        if args.devices:
+            device_list = [d.strip() for d in args.devices.split(",")]
+            nr = nr.filter(F(name__in=device_list))
+            logger.info(f"Targeting {len(nr.inventory.hosts)} specified devices")
+        
+        logger.info(f"Executing task: {args.task}")
+        results = nr.run(task=run_command_task, command=args.task)
+        
+        logger.info("Applying filters to results")
+        filters = ResultFilter(results)
+        if args.status:
+            filters.by_status(args.status)
+        if args.device_type:
+            filters.by_device_type(args.device_type)
+        if args.pattern:
+            filters.by_pattern(args.pattern)
+        
+        filtered = filters.get()
+        logger.info(f"Filtered results: {len(filtered)} devices")
+        
+        if args.format == "json":
+            report = generate_json_report(filtered)
+        else:
+            report = generate_text_report(filtered)
+        
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(report)
+            logger.info(f"Report written to {args.output}")
+        else:
+            print(report)
+        
+        return 0
+    
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=args.verbose)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+```
