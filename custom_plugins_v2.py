@@ -1,204 +1,224 @@
-The user wants the script output directly. I'll write it now.
-
-```
+```python
 """
-CDP/LLDP Network Topology Discovery
+Device Health Monitor - Nornir Network Automation
 
-Collects neighbor discovery protocol data (CDP or LLDP) from one or more seed
-devices via Nornir/Netmiko, builds a layer-2 topology map, and writes it as
-JSON. An optional Graphviz DOT file can also be emitted for visualization
-with `dot -Tpng topology.dot -o topology.png`.
+Purpose:
+    Monitor and report on the health status of network devices including
+    connectivity, uptime, interface states, and resource utilization.
 
 Usage:
-    python topology_discovery.py \
-        --hosts 10.0.0.1,10.0.0.2 \
-        --username admin --password secret \
-        --protocol cdp --output topology.json --dot topology.dot
+    python device_health_monitor.py --inventory inventory.yml
+    python device_health_monitor.py --inventory inventory.yml --groups routers
+    python device_health_monitor.py --inventory inventory.yml --output-file health.json --format json
 
 Prerequisites:
-    pip install nornir nornir-netmiko netmiko
-    CDP or LLDP must be enabled on target devices.
-    User account requires at minimum read-only (show) access.
+    - Nornir with netmiko plugin installed
+    - Network device inventory in YAML format
+    - Devices must be reachable via SSH with valid credentials
+    - Supported device types: Cisco IOS, Junos, Arista EOS
 """
 
 import argparse
 import json
 import logging
-import re
-import sys
-from typing import Any
-
-from nornir.core import Nornir
-from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
-from nornir.core.plugins.runners import ThreadedRunner
-from nornir.core.task import Result, Task
+from typing import Dict, Any
+from datetime import datetime
+from nornir import InitNornir
+from nornir.core.task import Task, Result
 from nornir_netmiko.tasks import netmiko_send_command
+from nornir_utils.plugins.functions import print_result
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("topology_discovery")
+logger = logging.getLogger(__name__)
 
 
-def build_nornir(
-    hosts: list[str], username: str, password: str, platform: str, workers: int
-) -> Nornir:
-    host_dict = {
-        h: Host(name=h, hostname=h, username=username, password=password, platform=platform)
-        for h in hosts
+def get_device_uptime(task: Task) -> Result:
+    """Retrieve device uptime using show version command."""
+    try:
+        if task.host.platform == "cisco_ios":
+            cmd = "show version"
+        elif task.host.platform == "juniper_junos":
+            cmd = "show system uptime"
+        else:
+            cmd = "show version"
+
+        result = task.run(netmiko_send_command, command_string=cmd)
+        output = result[0].result
+
+        uptime = "Unknown"
+        for line in output.split("\n"):
+            if "uptime" in line.lower():
+                uptime = line.strip()
+                break
+
+        return Result(host=task.host, result={"uptime": uptime})
+
+    except Exception as e:
+        logger.error(f"{task.host.name}: Failed to get uptime - {str(e)}")
+        return Result(host=task.host, result={"uptime": "Error", "error": str(e)})
+
+
+def get_interface_summary(task: Task) -> Result:
+    """Summarize interface status (up/down counts)."""
+    try:
+        result = task.run(netmiko_send_command, command_string="show interfaces")
+        output = result[0].result
+
+        up_count = 0
+        down_count = 0
+
+        for line in output.split("\n"):
+            line_lower = line.lower()
+            if " is up" in line_lower and "admin" not in line_lower:
+                up_count += 1
+            elif " is down" in line_lower:
+                down_count += 1
+
+        return Result(
+            host=task.host,
+            result={"interfaces_up": up_count, "interfaces_down": down_count}
+        )
+
+    except Exception as e:
+        logger.error(f"{task.host.name}: Failed to get interfaces - {str(e)}")
+        return Result(
+            host=task.host,
+            result={"interfaces_up": 0, "interfaces_down": 0, "error": str(e)}
+        )
+
+
+def get_system_resources(task: Task) -> Result:
+    """Retrieve CPU and memory utilization."""
+    resources = {"cpu_usage": "N/A", "memory_usage": "N/A"}
+
+    try:
+        if task.host.platform == "cisco_ios":
+            result = task.run(netmiko_send_command, command_string="show processes cpu")
+            output = result[0].result
+
+            for line in output.split("\n"):
+                if "CPU utilization" in line or "5 sec:" in line:
+                    resources["cpu_usage"] = line.strip()
+                    break
+
+    except Exception as e:
+        logger.warning(f"{task.host.name}: Could not retrieve resources - {str(e)}")
+
+    return Result(host=task.host, result=resources)
+
+
+def monitor_device_health(task: Task) -> Result:
+    """Aggregate health metrics for a device."""
+    health = {
+        "device_name": task.host.name,
+        "platform": task.host.platform,
+        "timestamp": datetime.now().isoformat(),
+        "status": "HEALTHY"
     }
-    return Nornir(
-        inventory=Inventory(hosts=Hosts(host_dict), groups=Groups({}), defaults=Defaults()),
-        runner=ThreadedRunner(num_workers=workers),
-    )
+
+    try:
+        uptime_result = task.run(get_device_uptime)
+        health["uptime"] = uptime_result[0].result.get("uptime", "Unknown")
+
+        interface_result = task.run(get_interface_summary)
+        health["interfaces_up"] = interface_result[0].result.get("interfaces_up", 0)
+        health["interfaces_down"] = interface_result[0].result.get("interfaces_down", 0)
+
+        resource_result = task.run(get_system_resources)
+        health["cpu_usage"] = resource_result[0].result.get("cpu_usage", "N/A")
+
+        if health["interfaces_down"] > 0:
+            health["status"] = "WARNING"
+
+    except Exception as e:
+        logger.error(f"{task.host.name}: Health check failed - {str(e)}")
+        health["status"] = "FAILED"
+        health["error"] = str(e)
+
+    return Result(host=task.host, result=health)
 
 
-def collect_cdp(task: Task) -> Result:
-    r = task.run(
-        task=netmiko_send_command,
-        command_string="show cdp neighbors detail",
-        use_textfsm=True,
-    )
-    return Result(host=task.host, result=r.result)
-
-
-def collect_lldp(task: Task) -> Result:
-    r = task.run(
-        task=netmiko_send_command,
-        command_string="show lldp neighbors detail",
-        use_textfsm=True,
-    )
-    return Result(host=task.host, result=r.result)
-
-
-def _parse_cdp_raw(text: str) -> list[dict]:
-    """Regex fallback when TextFSM template is unavailable."""
-    neighbors = []
-    for block in re.split(r"-{20,}", text):
-        device_id = re.search(r"Device ID:\s*(\S+)", block)
-        local_if = re.search(r"Interface:\s*(\S+),", block)
-        remote_if = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
-        platform = re.search(r"Platform:\s*(.+?),", block)
-        if device_id and local_if:
-            neighbors.append(
-                {
-                    "neighbor": device_id.group(1),
-                    "local_interface": local_if.group(1),
-                    "neighbor_interface": remote_if.group(1) if remote_if else "unknown",
-                    "platform": platform.group(1).strip() if platform else "unknown",
-                }
-            )
-    return neighbors
-
-
-def normalize(raw: Any, protocol: str) -> list[dict]:
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        return _parse_cdp_raw(raw) if protocol == "cdp" else []
-    return []
-
-
-def build_topology(data: dict[str, list[dict]]) -> dict:
-    topology: dict = {"nodes": {}, "edges": []}
-    seen: set = set()
-
-    for hostname, neighbors in data.items():
-        topology["nodes"].setdefault(hostname, {"hostname": hostname})
-        for nbr in neighbors:
-            nid = nbr.get("neighbor") or nbr.get("dest_host", "unknown")
-            local = nbr.get("local_interface") or nbr.get("local_port", "")
-            remote = nbr.get("neighbor_interface") or nbr.get("neighbor_port", "")
-            plat = nbr.get("platform") or nbr.get("capabilities", "")
-
-            topology["nodes"].setdefault(nid, {"hostname": nid, "platform": plat})
-
-            key = tuple(sorted([f"{hostname}:{local}", f"{nid}:{remote}"]))
-            if key not in seen:
-                seen.add(key)
-                topology["edges"].append(
-                    {
-                        "source": hostname,
-                        "source_interface": local,
-                        "target": nid,
-                        "target_interface": remote,
-                    }
-                )
-
-    return topology
-
-
-def write_dot(topology: dict, path: str) -> None:
-    lines = ['graph topology {', '    rankdir=LR;', '    node [shape=box];']
-    for node in topology["nodes"]:
-        lines.append(f'    "{node}";')
-    for edge in topology["edges"]:
-        label = f'{edge["source_interface"]} -- {edge["target_interface"]}'
-        lines.append(f'    "{edge["source"]}" -- "{edge["target"]}" [label="{label}"];')
-    lines.append("}")
-    with open(path, "w") as fh:
-        fh.write("\n".join(lines) + "\n")
-    logger.info("DOT file written: %s", path)
-
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="Discover network topology via CDP or LLDP using Nornir"
+        description="Monitor network device health and status"
     )
-    parser.add_argument("--hosts", required=True, help="Comma-separated seed device IPs/hostnames")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
-    parser.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp")
-    parser.add_argument("--output", default="topology.json", help="JSON output path")
-    parser.add_argument("--dot", help="Optional Graphviz DOT output path")
-    parser.add_argument("--workers", type=int, default=10, help="Parallel workers (default: 10)")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--inventory",
+        required=True,
+        help="Path to Nornir inventory file (YAML)"
+    )
+    parser.add_argument(
+        "--groups",
+        help="Comma-separated list of device groups to monitor"
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
+    )
+    parser.add_argument(
+        "--output-file",
+        help="Write results to file (optional)"
+    )
+
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    try:
+        nr = InitNornir(config_file=args.inventory)
+        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} devices")
+    except Exception as e:
+        logger.error(f"Failed to load inventory: {str(e)}")
+        return 1
 
-    host_list = [h.strip() for h in args.hosts.split(",") if h.strip()]
-    nr = build_nornir(host_list, args.username, args.password, args.platform, args.workers)
+    if args.groups:
+        group_list = [g.strip() for g in args.groups.split(",")]
+        nr = nr.filter(groups__contains=group_list)
+        logger.info(f"Filtered to {len(nr.inventory.hosts)} devices")
 
-    task_fn = collect_cdp if args.protocol == "cdp" else collect_lldp
-    logger.info("Collecting %s neighbors from %d host(s)", args.protocol.upper(), len(host_list))
+    results = nr.run(task=monitor_device_health)
 
-    agg = nr.run(task=task_fn)
+    health_report = {}
+    for host_name, multi_result in results.items():
+        if multi_result.failed:
+            health_report[host_name] = {"status": "UNREACHABLE"}
+        else:
+            health_report[host_name] = multi_result[0].result
 
-    neighbor_data: dict[str, list[dict]] = {}
-    failed: list[str] = []
-    for host, multi in agg.items():
-        if multi.failed:
-            logger.warning("Failed on %s: %s", host, multi[0].exception)
-            failed.append(host)
-            continue
-        neighbor_data[host] = normalize(multi[0].result, args.protocol)
+    if args.format == "json":
+        output = json.dumps(health_report, indent=2)
+    else:
+        output = "\n" + "=" * 70 + "\n"
+        output += "DEVICE HEALTH REPORT\n"
+        output += "=" * 70 + "\n"
 
-    if failed:
-        logger.warning("Unreachable hosts (%d): %s", len(failed), ", ".join(failed))
+        for device_name, health_data in health_report.items():
+            status_symbol = "✓" if health_data["status"] == "HEALTHY" else "✗"
+            output += f"\n{status_symbol} {device_name} ({health_data.get('platform', 'Unknown')})\n"
+            output += "-" * 70 + "\n"
+            output += f"  Status:            {health_data.get('status', 'Unknown')}\n"
+            output += f"  Uptime:            {health_data.get('uptime', 'Unknown')}\n"
+            output += f"  Interfaces Up:     {health_data.get('interfaces_up', 0)}\n"
+            output += f"  Interfaces Down:   {health_data.get('interfaces_down', 0)}\n"
+            output += f"  CPU Usage:         {health_data.get('cpu_usage', 'N/A')}\n"
 
-    if not neighbor_data:
-        logger.error("No neighbor data collected; check connectivity and credentials")
-        sys.exit(1)
+            if "error" in health_data:
+                output += f"  Error:             {health_data['error']}\n"
 
-    topology = build_topology(neighbor_data)
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            f.write(output)
+        logger.info(f"Report written to {args.output_file}")
+    else:
+        print(output)
 
-    with open(args.output, "w") as fh:
-        json.dump(topology, fh, indent=2)
-    logger.info(
-        "Topology saved to %s — %d nodes, %d edges",
-        args.output,
-        len(topology["nodes"]),
-        len(topology["edges"]),
-    )
-
-    if args.dot:
-        write_dot(topology, args.dot)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
