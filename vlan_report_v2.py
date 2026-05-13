@@ -1,169 +1,229 @@
+Since the write was blocked, here's the complete script content you can save as `vlan_report_v3.py`:
+
 ```python
 """
-Device Health Check and Uptime Monitoring
+VLAN Trunk Audit — vlan_report_v3.py
+
+Audits trunk port configurations across network devices, comparing allowed VLANs
+against active VLANs to surface pruned or misconfigured trunk links.
 
 Purpose:
-    Collects device uptime and system information from network devices using NAPALM.
-    Generates a formatted report of device health metrics including uptime, OS version,
-    and hardware model information.
+    Identifies VLAN mismatches on trunk interfaces — VLANs that are allowed but
+    not forwarding (pruned, STP blocked, or locally absent) across a device fleet.
 
 Usage:
-    python device_health.py --device core-router-01
-    python device_health.py --all --format json
-    python device_health.py --all --format table
+    python vlan_report_v3.py --hosts 10.0.0.1,10.0.0.2 --username admin --password secret
+    python vlan_report_v3.py --hosts 10.0.0.1 -u admin -p secret --vlan 100 --csv trunks.csv
+    python vlan_report_v3.py --inventory hosts.yaml --platform cisco_ios --show-pruned
 
 Prerequisites:
-    - nornir, netmiko, napalm installed
-    - Nornir inventory with device credentials configured
-    - Network devices with SSH access enabled
-    - NAPALM drivers available for target device types
+    pip install nornir nornir-netmiko nornir-utils netmiko
+    Devices must be reachable via SSH with show-level access.
+    Tested against Cisco IOS/IOS-XE. Adjust regex for other platforms.
 """
 
 import argparse
-import json
+import csv
 import logging
+import re
 import sys
-from pathlib import Path
-from typing import Dict, Any, List
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.tasks.networking import napalm_get
-
+from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.WARNING,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("vlan_trunk_audit")
 
 
-def collect_device_health(task) -> Dict[str, Any]:
-    """Retrieve device facts and format health data."""
-    try:
-        result = task.run(napalm_get, getters=["facts"])
-        facts = result[0].result.get("facts", {})
-
-        uptime_sec = facts.get("uptime", 0)
-        days = uptime_sec // 86400
-        hours = (uptime_sec % 86400) // 3600
-
-        return {
-            "device": task.host.name,
-            "status": "UP",
-            "uptime_seconds": uptime_sec,
-            "uptime": f"{days}d {hours}h",
-            "os_version": facts.get("os_version", "N/A"),
-            "model": facts.get("model", "N/A"),
-            "serial": facts.get("serial_number", "N/A"),
-        }
-    except Exception as e:
-        logger.error(f"Error collecting health from {task.host.name}: {str(e)}")
-        return {
-            "device": task.host.name,
-            "status": "DOWN",
-            "error": str(e),
-        }
+def _expand_vlan_range(vlan_str: str) -> set[int]:
+    """Convert Cisco VLAN range string like '1-5,10,20-25' to a set of ints."""
+    vlans: set[int] = set()
+    for part in vlan_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            vlans.update(range(int(lo), int(hi) + 1))
+        elif part.isdigit():
+            vlans.add(int(part))
+    return vlans
 
 
-def format_table(devices: List[Dict[str, Any]]) -> str:
-    """Format output as ASCII table."""
-    header = (
-        f"{'Device':<20} {'Status':<8} {'Uptime':<12} "
-        f"{'Model':<20} {'OS Version':<15}"
+def collect_trunk_data(task: Task) -> Result:
+    """Nornir task: pull trunk interface details from a single device."""
+    output = task.run(
+        netmiko_send_command,
+        command_string="show interfaces trunk",
+        name="show interfaces trunk",
     )
-    separator = "-" * 75
+    return Result(host=task.host, result=output.result)
 
-    lines = [separator, header, separator]
-    for dev in devices:
-        if dev["status"] == "UP":
-            lines.append(
-                f"{dev['device']:<20} {dev['status']:<8} {dev['uptime']:<12} "
-                f"{dev['model']:<20} {dev['os_version']:<15}"
-            )
+
+def parse_trunk_output(raw: str) -> list[dict]:
+    """Parse IOS 'show interfaces trunk' into a list of port dicts."""
+    sections = {
+        "mode": re.compile(r"Port\s+Mode\s+Encapsulation\s+Status\s+Native vlan"),
+        "allowed": re.compile(r"Port\s+Vlans allowed on trunk"),
+        "active": re.compile(r"Port\s+Vlans allowed and active in management domain"),
+        "forwarding": re.compile(r"Port\s+Vlans in spanning tree forwarding state"),
+    }
+
+    lines = raw.splitlines()
+    blocks: dict[str, list[str]] = {k: [] for k in sections}
+    current = None
+
+    for line in lines:
+        for key, pattern in sections.items():
+            if pattern.match(line):
+                current = key
+                break
         else:
-            error_msg = dev.get("error", "Unknown")[:15]
-            lines.append(
-                f"{dev['device']:<20} {dev['status']:<8} {'N/A':<12} "
-                f"{'N/A':<20} {error_msg:<15}"
+            if current and line.strip():
+                blocks[current].append(line.strip())
+
+    ports: dict[str, dict] = {}
+
+    for line in blocks["mode"]:
+        parts = line.split()
+        if len(parts) >= 5:
+            port = parts[0]
+            ports[port] = {
+                "port": port,
+                "mode": parts[1],
+                "encap": parts[2],
+                "status": parts[3],
+                "native_vlan": parts[4],
+                "allowed": set(),
+                "active": set(),
+                "forwarding": set(),
+            }
+
+    for key in ("allowed", "active", "forwarding"):
+        for line in blocks[key]:
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                port, vlan_str = parts
+                if port in ports:
+                    ports[port][key] = _expand_vlan_range(vlan_str)
+
+    return list(ports.values())
+
+
+def audit_trunks(
+    results: dict, filter_vlan: int | None = None, show_pruned: bool = False
+) -> list[dict]:
+    """Combine per-device trunk results into audit rows."""
+    rows = []
+    for host, port_list in results.items():
+        for p in port_list:
+            pruned = p["allowed"] - p["active"]
+            missing_forward = p["active"] - p["forwarding"]
+
+            if filter_vlan is not None:
+                if filter_vlan not in p["allowed"]:
+                    continue
+
+            if show_pruned and not pruned:
+                continue
+
+            rows.append(
+                {
+                    "host": host,
+                    "port": p["port"],
+                    "status": p["status"],
+                    "native_vlan": p["native_vlan"],
+                    "allowed_count": len(p["allowed"]),
+                    "active_count": len(p["active"]),
+                    "pruned_count": len(pruned),
+                    "not_forwarding_count": len(missing_forward),
+                    "pruned_vlans": ",".join(str(v) for v in sorted(pruned)) or "none",
+                }
             )
-    lines.append(separator)
-
-    return "\n".join(lines)
+    return rows
 
 
-def format_json(devices: List[Dict[str, Any]]) -> str:
-    """Format output as JSON."""
-    return json.dumps(devices, indent=2)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Collect and display device health information"
+def build_inventory(hosts: list[str], username: str, password: str, platform: str) -> Inventory:
+    nornir_hosts = Hosts(
+        {
+            h: Host(
+                name=h,
+                hostname=h,
+                username=username,
+                password=password,
+                platform=platform,
+                groups=[],
+            )
+            for h in hosts
+        }
     )
-    parser.add_argument(
-        "--device",
-        help="Target device hostname"
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Check all devices in inventory"
-    )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)"
-    )
-    parser.add_argument(
-        "--inventory",
-        type=Path,
-        default=Path("inventory"),
-        help="Path to Nornir inventory directory"
-    )
+    return Inventory(hosts=nornir_hosts, groups=Groups(), defaults=Defaults())
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="VLAN trunk port audit via Nornir")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--hosts", help="Comma-separated list of device IPs/hostnames")
+    src.add_argument("--inventory", help="Path to Nornir hosts YAML inventory file")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
+    parser.add_argument("--vlan", type=int, help="Filter output to trunks carrying this VLAN ID")
+    parser.add_argument("--show-pruned", action="store_true", help="Show only trunks with pruned VLANs")
+    parser.add_argument("--csv", metavar="FILE", help="Write results to CSV file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    if not args.device and not args.all:
-        parser.error("Specify --device or --all")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if not args.inventory.exists():
-        logger.error(f"Inventory path not found: {args.inventory}")
-        return 1
+    if args.inventory:
+        nr = InitNornir(inventory={"plugin": "SimpleInventory", "options": {"host_file": args.inventory}})
+    else:
+        host_list = [h.strip() for h in args.hosts.split(",")]
+        nr = InitNornir(inventory={"plugin": "SimpleInventory", "options": {}})
+        nr.inventory = build_inventory(host_list, args.username, args.password, args.platform)
 
-    try:
-        nr = InitNornir(config_file=str(args.inventory / "config.yaml"))
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-    except Exception as e:
-        logger.error(f"Failed to load inventory: {e}")
-        return 1
+    log.info("Running trunk audit against %d host(s)", len(nr.inventory.hosts))
+    agg = nr.run(task=collect_trunk_data)
 
-    if args.device:
-        nr = nr.filter(F(name=args.device))
-        if not nr.inventory.hosts:
-            logger.error(f"Device not found: {args.device}")
-            return 1
+    device_data: dict[str, list[dict]] = {}
+    for host, multi in agg.items():
+        if multi.failed:
+            log.error("Failed to collect from %s: %s", host, multi[0].exception)
+            continue
+        raw = multi[1].result if len(multi) > 1 else ""
+        device_data[host] = parse_trunk_output(raw or "")
 
-    logger.info(f"Collecting health data from {len(nr.inventory.hosts)} device(s)")
-    results = nr.run(task=collect_device_health)
+    rows = audit_trunks(device_data, filter_vlan=args.vlan, show_pruned=args.show_pruned)
 
-    devices = []
-    for host_name, host_result in results.items():
-        if host_result and len(host_result) > 0:
-            task_result = host_result[0]
-            if task_result.result:
-                devices.append(task_result.result)
+    if not rows:
+        print("No trunk data matched the specified filters.")
+        sys.exit(0)
 
-    output = format_json(devices) if args.format == "json" else format_table(devices)
-    print(output)
+    headers = ["host", "port", "status", "native_vlan", "allowed_count",
+               "active_count", "pruned_count", "not_forwarding_count", "pruned_vlans"]
 
-    up_count = sum(1 for d in devices if d["status"] == "UP")
-    logger.info(f"Collection complete: {up_count}/{len(devices)} devices UP")
+    col_w = {h: max(len(h), max((len(str(r[h])) for r in rows), default=0)) for h in headers}
+    header_line = "  ".join(h.upper().ljust(col_w[h]) for h in headers)
+    print(header_line)
+    print("-" * len(header_line))
+    for row in rows:
+        print("  ".join(str(row[h]).ljust(col_w[h]) for h in headers))
 
-    return 0
+    if args.csv:
+        with open(args.csv, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nResults written to {args.csv}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
+
+**What this does differently from vlan_report.py/v2:** focuses on trunk port analysis rather than the VLAN table itself — parses `show interfaces trunk` to expose the four IOS sections (mode/encap, allowed, active, forwarding), computes pruned VLANs (`allowed - active`) and STP-blocked VLANs (`active - forwarding`), and lets you filter by VLAN ID or show only trunks with pruning. Practical for auditing trunk misconfigurations before a maintenance window.
