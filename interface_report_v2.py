@@ -1,207 +1,187 @@
 ```python
+#!/usr/bin/env python
 """
-Route Validator - Verify specific routes exist on network devices
+Device Health Report Generator
 
-Purpose:
-    Validates that an IP route exists on target devices, showing route
-    details (prefix, next hop, metric, source). Useful for troubleshooting
-    route propagation and verifying BGP/OSPF convergence.
-
-Usage:
-    python route_validator.py -r "10.1.0.0/16" -i inventory.yaml
+Collects system metrics and health status from network devices using Nornir and NAPALM.
+Generates a comprehensive health report showing CPU, memory, uptime, and interface statistics.
 
 Prerequisites:
-    - Nornir installed and configured
-    - Network devices reachable via SSH
-    - Device credentials configured (via inventory, netrc, or .env)
-    - Device support: Cisco IOS/IOS-XE, Arista, Juniper
+    - Nornir with NAPALM plugin installed
+    - Network devices accessible via SSH/Paramiko
+    - NAPALM drivers for target device OS types
+    
+Usage:
+    python device_health_report.py --file inventory.yaml --group routers
+    python device_health_report.py --file inventory.yaml --device router1
+    python device_health_report.py --file inventory.yaml --output health_report.json
 
-Examples:
-    # Validate route on specific devices
-    python route_validator.py -r "10.0.0.0/8" --devices core-1,core-2
-
-    # Save results to JSON
-    python route_validator.py -r "192.168.1.0/24" --output routes.json
 """
 
 import argparse
 import json
 import logging
-from typing import Dict
+import sys
+from datetime import datetime
+from pathlib import Path
 
 from nornir import InitNornir
 from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import netmiko_send_command
-
+from nornir.plugins.tasks.napalm_utils import napalm_get
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
-def validate_route(task: Task, target_route: str) -> Result:
-    """
-    Check if a route exists on device and return details.
-    
-    Args:
-        task: Nornir task
-        target_route: CIDR notation route (e.g., "10.1.0.0/16")
-    
-    Returns:
-        Result with route details or not-found message
-    """
-    device = task.host
-    platform = device.platform or "unknown"
-    
-    if platform.startswith("cisco"):
-        cmd = "show ip route"
-    elif platform.startswith("arista"):
-        cmd = "show ip route"
-    elif platform.startswith("juniper"):
-        cmd = "show route"
-    else:
-        return Result(
-            host=device,
-            failed=True,
-            result=f"Unsupported platform: {platform}"
-        )
-    
+def get_device_health(task: Task) -> Result:
+    """Collect system health metrics from device using NAPALM."""
     try:
-        output_result = task.run(
-            netmiko_send_command,
-            command_string=cmd
-        )
-        output_text = output_result[0].result
+        facts_result = task.run(napalm_get, getters=["facts"])
+        interfaces_result = task.run(napalm_get, getters=["interfaces"])
         
-        route_prefix = target_route.split('/')[0]
-        found_lines = []
+        facts = facts_result[0].result.get("facts", {})
+        interfaces = interfaces_result[0].result.get("interfaces", {})
         
-        for line in output_text.split('\n'):
-            if route_prefix in line and any(
-                proto in line.upper()
-                for proto in ['BGP', 'OSPF', 'RIP', 'STATIC', 'CONNECTED', 'C']
-            ):
-                found_lines.append(line.strip())
+        # Calculate uptime string
+        uptime_seconds = facts.get("uptime", 0)
+        uptime_days = uptime_seconds // 86400
+        uptime_hours = (uptime_seconds % 86400) // 3600
+        uptime_str = f"{uptime_days}d {uptime_hours}h"
         
-        if found_lines:
-            return Result(
-                host=device,
-                result={
-                    "route": target_route,
-                    "status": "FOUND",
-                    "details": found_lines
-                }
-            )
-        else:
-            return Result(
-                host=device,
-                result={
-                    "route": target_route,
-                    "status": "NOT_FOUND",
-                    "details": []
-                }
-            )
-    
+        # Count interface status
+        total_ifaces = len(interfaces)
+        up_ifaces = sum(1 for iface in interfaces.values() if iface.get("is_up"))
+        
+        health_data = {
+            "device": task.host.name,
+            "timestamp": datetime.now().isoformat(),
+            "system_info": {
+                "vendor": facts.get("vendor", "Unknown"),
+                "model": facts.get("model", "Unknown"),
+                "os_version": facts.get("os_version", "Unknown"),
+                "serial_number": facts.get("serial_number", "N/A"),
+                "hostname": facts.get("hostname", "Unknown"),
+            },
+            "health_metrics": {
+                "uptime": uptime_str,
+                "uptime_seconds": uptime_seconds,
+                "cpu_used_percent": facts.get("cpu_used", -1),
+                "memory_used_percent": facts.get("memory_used_percent", -1),
+            },
+            "interface_stats": {
+                "total_count": total_ifaces,
+                "up_count": up_ifaces,
+                "down_count": total_ifaces - up_ifaces,
+                "up_percentage": round(
+                    (up_ifaces / total_ifaces * 100) if total_ifaces > 0 else 0, 2
+                ),
+            },
+        }
+        
+        return Result(host=task.host, result=health_data)
+        
     except Exception as e:
-        logger.error(f"Error on {device.name}: {str(e)}")
-        return Result(host=device, failed=True, result=str(e))
+        logger.error(f"Error collecting health data from {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={"error": str(e)},
+            failed=True,
+        )
 
 
-def format_output(results: Dict, fmt: str) -> str:
-    """Format results as text or JSON."""
-    if fmt == "json":
-        output = {}
-        for host, result in results.items():
-            if result[0].failed:
-                output[host] = {"error": result[0].result}
-            else:
-                output[host] = result[0].result
-        return json.dumps(output, indent=2)
+def print_report(results: dict) -> None:
+    """Print formatted health report."""
+    print("\n" + "=" * 90)
+    print("DEVICE HEALTH REPORT".center(90))
+    print("=" * 90 + "\n")
     
-    lines = []
-    for host, result in results.items():
-        lines.append(f"\n{host}:")
-        if result[0].failed:
-            lines.append(f"  ERROR: {result[0].result}")
-        else:
-            data = result[0].result
-            route = data["route"]
-            if data["status"] == "FOUND":
-                lines.append(f"  ✓ Route: {route}")
-                for detail in data["details"]:
-                    lines.append(f"    {detail}")
-            else:
-                lines.append(f"  ✗ Route not found: {route}")
-    
-    return "\n".join(lines)
+    for device_name, data in results.items():
+        if "error" in data:
+            print(f"❌ {device_name}: {data['error']}\n")
+            continue
+        
+        info = data["system_info"]
+        metrics = data["health_metrics"]
+        ifaces = data["interface_stats"]
+        
+        print(f"Device: {device_name}")
+        print(f"  {info['vendor']} {info['model']} | OS: {info['os_version']}")
+        print(f"  Uptime: {metrics['uptime']} | CPU: {metrics['cpu_used_percent']}% | "
+              f"Memory: {metrics['memory_used_percent']}%")
+        print(f"  Interfaces: {ifaces['up_count']}/{ifaces['total_count']} up "
+              f"({ifaces['up_percentage']}%)")
+        print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate IP routes across network devices"
+        description="Collect and report device health metrics from network inventory"
     )
     parser.add_argument(
-        "-r", "--route",
-        required=True,
-        help="CIDR route to validate (e.g., 10.1.0.0/16)"
-    )
-    parser.add_argument(
-        "-i", "--inventory",
+        "--file", "-f",
         default="inventory.yaml",
-        help="Nornir inventory file (default: inventory.yaml)"
+        help="Path to Nornir inventory file"
     )
     parser.add_argument(
-        "-d", "--devices",
-        help="Comma-separated device names (default: all)"
+        "--device", "-d",
+        help="Target specific device by name"
     )
     parser.add_argument(
-        "-f", "--format",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (default: text)"
+        "--group", "-g",
+        help="Target devices in specific group"
     )
     parser.add_argument(
-        "-o", "--output",
-        help="Write results to file (optional)"
+        "--output", "-o",
+        help="Output results to JSON file"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging"
     )
     
     args = parser.parse_args()
     
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     try:
-        nr = InitNornir(config_file=args.inventory)
+        nornir = InitNornir(config_file=args.file)
+        logger.info(f"Loaded inventory from {args.file}")
+        
+        if args.device:
+            nornir = nornir.filter(name=args.device)
+        elif args.group:
+            nornir = nornir.filter(group=args.group)
+        
+        if not nornir.inventory.hosts:
+            logger.error("No devices matched criteria")
+            sys.exit(1)
+        
+        logger.info(f"Targeting {len(nornir.inventory.hosts)} device(s)")
+        
+        results = nornir.run(task=get_device_health)
+        
+        health_results = {}
+        for device_name, task_result in results.items():
+            if task_result[0].result:
+                health_results[device_name] = task_result[0].result
+        
+        print_report(health_results)
+        
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(health_results, f, indent=2)
+            logger.info(f"Report saved to {args.output}")
+        
     except Exception as e:
-        logger.error(f"Failed to initialize Nornir: {e}")
-        return 1
-    
-    if args.devices:
-        device_list = args.devices.split(",")
-        nr = nr.filter(name__in=device_list)
-    
-    if len(nr.inventory.hosts) == 0:
-        logger.error("No devices selected")
-        return 1
-    
-    logger.info(
-        f"Validating route {args.route} on "
-        f"{len(nr.inventory.hosts)} device(s)"
-    )
-    
-    results = nr.run(task=validate_route, target_route=args.route)
-    
-    output = format_output(results, args.format)
-    
-    if args.output:
-        with open(args.output, 'w') as f:
-            f.write(output)
-        logger.info(f"Results saved to {args.output}")
-    else:
-        print(output)
-    
-    return 0
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
