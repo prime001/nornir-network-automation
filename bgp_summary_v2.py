@@ -1,231 +1,242 @@
-BGP Route Analysis and AS-Path Audit
+Now I have full context on what both scripts do. `bgp_summary.py` is a NAPALM-based neighbor table renderer and `bgp_summary_v2.py` is a DNS/NTP verifier. I'll write a BGP prefix drift detector — baseline snapshot + live comparison — which is a genuinely different workflow.
 
-Purpose:
-    Collects the full BGP routing table from one or more devices and performs
-    AS-path depth analysis, transit-ASN filtering, and community-string auditing.
-    Useful for validating route policy correctness, identifying sub-optimal paths,
-    and confirming community tagging compliance across the network.
+"""
+bgp_prefix_drift.py — BGP Prefix Drift Detector
+
+Collects BGP neighbor state and prefix counts from a fleet of routers,
+then compares against a saved JSON baseline to surface drift: new or
+missing peers, session state flaps, and significant prefix-count changes.
+
+On the first run (or with --save-baseline), a JSON snapshot is written.
+On subsequent runs the live state is diffed and a delta report is printed.
+Exit code 0 = clean, 1 = drift or collection errors, 2 = bad arguments.
 
 Usage:
-    python bgp_route_audit.py --hosts rtr1,rtr2 --username admin --password secret
-    python bgp_route_audit.py --inventory hosts.yaml --filter-asn 65001
-    python bgp_route_audit.py --hosts 10.0.0.1 --max-aspath 5 --require-community 65000:100 --export out.csv
+    # Establish or refresh a baseline
+    python bgp_prefix_drift.py \
+        --hosts inventory/hosts.yaml \
+        --groups inventory/groups.yaml \
+        --defaults inventory/defaults.yaml \
+        --save-baseline bgp_baseline.json
+
+    # Compare live state to baseline
+    python bgp_prefix_drift.py --baseline bgp_baseline.json
+
+    # Alert only when prefix count shifts by >=10 % (default 20)
+    python bgp_prefix_drift.py --baseline bgp_baseline.json --threshold 10
+
+    # Restrict to edge routers in nyc
+    python bgp_prefix_drift.py --baseline bgp_baseline.json --filter role=edge,site=nyc
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    Devices must support IOS-style: show ip bgp
+    pip install nornir nornir-napalm nornir-utils napalm
+
+    NAPALM-supported platforms: ios, eos, junos, nxos_ssh.
+    Credentials live in defaults.yaml or per-host in hosts.yaml.
 """
 
 import argparse
-import csv
+import json
 import logging
-import re
 import sys
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from nornir import InitNornir
-from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
+from nornir.core.filter import F
 from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir_napalm.plugins.tasks import napalm_get
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-_BGP_ROUTE_RE = re.compile(
-    r"^(?P<flags>[*>sidhrSRH ]{2})\s+"
-    r"(?P<prefix>\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}|\s{1,20})"
-    r"\s+(?P<next_hop>\d{1,3}(?:\.\d{1,3}){3})"
-    r"\s+(?P<metric>\d+)\s+(?P<locpref>\d+)\s+\d+"
-    r"\s*(?P<aspath>[\d ]*)\s*(?P<origin>[ie?])\s*$",
-    re.MULTILINE,
-)
 
+def collect_bgp_state(task: Task) -> Result:
+    task.run(task=napalm_get, getters=["bgp_neighbors"])
+    raw = task.results[1].result.get("bgp_neighbors", {})
 
-@dataclass
-class BgpRoute:
-    prefix: str
-    next_hop: str
-    as_path: list
-    local_pref: int
-    med: int
-    origin: str
-    best: bool
-    communities: list = field(default_factory=list)
-
-
-def parse_bgp_table(output: str) -> list:
-    routes = []
-    current_prefix = ""
-    for m in _BGP_ROUTE_RE.finditer(output):
-        raw_prefix = m.group("prefix").strip()
-        if raw_prefix:
-            current_prefix = raw_prefix
-        if not current_prefix:
-            continue
-        aspath_raw = m.group("aspath").strip()
-        routes.append(
-            BgpRoute(
-                prefix=current_prefix,
-                next_hop=m.group("next_hop"),
-                as_path=aspath_raw.split() if aspath_raw else [],
-                local_pref=int(m.group("locpref") or 100),
-                med=int(m.group("metric") or 0),
-                origin=m.group("origin"),
-                best=">" in m.group("flags"),
+    peers = {}
+    for vrf, vrf_data in raw.items():
+        for peer_ip, peer in vrf_data.get("peers", {}).items():
+            rcv = sum(
+                af.get("received_prefixes", 0) or 0
+                for af in peer.get("address_family", {}).values()
             )
-        )
-    return routes
+            peers[f"{vrf}/{peer_ip}"] = {
+                "vrf": vrf,
+                "peer": peer_ip,
+                "remote_as": peer.get("remote_as", ""),
+                "state": peer.get("connection_state", "unknown"),
+                "rcv_prefixes": rcv,
+                "uptime": peer.get("uptime", -1) or -1,
+            }
+
+    return Result(host=task.host, result=peers)
 
 
-def collect_bgp_routes(task: Task) -> Result:
-    result = task.run(
-        task=netmiko_send_command,
-        command_string="show ip bgp",
-        name="show ip bgp",
-    )
-    routes = parse_bgp_table(result.result)
-    logger.debug("%s: parsed %d BGP routes", task.host, len(routes))
-    return Result(host=task.host, result=routes)
-
-
-def analyze(routes: list, filter_asn, max_aspath, require_community) -> dict:
-    best = [r for r in routes if r.best]
-    lengths = [len(r.as_path) for r in best]
-    findings = {
-        "total": len(routes),
-        "best_paths": len(best),
-        "avg_aspath_len": round(sum(lengths) / len(lengths), 2) if lengths else 0,
-        "long_paths": [],
-        "transit_asn_routes": [],
-        "missing_community": [],
-    }
-    for r in best:
-        if max_aspath and len(r.as_path) > max_aspath:
-            findings["long_paths"].append(
-                {"prefix": r.prefix, "hops": len(r.as_path), "path": " ".join(r.as_path)}
-            )
-        if filter_asn and filter_asn in r.as_path:
-            findings["transit_asn_routes"].append(
-                {"prefix": r.prefix, "path": " ".join(r.as_path)}
-            )
-        if require_community and require_community not in r.communities:
-            findings["missing_community"].append(r.prefix)
-    return findings
-
-
-def print_report(hostname: str, findings: dict, filter_asn, max_aspath) -> None:
-    print(f"\n{'=' * 62}")
-    print(f"  Host: {hostname}")
-    print(f"  Total routes        : {findings['total']}")
-    print(f"  Best paths          : {findings['best_paths']}")
-    print(f"  Avg AS-path length  : {findings['avg_aspath_len']}")
-
-    if max_aspath and findings["long_paths"]:
-        print(f"\n  Paths exceeding {max_aspath} hop(s) — {len(findings['long_paths'])} found:")
-        for e in findings["long_paths"]:
-            print(f"    {e['prefix']:<22} hops={e['hops']}  {e['path']}")
-
-    if filter_asn and findings["transit_asn_routes"]:
-        print(f"\n  Routes transiting AS{filter_asn} — {len(findings['transit_asn_routes'])} found:")
-        for e in findings["transit_asn_routes"]:
-            print(f"    {e['prefix']:<22} {e['path']}")
-
-    if findings["missing_community"]:
-        print(f"\n  Prefixes missing required community — {len(findings['missing_community'])} found:")
-        for prefix in findings["missing_community"]:
-            print(f"    {prefix}")
-
-
-def export_csv(all_results: dict, path: str) -> None:
-    with open(path, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["host", "metric", "value"])
-        for host, f in all_results.items():
-            for key in ("total", "best_paths", "avg_aspath_len"):
-                w.writerow([host, key, f[key]])
-            w.writerow([host, "long_path_count", len(f["long_paths"])])
-            w.writerow([host, "transit_asn_count", len(f["transit_asn_routes"])])
-            w.writerow([host, "missing_community_count", len(f["missing_community"])])
-    logger.info("Results exported to %s", path)
-
-
-def build_nornir(args) -> object:
-    runner_cfg = {"plugin": "threaded", "options": {"num_workers": args.workers}}
-    if args.inventory:
-        return InitNornir(
-            runner=runner_cfg,
-            inventory={"plugin": "SimpleInventory", "options": {"host_file": args.inventory}},
-        )
-    hosts = {}
-    for raw in args.hosts.split(","):
-        h = raw.strip()
-        hosts[h] = Host(
-            name=h,
-            hostname=h,
-            username=args.username,
-            password=args.password,
-            platform=args.platform,
-            port=args.port,
-        )
-    return InitNornir(
-        runner=runner_cfg,
-        inventory=Inventory(hosts=Hosts(hosts), groups=Groups(), defaults=Defaults()),
-    )
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="BGP route analysis and AS-path audit via Nornir")
-    grp = p.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--hosts", metavar="HOST[,HOST]", help="Comma-separated hostnames or IPs")
-    grp.add_argument("--inventory", metavar="FILE", help="Nornir SimpleInventory hosts.yaml")
-    p.add_argument("--username", default="admin")
-    p.add_argument("--password", default="admin")
-    p.add_argument("--platform", default="cisco_ios")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("--workers", type=int, default=5)
-    p.add_argument("--filter-asn", metavar="ASN", help="Report all best paths transiting this ASN")
-    p.add_argument("--max-aspath", type=int, metavar="N", help="Flag best paths longer than N hops")
-    p.add_argument(
-        "--require-community", metavar="X:Y",
-        help="Flag best paths that do not carry this community tag"
-    )
-    p.add_argument("--export", metavar="FILE", help="Write per-host summary to CSV")
-    p.add_argument("--debug", action="store_true")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    try:
-        nr = build_nornir(args)
-    except Exception as exc:
-        logger.error("Nornir init failed: %s", exc)
-        sys.exit(1)
-
-    logger.info("Auditing BGP tables on %d device(s)", len(nr.inventory.hosts))
-    agg = nr.run(task=collect_bgp_routes, name="bgp_route_audit")
-
-    all_findings: dict = {}
-    for host, multi in agg.items():
+def snapshot_fleet(nr):
+    results = nr.run(task=collect_bgp_state)
+    snapshot, errors = {}, []
+    for host, multi in results.items():
         if multi.failed:
-            logger.error("%s failed: %s", host, multi.exception)
+            errors.append((host, str(multi.exception)))
+        else:
+            snapshot[host] = multi[0].result
+    return snapshot, errors
+
+
+def diff_snapshots(baseline: dict, live: dict, threshold_pct: float) -> list:
+    lines = []
+    for host in sorted(set(baseline) | set(live)):
+        if host not in baseline:
+            lines.append(f"NEW HOST   {host}")
             continue
-        routes = multi[0].result
-        findings = analyze(routes, args.filter_asn, args.max_aspath, args.require_community)
-        all_findings[host] = findings
-        print_report(host, findings, args.filter_asn, args.max_aspath)
+        if host not in live:
+            lines.append(f"LOST HOST  {host}")
+            continue
 
-    if args.export and all_findings:
-        export_csv(all_findings, args.export)
+        base_peers, live_peers = baseline[host], live[host]
+        for key in sorted(set(base_peers) | set(live_peers)):
+            if key not in base_peers:
+                p = live_peers[key]
+                lines.append(
+                    f"NEW PEER   {host:20s}  {key:35s}  AS {p['remote_as']}"
+                    f"  state={p['state']}  rcv={p['rcv_prefixes']}"
+                )
+            elif key not in live_peers:
+                p = base_peers[key]
+                lines.append(
+                    f"LOST PEER  {host:20s}  {key:35s}  AS {p['remote_as']}"
+                    f"  was state={p['state']}  was rcv={p['rcv_prefixes']}"
+                )
+            else:
+                b, lv = base_peers[key], live_peers[key]
+                if b["state"].lower() != lv["state"].lower():
+                    lines.append(
+                        f"STATE CHG  {host:20s}  {key:35s}  AS {b['remote_as']}"
+                        f"  {b['state']} -> {lv['state']}"
+                    )
+                base_rcv, live_rcv = b["rcv_prefixes"], lv["rcv_prefixes"]
+                if base_rcv > 0:
+                    pct = abs(live_rcv - base_rcv) / base_rcv * 100
+                elif live_rcv > 0:
+                    pct = 100.0
+                else:
+                    pct = 0.0
+                if pct >= threshold_pct:
+                    sign = "+" if live_rcv > base_rcv else "-"
+                    lines.append(
+                        f"PFX DRIFT  {host:20s}  {key:35s}  AS {b['remote_as']}"
+                        f"  {base_rcv} -> {live_rcv} ({sign}{pct:.1f}%)"
+                    )
+    return lines
 
-    if any(m.failed for m in agg.values()):
+
+def build_nornir(args):
+    for path in (args.hosts, args.groups, args.defaults):
+        if not Path(path).exists():
+            logger.error("Inventory file not found: %s", path)
+            sys.exit(2)
+
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": args.hosts,
+                "group_file": args.groups,
+                "defaults_file": args.defaults,
+            },
+        },
+        logging={"enabled": False},
+    )
+
+    if args.filter:
+        pairs = {}
+        for token in args.filter.split(","):
+            k, _, v = token.partition("=")
+            if k.strip() and v.strip():
+                pairs[k.strip()] = v.strip()
+        nr = nr.filter(F(**pairs))
+
+    if not nr.inventory.hosts:
+        print("No hosts matched — check inventory and --filter.", file=sys.stderr)
+        sys.exit(2)
+    return nr
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="BGP prefix drift detector — diff live BGP state against a saved baseline"
+    )
+    parser.add_argument("--hosts", default="inventory/hosts.yaml", metavar="FILE")
+    parser.add_argument("--groups", default="inventory/groups.yaml", metavar="FILE")
+    parser.add_argument("--defaults", default="inventory/defaults.yaml", metavar="FILE")
+    parser.add_argument(
+        "--filter", metavar="KEY=VAL[,KEY=VAL]",
+        help="Nornir host filter (e.g. role=edge,site=nyc)",
+    )
+    parser.add_argument(
+        "--baseline", default="bgp_baseline.json", metavar="FILE",
+        help="Baseline snapshot file (default: bgp_baseline.json)",
+    )
+    parser.add_argument(
+        "--save-baseline", action="store_true",
+        help="Capture a fresh baseline and exit",
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=20.0, metavar="PCT",
+        help="Prefix-count delta %% that triggers a drift alert (default: 20)",
+    )
+    parser.add_argument("--workers", type=int, default=10, metavar="N")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+    nr = build_nornir(args)
+    live_snapshot, errors = snapshot_fleet(nr)
+
+    for host, err in errors:
+        print(f"ERROR  {host}: {err}", file=sys.stderr)
+
+    if not live_snapshot:
+        print("No data collected from any host.", file=sys.stderr)
         sys.exit(1)
+
+    if args.save_baseline:
+        payload = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot": live_snapshot,
+        }
+        with open(args.baseline, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"Baseline saved: {args.baseline}  ({len(live_snapshot)} hosts)")
+        sys.exit(0 if not errors else 1)
+
+    if not Path(args.baseline).exists():
+        print(
+            f"No baseline at {args.baseline}. Run with --save-baseline to create one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    with open(args.baseline) as fh:
+        baseline_snapshot = json.load(fh)["snapshot"]
+
+    drift = diff_snapshots(baseline_snapshot, live_snapshot, args.threshold)
+
+    if drift:
+        print(f"\nBGP DRIFT DETECTED  ({len(drift)} change(s))\n")
+        for line in drift:
+            print(" ", line)
+        print()
+    else:
+        print("OK — no BGP drift detected.")
+
+    sys.exit(1 if (drift or errors) else 0)
 
 
 if __name__ == "__main__":
