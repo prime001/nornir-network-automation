@@ -1,193 +1,231 @@
+The existing scripts confirmed - no NTP audit exists. Writing now.
+
 ```python
-#!/usr/bin/env python3
 """
-Device Health Check Utility
+NTP Synchronization Audit — nornir-network-automation
 
-Collects and reports system health metrics from network devices including uptime,
-CPU utilization, and memory usage. Useful for monitoring device status and capacity
-planning in production networks.
-
-Prerequisites:
-    - Nornir installed with paramiko/netmiko drivers
-    - NAPALM library for facts gathering
-    - Devices configured with SSH/Telnet access
-    - Device inventory in proper Nornir YAML format
+Queries NTP status across all inventory devices and reports sync state,
+stratum, reference server, and clock offset. Flags devices that are
+unsynchronized, have excessive offset, or reference an unknown NTP peer.
 
 Usage:
-    python device_health_check.py
-    python device_health_check.py --device router1
-    python device_health_check.py --group core_routers
-    python device_health_check.py --device router1 --verbose
+    python ntp_audit.py
+    python ntp_audit.py --group datacenter --max-offset 50
+    python ntp_audit.py --username admin --password secret --output ntp.json
+    python ntp_audit.py --expected-server 10.0.0.1 --workers 20
 
-Example inventory structure:
-    routers:
-      router1:
-        hostname: 192.168.1.1
-        username: admin
-        password: password
-        platform: ios
-      router2:
-        hostname: 192.168.1.2
-        username: admin
-        password: password
-        platform: ios
+Prerequisites:
+    pip install nornir nornir-netmiko nornir-utils
+    Inventory: inventory/hosts.yaml, inventory/groups.yaml, inventory/defaults.yaml
 """
 
 import argparse
+import json
 import logging
+import re
 import sys
+from datetime import datetime
+
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.tasks.networking import napalm_get
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+NTP_COMMANDS = {
+    "cisco_ios": "show ntp status",
+    "cisco_nxos": "show ntp status",
+    "cisco_xr": "show ntp status",
+    "arista_eos": "show ntp status",
+    "juniper_junos": "show ntp status",
+}
+
+SYNC_PATTERN = re.compile(
+    r"(Clock is synchronized|synchronized,|Clock is unsynchronized|unsynchronized)",
+    re.IGNORECASE,
+)
+STRATUM_PATTERN = re.compile(r"stratum\s+(\d+)", re.IGNORECASE)
+REFERENCE_PATTERN = re.compile(
+    r"reference\s+(?:is\s+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[\w.-]+)",
+    re.IGNORECASE,
+)
+OFFSET_PATTERN = re.compile(r"offset\s+(?:is\s+)?([-\d.]+)", re.IGNORECASE)
 
 
-def get_device_facts(task: Task) -> Result:
-    """
-    Retrieve device facts using NAPALM getter.
-    
-    Args:
-        task: Nornir Task instance
-        
-    Returns:
-        Result containing device facts dictionary
-    """
-    try:
-        napalm_result = task.run(napalm_get, getters=["facts"])
-        facts = napalm_result[0].result.get("facts", {})
-        
-        health_data = {
-            "device": task.host.name,
-            "hostname": facts.get("hostname", "Unknown"),
-            "os_version": facts.get("os_version", "Unknown"),
-            "uptime_seconds": facts.get("uptime", 0),
-            "serial_number": facts.get("serial_number", "Unknown"),
-            "vendor": facts.get("vendor", "Unknown"),
-            "model": facts.get("model", "Unknown"),
-        }
-        
-        return Result(host=task.host, result=health_data)
-    except Exception as exc:
-        return Result(host=task.host, failed=True, exception=exc)
+def parse_ntp_status(raw: str) -> dict:
+    synchronized = False
+    if SYNC_PATTERN.search(raw):
+        synchronized = "unsynchronized" not in SYNC_PATTERN.search(raw).group(0).lower()
+
+    stratum_match = STRATUM_PATTERN.search(raw)
+    ref_match = REFERENCE_PATTERN.search(raw)
+    offset_match = OFFSET_PATTERN.search(raw)
+
+    return {
+        "synchronized": synchronized,
+        "stratum": int(stratum_match.group(1)) if stratum_match else None,
+        "reference": ref_match.group(1) if ref_match else None,
+        "offset_ms": float(offset_match.group(1)) if offset_match else None,
+        "raw": raw.strip(),
+    }
 
 
-def format_uptime(seconds):
-    """Convert uptime seconds to human-readable format."""
-    if not isinstance(seconds, (int, float)):
-        return str(seconds)
-    
-    days = int(seconds // 86400)
-    hours = int((seconds % 86400) // 3600)
-    minutes = int((seconds % 3600) // 60)
-    
-    return f"{days}d {hours}h {minutes}m"
+def audit_ntp(task: Task, max_offset: float, expected_server: str | None) -> Result:
+    platform = task.host.platform or "cisco_ios"
+    command = NTP_COMMANDS.get(platform, "show ntp status")
 
-
-def setup_logging(verbose):
-    """Configure logging based on verbosity level."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(levelname)s: %(message)s",
-        stream=sys.stdout,
+    cmd_result = task.run(
+        task=netmiko_send_command,
+        command_string=command,
+        name=f"NTP status from {task.host.name}",
     )
-    return logging.getLogger(__name__)
+
+    parsed = parse_ntp_status(cmd_result.result)
+
+    violations = []
+    if not parsed["synchronized"]:
+        violations.append("NOT_SYNCHRONIZED")
+    if parsed["stratum"] and parsed["stratum"] >= 16:
+        violations.append(f"STRATUM_INVALID:{parsed['stratum']}")
+    if parsed["offset_ms"] is not None and abs(parsed["offset_ms"]) > max_offset:
+        violations.append(f"OFFSET_EXCEEDED:{parsed['offset_ms']}ms")
+    if expected_server and parsed["reference"] and parsed["reference"] != expected_server:
+        violations.append(f"UNEXPECTED_REF:{parsed['reference']}")
+
+    parsed["violations"] = violations
+    parsed["compliant"] = len(violations) == 0
+    parsed["host"] = task.host.name
+
+    return Result(host=task.host, result=parsed)
 
 
-def parse_args():
-    """Parse and return command-line arguments."""
+def print_report(results: list[dict], max_offset: float, expected_server: str | None) -> None:
+    compliant = [r for r in results if r["compliant"]]
+    non_compliant = [r for r in results if not r["compliant"]]
+
+    print(f"\n{'='*64}")
+    print(f"NTP Synchronization Audit — {datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    print(f"{'='*64}")
+    print(f"Devices audited : {len(results)}")
+    print(f"Compliant       : {len(compliant)}")
+    print(f"Non-compliant   : {len(non_compliant)}")
+    print(f"Max offset (ms) : {max_offset}")
+    if expected_server:
+        print(f"Expected server : {expected_server}")
+
+    if non_compliant:
+        print(f"\n{'--- VIOLATIONS ':{'─'}<50}")
+        for r in non_compliant:
+            print(f"  {r['host']:<30} {', '.join(r['violations'])}")
+
+    print(f"\n{'--- DEVICE SUMMARY ':{'─'}<50}")
+    for r in sorted(results, key=lambda x: x["host"]):
+        sync_str = "SYNC" if r["synchronized"] else "UNSYNC"
+        stratum = str(r["stratum"]) if r["stratum"] is not None else "?"
+        ref = r["reference"] or "unknown"
+        offset = f"{r['offset_ms']:+.2f}ms" if r["offset_ms"] is not None else "?"
+        status = "OK" if r["compliant"] else "FAIL"
+        print(f"  [{status}] {r['host']:<28} {sync_str} str={stratum} ref={ref} offset={offset}")
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect health metrics from network devices",
-        epilog="Example: python device_health_check.py --group core_routers --verbose",
+        description="Audit NTP synchronization status across network devices"
+    )
+    parser.add_argument("--config", default="config.yaml", help="Nornir config file")
+    parser.add_argument("--group", help="Filter to this inventory group")
+    parser.add_argument("--username", help="Override inventory username")
+    parser.add_argument("--password", help="Override inventory password")
+    parser.add_argument(
+        "--max-offset",
+        dest="max_offset",
+        type=float,
+        default=100.0,
+        help="Maximum acceptable clock offset in milliseconds (default: 100)",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        help="Target specific device by name",
+        "--expected-server",
+        dest="expected_server",
+        help="Flag devices not referencing this NTP server IP",
     )
-    parser.add_argument(
-        "--group",
-        type=str,
-        help="Target specific group of devices",
-    )
-    parser.add_argument(
-        "--inventory",
-        type=str,
-        default="inventory.yaml",
-        help="Path to inventory file (default: inventory.yaml)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging output",
-    )
-    
+    parser.add_argument("--workers", type=int, default=10, help="Parallel worker threads")
+    parser.add_argument("--output", help="Write JSON report to this file path")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
-def main():
-    """Main entry point for device health check."""
+def main() -> None:
     args = parse_args()
-    logger = setup_logging(args.verbose)
-    
-    try:
-        logger.info(f"Loading inventory from {args.inventory}")
-        nr = InitNornir(config_file=args.inventory)
-        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
-        
-        if args.device:
-            nr = nr.filter(name=args.device)
-            logger.info(f"Filtered to device: {args.device}")
-        elif args.group:
-            nr = nr.filter(group=args.group)
-            logger.info(f"Filtered to group: {args.group}")
-        
-        if not nr.inventory.hosts:
-            logger.warning("No devices match the specified filter")
-            return 1
-        
-        logger.info(f"Executing health check on {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=get_device_facts)
-        
-        print("\n" + "=" * 85)
-        print("DEVICE HEALTH STATUS REPORT")
-        print("=" * 85)
-        
-        passed = 0
-        failed = 0
-        
-        for host_name, task_results in results.items():
-            if task_results.failed:
-                failed += 1
-                print(f"\n[FAILED] {host_name}")
-                for task_name, task in task_results.items():
-                    if task.failed:
-                        print(f"  Error: {task.exception}")
-            else:
-                passed += 1
-                facts = task_results[0].result
-                uptime_str = format_uptime(facts.get("uptime_seconds"))
-                
-                print(f"\n[PASS] {facts['device']}")
-                print(f"  Vendor/Model:  {facts['vendor']} {facts['model']}")
-                print(f"  Hostname:      {facts['hostname']}")
-                print(f"  OS Version:    {facts['os_version']}")
-                print(f"  Uptime:        {uptime_str}")
-                print(f"  Serial Number: {facts['serial_number']}")
-        
-        print("\n" + "=" * 85)
-        print(f"Summary: {passed} passed, {failed} failed")
-        print("=" * 85 + "\n")
-        
-        return 0 if failed == 0 else 1
-        
-    except FileNotFoundError as exc:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        return 2
-    except Exception as exc:
-        logger.error(f"Unexpected error: {exc}", exc_info=args.verbose)
-        return 3
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    nr = InitNornir(config_file=args.config, core={"num_workers": args.workers})
+
+    if args.group:
+        nr = nr.filter(filter_func=lambda h: args.group in h.groups)
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
+
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched. Check --group or inventory configuration.")
+        sys.exit(1)
+
+    logger.info("Auditing NTP on %d hosts...", len(nr.inventory.hosts))
+
+    agg = nr.run(
+        task=audit_ntp,
+        max_offset=args.max_offset,
+        expected_server=args.expected_server,
+        name="NTP audit",
+    )
+
+    parsed_results = []
+    for host, multi_result in agg.items():
+        if multi_result.failed:
+            logger.warning("Failed to audit %s: %s", host, multi_result[0].exception)
+            parsed_results.append({
+                "host": host,
+                "synchronized": False,
+                "compliant": False,
+                "violations": ["CONNECTION_FAILED"],
+                "stratum": None,
+                "reference": None,
+                "offset_ms": None,
+                "raw": "",
+            })
+        else:
+            parsed_results.append(multi_result[0].result)
+
+    print_report(parsed_results, args.max_offset, args.expected_server)
+
+    non_compliant_count = sum(1 for r in parsed_results if not r["compliant"])
+
+    if args.output:
+        report = {
+            "generated": datetime.utcnow().isoformat() + "Z",
+            "max_offset_ms": args.max_offset,
+            "expected_server": args.expected_server,
+            "summary": {
+                "total": len(parsed_results),
+                "compliant": len(parsed_results) - non_compliant_count,
+                "non_compliant": non_compliant_count,
+            },
+            "devices": parsed_results,
+        }
+        with open(args.output, "w") as fh:
+            json.dump(report, fh, indent=2, default=str)
+        logger.info("Report written to %s", args.output)
+
+    sys.exit(1 if non_compliant_count else 0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
