@@ -1,146 +1,151 @@
 ```python
-#!/usr/bin/env python
 """
-Device Health Report Generator
+Network Neighbor Discovery Report using Nornir
 
-Collects system metrics and health status from network devices using Nornir and NAPALM.
-Generates a comprehensive health report showing CPU, memory, uptime, and interface statistics.
+Purpose:
+    Discovers and reports on network neighbors using LLDP/CDP protocols.
+    Helps identify device connections and build network topology maps.
+    Useful for capacity planning, troubleshooting, and documentation.
+
+Usage:
+    python neighbor_discovery.py --inventory inventory.yaml
+    python neighbor_discovery.py --inventory inventory.yaml --device router1
+    python neighbor_discovery.py --inventory inventory.yaml --export neighbors.csv
 
 Prerequisites:
-    - Nornir with NAPALM plugin installed
-    - Network devices accessible via SSH/Paramiko
-    - NAPALM drivers for target device OS types
-    
-Usage:
-    python device_health_report.py --file inventory.yaml --group routers
-    python device_health_report.py --file inventory.yaml --device router1
-    python device_health_report.py --file inventory.yaml --output health_report.json
-
+    - Nornir installed with napalm support (pip install nornir napalm)
+    - Network devices with SSH/Netconf access
+    - LLDP/CDP enabled on network devices
+    - Valid inventory.yaml with device groups, hosts, and connection details
+    - Supported OS: Cisco IOS/IOS-XE/NXOS, Arista EOS, Juniper Junos, etc.
 """
 
 import argparse
-import json
+import csv
 import logging
-import sys
 from datetime import datetime
-from pathlib import Path
-
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir.plugins.tasks.napalm_utils import napalm_get
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import napalm_get
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def get_device_health(task: Task) -> Result:
-    """Collect system health metrics from device using NAPALM."""
+def discover_neighbors(task: Task) -> Result:
+    """
+    Retrieve neighbor information from a device using NAPALM getters.
+    
+    Collects LLDP neighbor data and details about connected peers.
+    """
     try:
-        facts_result = task.run(napalm_get, getters=["facts"])
-        interfaces_result = task.run(napalm_get, getters=["interfaces"])
+        result = task.run(
+            napalm_get,
+            getters=["lldp_neighbors", "lldp_neighbors_detail"]
+        )
+        neighbors = result[0].result.get("lldp_neighbors", {})
+        details = result[0].result.get("lldp_neighbors_detail", {})
         
-        facts = facts_result[0].result.get("facts", {})
-        interfaces = interfaces_result[0].result.get("interfaces", {})
-        
-        # Calculate uptime string
-        uptime_seconds = facts.get("uptime", 0)
-        uptime_days = uptime_seconds // 86400
-        uptime_hours = (uptime_seconds % 86400) // 3600
-        uptime_str = f"{uptime_days}d {uptime_hours}h"
-        
-        # Count interface status
-        total_ifaces = len(interfaces)
-        up_ifaces = sum(1 for iface in interfaces.values() if iface.get("is_up"))
-        
-        health_data = {
-            "device": task.host.name,
-            "timestamp": datetime.now().isoformat(),
-            "system_info": {
-                "vendor": facts.get("vendor", "Unknown"),
-                "model": facts.get("model", "Unknown"),
-                "os_version": facts.get("os_version", "Unknown"),
-                "serial_number": facts.get("serial_number", "N/A"),
-                "hostname": facts.get("hostname", "Unknown"),
-            },
-            "health_metrics": {
-                "uptime": uptime_str,
-                "uptime_seconds": uptime_seconds,
-                "cpu_used_percent": facts.get("cpu_used", -1),
-                "memory_used_percent": facts.get("memory_used_percent", -1),
-            },
-            "interface_stats": {
-                "total_count": total_ifaces,
-                "up_count": up_ifaces,
-                "down_count": total_ifaces - up_ifaces,
-                "up_percentage": round(
-                    (up_ifaces / total_ifaces * 100) if total_ifaces > 0 else 0, 2
-                ),
-            },
-        }
-        
-        return Result(host=task.host, result=health_data)
-        
-    except Exception as e:
-        logger.error(f"Error collecting health data from {task.host.name}: {e}")
         return Result(
             host=task.host,
-            result={"error": str(e)},
-            failed=True,
+            result={
+                "neighbors": neighbors,
+                "details": details
+            }
         )
+    except Exception as e:
+        logger.warning(f"{task.host}: Failed to discover neighbors - {e}")
+        return Result(host=task.host, failed=True, result=str(e))
 
 
-def print_report(results: dict) -> None:
-    """Print formatted health report."""
-    print("\n" + "=" * 90)
-    print("DEVICE HEALTH REPORT".center(90))
-    print("=" * 90 + "\n")
+def format_report(results, export_file=None):
+    """
+    Format and display neighbor discovery results.
     
-    for device_name, data in results.items():
-        if "error" in data:
-            print(f"❌ {device_name}: {data['error']}\n")
-            continue
-        
-        info = data["system_info"]
-        metrics = data["health_metrics"]
-        ifaces = data["interface_stats"]
-        
-        print(f"Device: {device_name}")
-        print(f"  {info['vendor']} {info['model']} | OS: {info['os_version']}")
-        print(f"  Uptime: {metrics['uptime']} | CPU: {metrics['cpu_used_percent']}% | "
-              f"Memory: {metrics['memory_used_percent']}%")
-        print(f"  Interfaces: {ifaces['up_count']}/{ifaces['total_count']} up "
-              f"({ifaces['up_percentage']}%)")
-        print()
+    Optionally exports data to CSV for integration with other tools.
+    """
+    print("\n" + "=" * 110)
+    print(f"NETWORK NEIGHBOR DISCOVERY REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 110 + "\n")
+    
+    neighbor_list = []
+    successful_devices = 0
+    
+    for host, multi_result in results.items():
+        for result in multi_result:
+            if result.failed:
+                print(f"[FAILED] {host}: {result.result}")
+                continue
+            
+            successful_devices += 1
+            neighbors = result.result.get("neighbors", {})
+            details = result.result.get("details", {})
+            
+            if not neighbors:
+                print(f"{host}: No neighbors discovered (LLDP may be disabled)\n")
+                continue
+            
+            print(f"Device: {host}")
+            print("-" * 110)
+            
+            for interface, neighbor_list_intf in neighbors.items():
+                for neighbor in neighbor_list_intf:
+                    detail = details.get(interface, {}).get(neighbor, {})
+                    
+                    entry = {
+                        'local_device': host,
+                        'local_interface': interface,
+                        'neighbor_device': neighbor,
+                        'neighbor_interface': detail.get("port_description", "Unknown"),
+                        'neighbor_platform': detail.get("system_description", "Unknown")
+                    }
+                    neighbor_list.append(entry)
+                    
+                    neighbor_port = entry['neighbor_interface']
+                    platform = entry['neighbor_platform'][:40]
+                    print(f"  {interface:20} <--> {neighbor:20} ({neighbor_port:20}) {platform}")
+            print()
+    
+    if export_file and neighbor_list:
+        with open(export_file, 'w', newline='') as csvfile:
+            fieldnames = neighbor_list[0].keys()
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(neighbor_list)
+        logger.info(f"Exported {len(neighbor_list)} neighbor relationships to {export_file}")
+    
+    print("=" * 110)
+    print(f"Summary: {successful_devices} devices queried, {len(neighbor_list)} neighbors discovered")
+    print("=" * 110 + "\n")
+    
+    return neighbor_list
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Collect and report device health metrics from network inventory"
+        description="Discover and report network topology using LLDP/CDP neighbor data"
     )
     parser.add_argument(
-        "--file", "-f",
+        "--inventory",
         default="inventory.yaml",
-        help="Path to Nornir inventory file"
+        help="Path to Nornir inventory file (default: inventory.yaml)"
     )
     parser.add_argument(
-        "--device", "-d",
-        help="Target specific device by name"
+        "--device",
+        help="Target specific device by hostname (optional)"
     )
     parser.add_argument(
-        "--group", "-g",
-        help="Target devices in specific group"
+        "--export",
+        help="Export results to CSV file for further analysis"
     )
     parser.add_argument(
-        "--output", "-o",
-        help="Output results to JSON file"
-    )
-    parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
         action="store_true",
-        help="Enable verbose logging"
+        help="Enable debug-level logging"
     )
     
     args = parser.parse_args()
@@ -149,39 +154,22 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        nornir = InitNornir(config_file=args.file)
-        logger.info(f"Loaded inventory from {args.file}")
+        nr = InitNornir(config_file=args.inventory)
         
         if args.device:
-            nornir = nornir.filter(name=args.device)
-        elif args.group:
-            nornir = nornir.filter(group=args.group)
+            nr = nr.filter(name=args.device)
+            logger.info(f"Targeting specific device: {args.device}")
         
-        if not nornir.inventory.hosts:
-            logger.error("No devices matched criteria")
-            sys.exit(1)
+        device_count = len(nr.inventory.hosts)
+        logger.info(f"Starting neighbor discovery on {device_count} device(s)")
         
-        logger.info(f"Targeting {len(nornir.inventory.hosts)} device(s)")
+        results = nr.run(task=discover_neighbors)
+        format_report(results, args.export)
         
-        results = nornir.run(task=get_device_health)
-        
-        health_results = {}
-        for device_name, task_result in results.items():
-            if task_result[0].result:
-                health_results[device_name] = task_result[0].result
-        
-        print_report(health_results)
-        
-        if args.output:
-            with open(args.output, "w") as f:
-                json.dump(health_results, f, indent=2)
-            logger.info(f"Report saved to {args.output}")
-        
+    except FileNotFoundError:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        exit(1)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        logger.error(f"Failed to run neighbor discovery: {e}")
+        exit(1)
 ```
