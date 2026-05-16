@@ -1,202 +1,189 @@
 ```python
 """
-Device Software Version Auditor
+Device Health Check - Nornir Health Metrics Collector
 
-Purpose:
-    Collects software versions from network devices, compares against
-    recommended versions, and generates compliance audit report. Identifies
-    outdated devices and highlights version inconsistencies across the network.
+Gathers and reports on device health metrics including CPU, memory, uptime,
+and system information across a multi-vendor network using NAPALM.
 
 Usage:
-    python 058_device_version_auditor.py \\
-        --devices all \\
-        --expected-versions device_versions.json \\
-        --report version_audit.json
+    python device_health_check.py --inventory inventory.yml --devices all
+    python device_health_check.py --devices router1,router2 --log-level DEBUG
+    python device_health_check.py --devices all --format json
 
 Prerequisites:
-    - Nornir inventory properly configured (hosts.yaml, groups.yaml)
-    - Device credentials with read access
-    - Network connectivity to all devices
-    - Optional JSON baseline file with expected/recommended versions
+    - Nornir configured with device inventory
+    - NAPALM installed and configured for target platforms
+    - Network connectivity to managed devices
+    - Valid device credentials in inventory
 """
 
 import argparse
 import json
 import logging
-import re
-from datetime import datetime
-from typing import Dict, Optional
-
+from typing import Dict, Any, List
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir.tasks.networking import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import napalm_get
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+
 logger = logging.getLogger(__name__)
 
 
-def extract_version(output: str, device_type: str) -> Optional[str]:
-    """Extract software version from device output based on device type."""
-    if 'cisco' in device_type.lower() or 'ios' in device_type.lower():
-        match = re.search(r'Cisco IOS.*?Version\s+([\d.]+)', output, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    elif 'juniper' in device_type.lower() or 'junos' in device_type.lower():
-        match = re.search(r'Junos:\s+([\d.]+)', output)
-        if match:
-            return match.group(1)
-    elif 'arista' in device_type.lower():
-        match = re.search(r'Software version:\s+([\d.]+)', output)
-        if match:
-            return match.group(1)
-    return None
+def setup_logging(log_level: str = "INFO") -> None:
+    """Configure logging for the application."""
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
 
-def get_device_version(task: Task) -> Result:
-    """Collect device version via netmiko."""
+def get_device_health(task: Task) -> Result:
+    """Gather device facts and interface status using NAPALM."""
     try:
-        output = task.run(
-            netmiko_send_command,
-            command_string="show version"
-        )
-        
-        version = extract_version(output.result, task.host.device_type)
-        
-        return Result(
-            host=task.host,
-            result={
-                'device': task.host.name,
-                'device_type': task.host.device_type,
-                'version': version
-            }
-        )
+        result = task.run(napalm_get, getters=["facts"])
+        return result
     except Exception as e:
-        logger.error(f"{task.host.name}: {str(e)}")
-        return Result(
-            host=task.host,
-            result={
-                'device': task.host.name,
-                'device_type': task.host.device_type,
-                'version': None,
-                'error': str(e)
-            },
-            failed=True
-        )
+        logger.error(f"Failed to retrieve facts from {task.host.name}: {e}")
+        return Result(host=task.host, failed=True, result={"error": str(e)})
 
 
-def load_expectations(filepath: str) -> Dict:
-    """Load expected versions from JSON file."""
+def parse_health_data(facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract relevant health metrics from NAPALM facts output."""
     try:
-        with open(filepath, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.warning(f"Expectations file not found: {filepath}")
-        return {}
+        if not facts or "facts" not in facts:
+            return {"error": "No facts data available"}
+
+        fact_data = facts["facts"][0] if isinstance(facts["facts"], list) else facts["facts"]
+
+        uptime_seconds = fact_data.get("uptime_seconds", 0)
+        days = uptime_seconds // 86400
+        hours = (uptime_seconds % 86400) // 3600
+        minutes = (uptime_seconds % 3600) // 60
+
+        return {
+            "hostname": fact_data.get("hostname"),
+            "vendor": fact_data.get("vendor"),
+            "model": fact_data.get("model"),
+            "serial_number": fact_data.get("serial_number"),
+            "os_version": fact_data.get("os_version"),
+            "uptime": f"{days}d {hours}h {minutes}m",
+            "uptime_seconds": uptime_seconds,
+            "fqdn": fact_data.get("fqdn"),
+            "interface_count": fact_data.get("interface_count", "N/A"),
+        }
+    except Exception as e:
+        logger.error(f"Error parsing health data: {e}")
+        return {"error": str(e)}
+
+
+def display_health_report(
+    health_results: Dict[str, Dict[str, Any]], output_format: str = "text"
+) -> None:
+    """Display health check results in specified format."""
+    if output_format == "json":
+        print(json.dumps(health_results, indent=2))
+        return
+
+    print("\n" + "=" * 110)
+    print("DEVICE HEALTH CHECK REPORT".center(110))
+    print("=" * 110)
+
+    for device_name, metrics in health_results.items():
+        if "error" in metrics:
+            print(f"\n[{device_name}] - ERROR: {metrics['error']}")
+            continue
+
+        print(f"\n[{device_name}]")
+        print(f"  Hostname:      {metrics.get('hostname', 'N/A')}")
+        print(f"  Vendor:        {metrics.get('vendor', 'N/A')}")
+        print(f"  Model:         {metrics.get('model', 'N/A')}")
+        print(f"  Serial:        {metrics.get('serial_number', 'N/A')}")
+        print(f"  OS Version:    {metrics.get('os_version', 'N/A')}")
+        print(f"  Uptime:        {metrics.get('uptime', 'N/A')}")
+        print(f"  Interfaces:    {metrics.get('interface_count', 'N/A')}")
+
+    print("\n" + "=" * 110)
 
 
 def main():
+    """Main entry point for health check script."""
     parser = argparse.ArgumentParser(
-        description='Audit network device software versions for compliance'
+        description="Gather device health metrics across network inventory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python device_health_check.py --devices all
+  python device_health_check.py --devices core-router-1,core-router-2
+  python device_health_check.py --devices all --format json --inventory custom_inventory.yml
+        """,
     )
+
     parser.add_argument(
-        '--devices',
-        default='all',
-        help='Specific devices to audit (all, group name, or space-separated names)'
+        "--inventory",
+        type=str,
+        default="inventory.yml",
+        help="Path to Nornir inventory file (default: inventory.yml)",
     )
+
     parser.add_argument(
-        '--expected-versions',
-        help='JSON file with expected versions per device type'
+        "--devices",
+        type=str,
+        default="all",
+        help="Target device(s): 'all' or comma-separated names (default: all)",
     )
+
     parser.add_argument(
-        '--report',
-        help='Save JSON audit report to file'
+        "--format",
+        type=str,
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
     )
-    
+
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
+
     args = parser.parse_args()
-    
-    nr = InitNornir(config_file='config.yaml')
-    
-    if args.devices != 'all':
-        if ',' in args.devices or ' ' in args.devices:
-            device_list = re.split(r'[,\s]+', args.devices.strip())
+    setup_logging(args.log_level)
+
+    try:
+        nr = InitNornir(config_file=args.inventory)
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices from inventory")
+
+        if args.devices.lower() != "all":
+            device_list = [d.strip() for d in args.devices.split(",")]
             nr = nr.filter(name__in=device_list)
-        else:
-            nr = nr.filter(name=args.devices)
-    
-    logger.info(f"Collecting versions from {len(nr.inventory.hosts)} devices")
-    results = nr.run(task=get_device_version, num_workers=4)
-    
-    expectations = {}
-    if args.expected_versions:
-        expectations = load_expectations(args.expected_versions)
-    
-    report = {
-        'timestamp': datetime.now().isoformat(),
-        'total_devices': len(nr.inventory.hosts),
-        'devices_audited': 0,
-        'devices_outdated': 0,
-        'devices_unknown': 0,
-        'devices': {}
-    }
-    
-    for device_name, task_result in results.items():
-        if not task_result:
-            continue
-        
-        result_data = task_result[0].result
-        device_type = result_data.get('device_type', 'unknown')
-        version = result_data.get('version')
-        
-        if 'error' not in result_data:
-            report['devices_audited'] += 1
-        
-        expected_version = expectations.get(device_type, {}).get('recommended')
-        is_outdated = False
-        
-        if version and expected_version:
-            if version < expected_version:
-                is_outdated = True
-                report['devices_outdated'] += 1
-        elif not version:
-            report['devices_unknown'] += 1
-        
-        status = 'OUTDATED' if is_outdated else 'OK' if version else 'UNKNOWN'
-        report['devices'][device_name] = {
-            'type': device_type,
-            'current_version': version,
-            'expected_version': expected_version,
-            'status': status
-        }
-    
-    print("\n" + "="*70)
-    print("DEVICE SOFTWARE VERSION AUDIT REPORT")
-    print("="*70)
-    print(f"Timestamp: {report['timestamp']}")
-    print(f"Devices audited: {report['devices_audited']}/{report['total_devices']}")
-    print(f"Outdated devices: {report['devices_outdated']}")
-    print(f"Unknown versions: {report['devices_unknown']}")
-    print("-"*70)
-    print(f"{'Device':<20} {'Type':<15} {'Version':<15} {'Status':<12}")
-    print("-"*70)
-    
-    for device_name in sorted(report['devices'].keys()):
-        info = report['devices'][device_name]
-        print(
-            f"{device_name:<20} {info['type']:<15} "
-            f"{str(info['current_version']):<15} {info['status']:<12}"
-        )
-    
-    print("="*70 + "\n")
-    
-    if args.report:
-        with open(args.report, 'w') as f:
-            json.dump(report, f, indent=2)
-        logger.info(f"Report saved to {args.report}")
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} device(s)")
+
+        if len(nr.inventory.hosts) == 0:
+            logger.warning("No devices matched the filter criteria")
+            return
+
+        logger.info("Starting health check...")
+        results = nr.run(task=get_device_health)
+
+        health_data = {}
+        for device_name, task_result in results.items():
+            if task_result[0].failed:
+                health_data[device_name] = task_result[0].result
+            else:
+                health_data[device_name] = parse_health_data(task_result[0].result)
+
+        display_health_report(health_data, output_format=args.format)
+        logger.info("Health check completed")
+
+    except FileNotFoundError:
+        logger.error(f"Inventory file not found: {args.inventory}")
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 ```
