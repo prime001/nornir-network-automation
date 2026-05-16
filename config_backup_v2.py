@@ -1,199 +1,205 @@
 ```python
+#!/usr/bin/env python3
 """
-MAC Address Table Exporter
+Device Uptime and System Information Reporter
 
-Collects and analyzes MAC address tables from network switches to identify
-devices on the network and their physical port locations.
+Purpose:
+    Collects device uptime, system information, and generates reports on
+    device reliability and maintenance history. Useful for identifying
+    unstable devices, tracking reboots, and planning maintenance windows.
 
 Usage:
-    python mac_table_exporter.py --devices all
-    python mac_table_exporter.py --devices Switch1,Switch2 --mac 00:11:22:33:44:55
-    python mac_table_exporter.py --devices all --vlan 10 --output json
+    python device_uptime_report.py --output report.json
+    python device_uptime_report.py --devices router1,router2 --format table
+    python device_uptime_report.py --filter-group access
 
 Prerequisites:
-    - Nornir inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
-    - SSH/Netmiko access to switch devices
-    - Devices must support 'show mac address-table' command
-
-Output:
-    - MAC address details with port and VLAN information
-    - Device location mapping showing which switch/port each MAC is learned on
-    - JSON, CSV, or table format for further analysis and integration
+    - Nornir installed with netmiko driver
+    - Inventory configured with SSH credentials
+    - Network devices supporting 'show version' command
+    - SSH connectivity to all devices
 """
 
 import argparse
 import csv
 import json
 import logging
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
+from typing import Dict, List
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.networking import netmiko_send_command
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from nornir.tasks.networking import netmiko_send_command
 
 
-def parse_mac_table(output: str, device_name: str) -> list:
-    """Parse switch MAC address table output into structured format."""
-    macs = []
+def setup_logging(level: str = "INFO") -> None:
+    """Configure logging output."""
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+
+def parse_device_list(device_str: str) -> List[str]:
+    """Parse comma-separated device names."""
+    return [d.strip() for d in device_str.split(",") if d.strip()]
+
+
+def collect_uptime_info(nr, devices: List[str] = None) -> Dict:
+    """Collect uptime information from devices."""
+    results = {}
+    logger = logging.getLogger(__name__)
     
-    for line in output.split('\n'):
-        line = line.strip()
-        if not line or 'Mac Address' in line or 'VLAN' in line or '---' in line:
-            continue
-        
-        parts = line.split()
-        if len(parts) >= 4:
-            try:
-                mac = parts[0]
-                vlan = parts[1]
-                mac_type = parts[2]
-                interface = parts[3] if len(parts) > 3 else 'Unknown'
-                
-                if ':' in mac and len(mac) == 17:
-                    macs.append({
-                        'mac_address': mac,
-                        'vlan': vlan,
-                        'type': mac_type,
-                        'interface': interface,
-                        'switch': device_name
-                    })
-            except (ValueError, IndexError):
-                continue
-    
-    return macs
-
-
-def collect_mac_tables(nr, devices_filter: str = None) -> list:
-    """Collect MAC address tables from specified switches."""
-    if devices_filter and devices_filter != 'all':
-        device_list = [d.strip() for d in devices_filter.split(',')]
-        nr_filtered = nr.filter(F(name__in=device_list))
+    if devices:
+        inventory = nr.filter(F(name__in=devices))
     else:
-        nr_filtered = nr
+        inventory = nr
     
-    all_macs = []
-    
-    for host_name, host in nr_filtered.inventory.hosts.items():
-        try:
-            result = host.run_task(
-                netmiko_send_command,
-                command_string="show mac address-table"
-            )
-            
-            if result[0].failed:
-                logger.warning(f"Failed to retrieve MAC table from {host_name}")
-                continue
-            
-            macs = parse_mac_table(result[0].result, host_name)
-            all_macs.extend(macs)
-            logger.info(f"✓ Retrieved {len(macs)} MAC entries from {host_name}")
+    for host in inventory.inventory.hosts.values():
+        logger.info(f"Collecting uptime from {host.name}")
+        results[host.name] = {"timestamp": datetime.now().isoformat()}
         
+        try:
+            task = host.run_task(netmiko_send_command, command_string="show version")
+            
+            if task.ok:
+                output = task.result
+                results[host.name]["status"] = "success"
+                
+                for line in output.split("\n"):
+                    if "uptime" in line.lower():
+                        results[host.name]["uptime"] = line.strip()
+                        break
+                else:
+                    results[host.name]["uptime"] = "Unable to parse"
+            else:
+                results[host.name]["status"] = "failed"
+                results[host.name]["error"] = "Command execution failed"
+                
         except Exception as e:
-            logger.warning(f"Error querying {host_name}: {e}")
+            logger.error(f"Error from {host.name}: {e}")
+            results[host.name]["status"] = "error"
+            results[host.name]["error"] = str(e)
     
-    return all_macs
+    return results
 
 
-def filter_macs(all_macs: list, mac_filter: str = None, vlan_filter: str = None) -> list:
-    """Apply filters to MAC table entries."""
-    filtered = all_macs
+def format_table(results: Dict) -> str:
+    """Format results as ASCII table."""
+    lines = [
+        "\n" + "=" * 90,
+        "Device Uptime Report",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 90,
+        f"{'Device':<25} {'Status':<12} {'Uptime Information':<50}",
+        "-" * 90,
+    ]
     
-    if mac_filter:
-        mac_filter = mac_filter.lower()
-        filtered = [m for m in filtered if mac_filter in m['mac_address'].lower()]
+    for device, info in results.items():
+        status = info.get("status", "unknown").upper()
+        uptime = info.get("uptime", info.get("error", "N/A"))[:48]
+        lines.append(f"{device:<25} {status:<12} {uptime:<50}")
     
-    if vlan_filter:
-        filtered = [m for m in filtered if m['vlan'] == vlan_filter]
-    
-    return filtered
+    lines.append("=" * 90)
+    return "\n".join(lines) + "\n"
 
 
-def format_table_output(macs: list) -> str:
-    """Format MAC entries as human-readable table."""
-    if not macs:
-        return "\nNo MAC entries found matching criteria.\n"
+def format_csv(results: Dict) -> str:
+    """Format results as CSV."""
+    output = StringIO()
+    writer = csv.DictWriter(
+        output, fieldnames=["device", "status", "timestamp", "uptime", "error"]
+    )
+    writer.writeheader()
     
-    lines = []
-    lines.append("\n" + "="*120)
-    lines.append("MAC ADDRESS TABLE")
-    lines.append("="*120)
-    lines.append(f"{'MAC Address':<18} {'VLAN':<8} {'Type':<10} {'Interface':<25} {'Switch':<20}")
-    lines.append("-"*120)
+    for device, info in results.items():
+        writer.writerow({
+            "device": device,
+            "status": info.get("status", "unknown"),
+            "timestamp": info.get("timestamp", ""),
+            "uptime": info.get("uptime", ""),
+            "error": info.get("error", ""),
+        })
     
-    for entry in sorted(macs, key=lambda x: (x['switch'], x['mac_address'])):
-        lines.append(
-            f"{entry['mac_address']:<18} {entry['vlan']:<8} {entry['type']:<10} "
-            f"{entry['interface']:<25} {entry['switch']:<20}"
-        )
-    
-    lines.append("-"*120)
-    lines.append(f"Total entries: {len(macs)}")
-    lines.append("="*120 + "\n")
-    
-    return '\n'.join(lines)
+    return output.getvalue()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Collect device uptime and system information",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument('--devices', default='all',
-                       help='Device names (comma-separated) or "all"')
-    parser.add_argument('--mac', help='Filter by MAC address')
-    parser.add_argument('--vlan', help='Filter by VLAN ID')
-    parser.add_argument('--output', choices=['table', 'json', 'csv'], default='table',
-                       help='Output format')
-    parser.add_argument('--inventory', default='.',
-                       help='Path to nornir inventory directory')
+    
+    parser.add_argument(
+        "--devices", help="Comma-separated device names (default: all)"
+    )
+    parser.add_argument(
+        "--filter-group",
+        help="Filter inventory by group name",
+    )
+    parser.add_argument(
+        "--output", help="Output file (default: stdout)"
+    )
+    parser.add_argument(
+        "--format",
+        choices=["json", "table", "csv"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "--inventory",
+        default="nornir_inventory",
+        help="Path to nornir inventory directory",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level",
+    )
     
     args = parser.parse_args()
+    setup_logging(args.log_level)
+    logger = logging.getLogger(__name__)
     
     try:
-        nr = InitNornir(
-            inventory={
-                "plugin": "SimpleInventory",
-                "options": {
-                    "host_file": str(Path(args.inventory) / "hosts.yaml"),
-                    "group_file": str(Path(args.inventory) / "groups.yaml"),
-                    "defaults_file": str(Path(args.inventory) / "defaults.yaml"),
-                }
-            }
-        )
-        logger.info(f"Nornir initialized with {len(nr.inventory.hosts)} hosts")
+        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
         
-        all_macs = collect_mac_tables(nr, args.devices)
-        filtered_macs = filter_macs(all_macs, args.mac, args.vlan)
+        if args.filter_group:
+            nr = nr.filter(F(groups__contains=args.filter_group))
+            logger.info(f"Filtered to group '{args.filter_group}': {len(nr.inventory.hosts)} devices")
         
-        if args.output == 'json':
-            print(json.dumps(filtered_macs, indent=2))
-        elif args.output == 'csv':
-            if filtered_macs:
-                output = StringIO()
-                writer = csv.DictWriter(output, fieldnames=filtered_macs[0].keys())
-                writer.writeheader()
-                writer.writerows(filtered_macs)
-                print(output.getvalue())
-            else:
-                print("No entries to export")
+        devices = parse_device_list(args.devices) if args.devices else None
+        results = collect_uptime_info(nr, devices)
+        
+        if args.format == "json":
+            output = json.dumps(results, indent=2, default=str)
+        elif args.format == "csv":
+            output = format_csv(results)
         else:
-            print(format_table_output(filtered_macs))
+            output = format_table(results)
         
-        logger.info(f"Complete: {len(filtered_macs)} entries after filtering")
-        return 0
-    
+        if args.output:
+            Path(args.output).write_text(output)
+            logger.info(f"Report written to {args.output}")
+        else:
+            print(output)
+        
+        successful = sum(1 for r in results.values() if r.get("status") == "success")
+        logger.info(f"Successfully collected from {successful}/{len(results)} devices")
+        
+    except FileNotFoundError as e:
+        logger.error(f"Inventory not found: {e}")
+        raise
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        return 1
+        logger.error(f"Fatal error: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
