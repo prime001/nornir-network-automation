@@ -1,243 +1,222 @@
-Now I have full context on what both scripts do. `bgp_summary.py` is a NAPALM-based neighbor table renderer and `bgp_summary_v2.py` is a DNS/NTP verifier. I'll write a BGP prefix drift detector — baseline snapshot + live comparison — which is a genuinely different workflow.
+The nornir repo content is in the user's prompt — I have what I need. Writing the script now, targeting BGP prefix-limit utilization monitoring as a non-duplicate angle.
 
 """
-bgp_prefix_drift.py — BGP Prefix Drift Detector
+BGP Prefix Limit Monitor
 
-Collects BGP neighbor state and prefix counts from a fleet of routers,
-then compares against a saved JSON baseline to surface drift: new or
-missing peers, session state flaps, and significant prefix-count changes.
+Queries routers for per-neighbor BGP prefix counts and configured maximum-prefix
+limits, then reports utilization percentages and flags sessions approaching or
+exceeding a configurable warning threshold.
 
-On the first run (or with --save-baseline), a JSON snapshot is written.
-On subsequent runs the live state is diffed and a delta report is printed.
-Exit code 0 = clean, 1 = drift or collection errors, 2 = bad arguments.
-
-Usage:
-    # Establish or refresh a baseline
-    python bgp_prefix_drift.py \
-        --hosts inventory/hosts.yaml \
-        --groups inventory/groups.yaml \
-        --defaults inventory/defaults.yaml \
-        --save-baseline bgp_baseline.json
-
-    # Compare live state to baseline
-    python bgp_prefix_drift.py --baseline bgp_baseline.json
-
-    # Alert only when prefix count shifts by >=10 % (default 20)
-    python bgp_prefix_drift.py --baseline bgp_baseline.json --threshold 10
-
-    # Restrict to edge routers in nyc
-    python bgp_prefix_drift.py --baseline bgp_baseline.json --filter role=edge,site=nyc
+Unlike bgp_summary.py (session health) and bgp_summary_v2.py (per-VRF reporting),
+this script answers the capacity-planning question: how close is each BGP session
+to its configured prefix ceiling?
 
 Prerequisites:
-    pip install nornir nornir-napalm nornir-utils napalm
+    pip install nornir nornir-netmiko nornir-utils
 
-    NAPALM-supported platforms: ios, eos, junos, nxos_ssh.
-    Credentials live in defaults.yaml or per-host in hosts.yaml.
+Usage:
+    Single host:
+        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret
+
+    Multiple hosts via YAML inventory:
+        python bgp_prefix_monitor.py --inventory hosts.yaml -u admin -p secret
+
+    Custom warning threshold (default 75 %):
+        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret \
+            --threshold 80
+
+    Write report to file:
+        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret \
+            --output report.txt
 """
 
 import argparse
-import json
 import logging
+import re
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, TextIO
 
 from nornir import InitNornir
-from nornir.core.filter import F
+from nornir.core.inventory import ConnectionOptions, Defaults, Groups, Host, Hosts
 from nornir.core.task import Result, Task
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir_netmiko.tasks import netmiko_send_command
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("bgp_prefix_monitor")
+
+_SUMMARY_RE = re.compile(
+    r"^(?P<peer>\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+"
+    r"\S+\s+(?P<state_or_pfx>\S+)",
+    re.MULTILINE,
+)
+_MAX_PREFIX_RE = re.compile(
+    r"Maximum prefixes allowed\s+(?P<limit>\d+)"
+    r"(?:\s+\((?P<warn_pct>\d+)%\))?"
+)
 
 
-def collect_bgp_state(task: Task) -> Result:
-    task.run(task=napalm_get, getters=["bgp_neighbors"])
-    raw = task.results[1].result.get("bgp_neighbors", {})
+@dataclass
+class NeighborLimit:
+    peer: str
+    received: int
+    prefix_limit: Optional[int] = None
+    device_warn_pct: int = 75
 
-    peers = {}
-    for vrf, vrf_data in raw.items():
-        for peer_ip, peer in vrf_data.get("peers", {}).items():
-            rcv = sum(
-                af.get("received_prefixes", 0) or 0
-                for af in peer.get("address_family", {}).values()
+    @property
+    def utilization(self) -> Optional[float]:
+        if self.prefix_limit and self.prefix_limit > 0:
+            return (self.received / self.prefix_limit) * 100.0
+        return None
+
+    @property
+    def status(self) -> str:
+        util = self.utilization
+        if util is None:
+            return "NO_LIMIT"
+        if util >= 100.0:
+            return "CRITICAL"
+        if util >= self.device_warn_pct:
+            return "WARNING"
+        return "OK"
+
+
+def collect_bgp_prefix_data(task: Task) -> Result:
+    summary_out = task.run(
+        task=netmiko_send_command,
+        command_string="show ip bgp summary",
+        name="bgp_summary",
+    ).result
+
+    established: List[NeighborLimit] = []
+    for m in _SUMMARY_RE.finditer(summary_out):
+        peer = m.group("peer")
+        state_or_pfx = m.group("state_or_pfx")
+        if not state_or_pfx.isdigit():
+            logger.debug("%s: peer %s not established (%s), skipping", task.host, peer, state_or_pfx)
+            continue
+        established.append(NeighborLimit(peer=peer, received=int(state_or_pfx)))
+
+    for nbr in established:
+        detail_out = task.run(
+            task=netmiko_send_command,
+            command_string=f"show ip bgp neighbors {nbr.peer}",
+            name=f"bgp_neighbor_{nbr.peer}",
+        ).result
+
+        m = _MAX_PREFIX_RE.search(detail_out)
+        if m:
+            nbr.prefix_limit = int(m.group("limit"))
+            if m.group("warn_pct"):
+                nbr.device_warn_pct = int(m.group("warn_pct"))
+
+    return Result(host=task.host, result=established)
+
+
+def print_report(
+    device_results: Dict[str, List[NeighborLimit]],
+    threshold: int,
+    fh: TextIO,
+) -> int:
+    col = "{:<20} {:<18} {:>10} {:>12} {:>9}  {}"
+    header = col.format("Device", "Peer", "Received", "MaxPrefix", "Util%", "Status")
+    separator = "-" * len(header)
+    fh.write(f"\n{header}\n{separator}\n")
+
+    flagged = 0
+    for device, neighbors in sorted(device_results.items()):
+        for nbr in sorted(neighbors, key=lambda n: n.peer):
+            util_str = f"{nbr.utilization:.1f}" if nbr.utilization is not None else "n/a"
+            limit_str = str(nbr.prefix_limit) if nbr.prefix_limit else "none"
+            status = nbr.status
+            if nbr.utilization is not None and nbr.utilization >= threshold:
+                flagged += 1
+            fh.write(
+                col.format(device, nbr.peer, nbr.received, limit_str, util_str, status)
+                + "\n"
             )
-            peers[f"{vrf}/{peer_ip}"] = {
-                "vrf": vrf,
-                "peer": peer_ip,
-                "remote_as": peer.get("remote_as", ""),
-                "state": peer.get("connection_state", "unknown"),
-                "rcv_prefixes": rcv,
-                "uptime": peer.get("uptime", -1) or -1,
-            }
 
-    return Result(host=task.host, result=peers)
+    fh.write(f"\n{flagged} neighbor(s) at or above {threshold}% utilization.\n")
+    return flagged
 
 
-def snapshot_fleet(nr):
-    results = nr.run(task=collect_bgp_state)
-    snapshot, errors = {}, []
-    for host, multi in results.items():
-        if multi.failed:
-            errors.append((host, str(multi.exception)))
-        else:
-            snapshot[host] = multi[0].result
-    return snapshot, errors
-
-
-def diff_snapshots(baseline: dict, live: dict, threshold_pct: float) -> list:
-    lines = []
-    for host in sorted(set(baseline) | set(live)):
-        if host not in baseline:
-            lines.append(f"NEW HOST   {host}")
-            continue
-        if host not in live:
-            lines.append(f"LOST HOST  {host}")
-            continue
-
-        base_peers, live_peers = baseline[host], live[host]
-        for key in sorted(set(base_peers) | set(live_peers)):
-            if key not in base_peers:
-                p = live_peers[key]
-                lines.append(
-                    f"NEW PEER   {host:20s}  {key:35s}  AS {p['remote_as']}"
-                    f"  state={p['state']}  rcv={p['rcv_prefixes']}"
-                )
-            elif key not in live_peers:
-                p = base_peers[key]
-                lines.append(
-                    f"LOST PEER  {host:20s}  {key:35s}  AS {p['remote_as']}"
-                    f"  was state={p['state']}  was rcv={p['rcv_prefixes']}"
-                )
-            else:
-                b, lv = base_peers[key], live_peers[key]
-                if b["state"].lower() != lv["state"].lower():
-                    lines.append(
-                        f"STATE CHG  {host:20s}  {key:35s}  AS {b['remote_as']}"
-                        f"  {b['state']} -> {lv['state']}"
-                    )
-                base_rcv, live_rcv = b["rcv_prefixes"], lv["rcv_prefixes"]
-                if base_rcv > 0:
-                    pct = abs(live_rcv - base_rcv) / base_rcv * 100
-                elif live_rcv > 0:
-                    pct = 100.0
-                else:
-                    pct = 0.0
-                if pct >= threshold_pct:
-                    sign = "+" if live_rcv > base_rcv else "-"
-                    lines.append(
-                        f"PFX DRIFT  {host:20s}  {key:35s}  AS {b['remote_as']}"
-                        f"  {base_rcv} -> {live_rcv} ({sign}{pct:.1f}%)"
-                    )
-    return lines
-
-
-def build_nornir(args):
-    for path in (args.hosts, args.groups, args.defaults):
-        if not Path(path).exists():
-            logger.error("Inventory file not found: %s", path)
-            sys.exit(2)
-
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.hosts,
-                "group_file": args.groups,
-                "defaults_file": args.defaults,
-            },
-        },
+def build_nornir_from_host(host: str, username: str, password: str, platform: str):
+    conn_opts = ConnectionOptions(extras={"device_type": platform})
+    hosts = Hosts(
+        {
+            host: Host(
+                name=host,
+                hostname=host,
+                username=username,
+                password=password,
+                connection_options={"netmiko": conn_opts},
+            )
+        }
+    )
+    return InitNornir(
+        inventory={"plugin": "SimpleInventory"},
+        runner={"plugin": "threaded", "options": {"num_workers": 10}},
         logging={"enabled": False},
+        core={"raise_on_error": False},
+        _hosts=hosts,
+        _groups=Groups(),
+        _defaults=Defaults(),
     )
 
-    if args.filter:
-        pairs = {}
-        for token in args.filter.split(","):
-            k, _, v = token.partition("=")
-            if k.strip() and v.strip():
-                pairs[k.strip()] = v.strip()
-        nr = nr.filter(F(**pairs))
 
-    if not nr.inventory.hosts:
-        print("No hosts matched — check inventory and --filter.", file=sys.stderr)
-        sys.exit(2)
-    return nr
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="BGP prefix drift detector — diff live BGP state against a saved baseline"
-    )
-    parser.add_argument("--hosts", default="inventory/hosts.yaml", metavar="FILE")
-    parser.add_argument("--groups", default="inventory/groups.yaml", metavar="FILE")
-    parser.add_argument("--defaults", default="inventory/defaults.yaml", metavar="FILE")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="BGP prefix-limit utilization monitor")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--host", help="Single device hostname or IP")
+    src.add_argument("--inventory", help="Path to Nornir SimpleInventory hosts.yaml")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform type")
     parser.add_argument(
-        "--filter", metavar="KEY=VAL[,KEY=VAL]",
-        help="Nornir host filter (e.g. role=edge,site=nyc)",
+        "--threshold",
+        type=int,
+        default=75,
+        help="Utilization %% at which to flag a neighbor (default: 75)",
     )
-    parser.add_argument(
-        "--baseline", default="bgp_baseline.json", metavar="FILE",
-        help="Baseline snapshot file (default: bgp_baseline.json)",
-    )
-    parser.add_argument(
-        "--save-baseline", action="store_true",
-        help="Capture a fresh baseline and exit",
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=20.0, metavar="PCT",
-        help="Prefix-count delta %% that triggers a drift alert (default: 20)",
-    )
-    parser.add_argument("--workers", type=int, default=10, metavar="N")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--output", help="Write report to this file path")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    if args.verbose:
+        logging.getLogger("bgp_prefix_monitor").setLevel(logging.DEBUG)
 
-    nr = build_nornir(args)
-    live_snapshot, errors = snapshot_fleet(nr)
-
-    for host, err in errors:
-        print(f"ERROR  {host}: {err}", file=sys.stderr)
-
-    if not live_snapshot:
-        print("No data collected from any host.", file=sys.stderr)
-        sys.exit(1)
-
-    if args.save_baseline:
-        payload = {
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "snapshot": live_snapshot,
-        }
-        with open(args.baseline, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        print(f"Baseline saved: {args.baseline}  ({len(live_snapshot)} hosts)")
-        sys.exit(0 if not errors else 1)
-
-    if not Path(args.baseline).exists():
-        print(
-            f"No baseline at {args.baseline}. Run with --save-baseline to create one.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    with open(args.baseline) as fh:
-        baseline_snapshot = json.load(fh)["snapshot"]
-
-    drift = diff_snapshots(baseline_snapshot, live_snapshot, args.threshold)
-
-    if drift:
-        print(f"\nBGP DRIFT DETECTED  ({len(drift)} change(s))\n")
-        for line in drift:
-            print(" ", line)
-        print()
+    if args.host:
+        nr = build_nornir_from_host(args.host, args.username, args.password, args.platform)
     else:
-        print("OK — no BGP drift detected.")
+        nr = InitNornir(
+            config_file=args.inventory,
+            runner={"plugin": "threaded", "options": {"num_workers": 10}},
+            logging={"enabled": False},
+        )
+        nr.inventory.defaults.username = args.username
+        nr.inventory.defaults.password = args.password
 
-    sys.exit(1 if (drift or errors) else 0)
+    results = nr.run(task=collect_bgp_prefix_data, name="bgp_prefix_monitor")
+
+    device_data: Dict[str, List[NeighborLimit]] = {}
+    for host_name, multi_result in results.items():
+        if multi_result.failed:
+            logger.error("Failed to collect data from %s: %s", host_name, multi_result[0].exception)
+            continue
+        device_data[host_name] = multi_result[0].result
+
+    fh = open(args.output, "w") if args.output else sys.stdout
+    try:
+        flagged = print_report(device_data, args.threshold, fh)
+    finally:
+        if args.output:
+            fh.close()
+
+    return 1 if flagged else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
