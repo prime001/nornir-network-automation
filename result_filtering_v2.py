@@ -1,193 +1,148 @@
 ```python
+#!/usr/bin/env python3
 """
-Device Health Check via Nornir and NAPALM.
+Software Version Inventory Aggregator
 
-Collects operational metrics (uptime, CPU, memory, interface errors) from network
-devices and generates a health summary report. Useful for monitoring device state
-and identifying interface anomalies.
-
-Usage:
-    python device_health_check.py -i inventory.yaml -g switches
-    python device_health_check.py -d router01 --format json
+Collects OS versions from all network devices and generates a report
+showing version distribution and outdated systems. Filters results by
+version status (current, outdated, critical).
 
 Prerequisites:
-    - Nornir installed (pip install nornir nornir-napalm)
-    - NAPALM drivers for target device types
-    - Inventory file with device credentials
+    - Nornir installed with netmiko driver
+    - Network devices accessible via SSH
+    - Devices support 'show version' command
+    - Inventory configured with device_type and credentials
+
+Usage:
+    python software_inventory.py --inventory inventory.yaml
+    python software_inventory.py --inventory inventory.yaml --outdated-only
+    python software_inventory.py --inventory inventory.yaml --filter "core-*"
+    python software_inventory.py --inventory inventory.yaml --group-by-version --verbose
 """
 
-import logging
 import argparse
-import json
-from typing import Dict, List, Optional, Any
+import logging
+from collections import defaultdict
+
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.napalm import napalm_get
+from nornir.core.task import Result, Task
+from nornir.tasks.networking import netmiko_send_command
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
+VERSION_THRESHOLD = {
+    "cisco_ios": {"current": "16.12", "outdated": "15.0"},
+    "cisco_xr": {"current": "7.0", "outdated": "6.0"},
+    "juniper_junos": {"current": "20.1", "outdated": "19.0"},
+    "arista_eos": {"current": "4.28", "outdated": "4.20"},
+}
 
-def gather_health_metrics(task) -> Optional[Dict[str, Any]]:
-    """Retrieve device health metrics: uptime, CPU, memory, temperature."""
+
+def extract_version(output: str, device_type: str) -> str:
+    """Parse version string from device output based on device type."""
+    for line in output.split("\n"):
+        if any(x in line for x in ["Software Version", "Cisco IOS", "Junos:", "Software version"]):
+            tokens = line.split()
+            for token in tokens:
+                if token[0].isdigit() and "." in token and len(token) < 10:
+                    return token
+    return "Unknown"
+
+
+def get_device_version(task: Task) -> Result:
+    """Collect version from device via netmiko."""
+    device_type = task.host.get("device_type", "cisco_ios")
+    
     try:
-        result = task.run(napalm_get, getters=['facts', 'environment'])
-        facts = result[0].result.get('facts', {})
-        environment = result[0].result.get('environment', {})
-
-        cpu_util = environment.get('cpu', {}).get('0', {}).get('%usage', 0)
-        mem_util = environment.get('memory', {}).get('%usage', 0)
-
-        return {
-            'device': task.host.name,
-            'uptime_seconds': facts.get('uptime_seconds', 0),
-            'cpu_utilization': cpu_util,
-            'memory_utilization': mem_util,
-            'vendor': facts.get('vendor', 'Unknown'),
-        }
+        r = task.run(netmiko_send_command, command_string="show version")
+        version = extract_version(r[0].result, device_type)
+        
+        return Result(host=task.host, result={
+            "version": version,
+            "device_type": device_type,
+        })
     except Exception as e:
-        logger.error(f"Failed to gather metrics from {task.host.name}: {e}")
-        return None
+        logger.error(f"Failed to get version from {task.host.name}: {e}")
+        return Result(host=task.host, failed=True, result={"version": "Error"})
 
 
-def gather_interface_health(task) -> Optional[Dict[str, Any]]:
-    """Retrieve interface error statistics across all interfaces."""
+def classify_version(version: str, device_type: str) -> str:
+    """Classify version status."""
+    if version == "Unknown" or version == "Error":
+        return "unknown"
+    
+    threshold = VERSION_THRESHOLD.get(device_type, {})
     try:
-        result = task.run(napalm_get, getters=['interfaces'])
-        interfaces = result[0].result.get('interfaces', {})
-
-        unhealthy_interfaces = {}
-        for iface_name, iface_data in interfaces.items():
-            rx_err = iface_data.get('rx_errors', 0)
-            tx_err = iface_data.get('tx_errors', 0)
-            if rx_err > 0 or tx_err > 0:
-                unhealthy_interfaces[iface_name] = {
-                    'rx_errors': rx_err,
-                    'tx_errors': tx_err,
-                    'rx_discards': iface_data.get('rx_discards', 0),
-                    'tx_discards': iface_data.get('tx_discards', 0),
-                }
-
-        return {
-            'device': task.host.name,
-            'error_count': len(unhealthy_interfaces),
-            'interfaces': unhealthy_interfaces,
-        }
-    except Exception as e:
-        logger.error(f"Failed to gather interface stats from {task.host.name}: {e}")
-        return None
+        curr = tuple(map(int, threshold.get("current", "0.0").split(".")[:2]))
+        outd = tuple(map(int, threshold.get("outdated", "0.0").split(".")[:2]))
+        vers = tuple(map(int, version.split(".")[:2]))
+        
+        if vers >= curr:
+            return "current"
+        elif vers >= outd:
+            return "outdated"
+        else:
+            return "critical"
+    except (ValueError, AttributeError):
+        return "unknown"
 
 
-def format_uptime(seconds: int) -> str:
-    """Convert seconds to readable uptime string."""
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
-
-
-def print_table_report(health: List[Dict], interfaces: List[Dict]) -> None:
-    """Print health metrics in table format."""
-    print("\n" + "=" * 80)
-    print(f"{'Device':<18} {'Uptime':<18} {'CPU %':<10} {'Memory %':<12} {'Status':<20}")
-    print("=" * 80)
-
-    for item in health:
-        if not item:
-            continue
-        uptime = format_uptime(item['uptime_seconds'])
-        cpu = item['cpu_utilization']
-        mem = item['memory_utilization']
-        status = "Healthy" if cpu < 80 and mem < 80 else "Warning"
-        print(f"{item['device']:<18} {uptime:<18} {cpu:<10.1f} {mem:<12.1f} {status:<20}")
-
-    print("\n" + "=" * 80)
-    print("Interface Error Summary:")
-    print("=" * 80)
-    for item in interfaces:
-        if not item or item['error_count'] == 0:
-            continue
-        print(f"\n{item['device']} ({item['error_count']} interfaces with errors):")
-        for iface, stats in item['interfaces'].items():
-            print(f"  {iface:<15} RX_ERR={stats['rx_errors']:<5} "
-                  f"TX_ERR={stats['tx_errors']:<5} "
-                  f"RX_DISC={stats['rx_discards']:<5} TX_DISC={stats['tx_discards']:<5}")
-
-
-def main() -> int:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Collect and report device health metrics'
-    )
-    parser.add_argument(
-        '-i', '--inventory',
-        default='inventory.yaml',
-        help='Path to Nornir inventory file'
-    )
-    parser.add_argument(
-        '-g', '--group',
-        help='Filter devices by group name'
-    )
-    parser.add_argument(
-        '-d', '--device',
-        help='Filter by specific device name'
-    )
-    parser.add_argument(
-        '-f', '--format',
-        choices=['table', 'json'],
-        default='table',
-        help='Output format'
-    )
-
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--inventory", default="inventory.yaml", help="Inventory file")
+    parser.add_argument("--filter", help="Filter devices by name")
+    parser.add_argument("--outdated-only", action="store_true", help="Show only outdated versions")
+    parser.add_argument("--group-by-version", action="store_true", help="Group by version")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    
     args = parser.parse_args()
-
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                       format="%(levelname)s: %(message)s")
+    
     try:
         nr = InitNornir(config_file=args.inventory)
-
-        if args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-        if args.device:
-            nr = nr.filter(F(name=args.device))
-
-        if len(nr.inventory.hosts) == 0:
-            logger.error("No devices matched filter criteria")
-            return 1
-
-        logger.info(f"Gathering health metrics from {len(nr.inventory.hosts)} device(s)")
-        health_results = nr.run(task=gather_health_metrics)
-        interface_results = nr.run(task=gather_interface_health)
-
-        health_data = [
-            health_results[host][0].result
-            for host in health_results
-            if health_results[host][0].result
-        ]
-        interface_data = [
-            interface_results[host][0].result
-            for host in interface_results
-            if interface_results[host][0].result
-        ]
-
-        if args.format == 'json':
-            output = {
-                'health_metrics': health_data,
-                'interface_errors': interface_data,
-            }
-            print(json.dumps(output, indent=2))
+        if args.filter:
+            nr = nr.filter(F(name__contains=args.filter))
+        
+        logger.info(f"Collecting versions from {len(nr.inventory.hosts)} devices...")
+        
+        inventory = {}
+        for host_name, host_obj in nr.inventory.hosts.items():
+            result = get_device_version(host_obj)
+            if not result.failed:
+                version = result.result["version"]
+                device_type = result.result["device_type"]
+                status = classify_version(version, device_type)
+                inventory[host_name] = {"version": version, "device_type": device_type, "status": status}
+        
+        if args.group_by_version:
+            grouped = defaultdict(list)
+            for device, info in inventory.items():
+                grouped[info["version"]].append(device)
+            
+            print("\nVersions by Release:")
+            for version in sorted(grouped.keys()):
+                devices = grouped[version]
+                if args.outdated_only and classify_version(version, "cisco_ios") == "current":
+                    continue
+                print(f"\n{version}: {len(devices)} device(s)")
+                for d in sorted(devices):
+                    print(f"  - {d}")
         else:
-            print_table_report(health_data, interface_data)
-
-        logger.info("Health check completed successfully")
+            print(f"\n{'Device':<25} {'Type':<15} {'Version':<12} {'Status':<10}")
+            print("-" * 65)
+            for device in sorted(inventory.keys()):
+                info = inventory[device]
+                if args.outdated_only and info["status"] == "current":
+                    continue
+                print(f"{device:<25} {info['device_type']:<15} {info['version']:<12} {info['status']:<10}")
+        
+        logger.info(f"Successfully processed {len(inventory)} devices")
         return 0
-
-    except FileNotFoundError:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        return 1
+    
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Error: {e}", exc_info=args.verbose)
         return 1
 
 
