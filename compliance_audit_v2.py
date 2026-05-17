@@ -1,225 +1,216 @@
 ```python
-#!/usr/bin/env python
 """
-Device Health Monitor - Nornir-based system health and availability reporting.
+Device Reachability & Response Time Audit
 
-This script collects system health metrics from network devices (CPU, memory, disk,
-uptime) and generates a health report. Useful for identifying devices approaching
-capacity limits or experiencing unexpected reboots.
+Audits network device availability and measures response times across inventory.
+Useful for SLA compliance verification and operational health assessment.
 
 Usage:
-    python device_health_monitor.py --hosts router1,router2,router3
-    python device_health_monitor.py --group dc1 --cpu-threshold 80 --mem-threshold 75
-    python device_health_monitor.py --hosts all --output report.csv
+    python device_reachability_audit.py --inventory inventory.yaml --username admin
+    python device_reachability_audit.py --timeout 10 --output audit_results.json
 
 Prerequisites:
-    - nornir with NAPALM plugin
-    - Network devices with SNMP/SSH access
-    - Device inventory configured in nornir config.yaml
+    - Nornir installed (pip install nornir netmiko)
+    - Inventory file with device definitions
+    - Device credentials via --username/--password or environment variables
+    - SSH/Telnet access to devices
+    - Python 3.7+
+
+Output:
+    JSON or CSV report showing per-device availability, response time, and
+    connection status. Identifies unreachable devices for troubleshooting.
 """
 
-import argparse
 import logging
-import sys
-from typing import Dict, List, Optional
+import argparse
+import json
+import csv
+import time
+from datetime import datetime
+from typing import Dict, Any
 from nornir import InitNornir
 from nornir.core.task import Task, Result
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.plugins.tasks.networking import netmiko_send_command
 
 
-def setup_logging(verbose: bool = False) -> None:
-    """Configure logging with appropriate verbosity."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=level
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def get_device_health(task: Task) -> Result:
-    """Retrieve device health metrics using NAPALM get_facts."""
+def test_device_reachability(task: Task, timeout: int = 10) -> Result:
+    """Test device reachability and measure response time."""
+    start_time = time.time()
+    
     try:
-        result = task.run(
-            napalm_get,
-            getters=['facts']
+        task.run(
+            netmiko_send_command,
+            command_string="show version",
+            use_textfsm=False,
         )
-        facts = result[0].result
-        return Result(host=task.host, result=facts)
+        response_time = time.time() - start_time
+        
+        return Result(
+            host=task.host,
+            result={
+                "device": task.host.name,
+                "status": "reachable",
+                "response_time_ms": round(response_time * 1000, 2),
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
     except Exception as e:
-        logging.error(f"{task.host.name}: Failed to retrieve health data - {e}")
-        return Result(host=task.host, result=None, failed=True)
+        response_time = time.time() - start_time
+        logger.warning(f"Device {task.host.name} unreachable: {str(e)[:50]}")
+        
+        return Result(
+            host=task.host,
+            failed=True,
+            result={
+                "device": task.host.name,
+                "status": "unreachable",
+                "response_time_ms": round(response_time * 1000, 2),
+                "error": str(e)[:100],
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
 
-def check_health_thresholds(
-    facts: Dict,
-    cpu_threshold: int,
-    mem_threshold: int
-) -> Dict:
-    """Check device metrics against thresholds and return status."""
-    status = {
-        'host': facts.get('hostname', 'unknown'),
-        'model': facts.get('model', 'unknown'),
-        'uptime': facts.get('uptime_seconds', 0),
-        'cpu': facts.get('cpu_utilization', 'N/A'),
-        'memory': facts.get('memory_used_percent', 'N/A'),
-        'warnings': []
-    }
-
-    if isinstance(status['cpu'], (int, float)):
-        if status['cpu'] > cpu_threshold:
-            status['warnings'].append(
-                f"CPU {status['cpu']}% exceeds {cpu_threshold}% threshold"
-            )
-
-    if isinstance(status['memory'], (int, float)):
-        if status['memory'] > mem_threshold:
-            status['warnings'].append(
-                f"Memory {status['memory']}% exceeds {mem_threshold}% threshold"
-            )
-
-    if status['uptime'] < 3600:
-        hours = status['uptime'] / 3600
-        status['warnings'].append(f"Recently rebooted ({hours:.1f} hours ago)")
-
-    return status
+def format_json_output(audit_results: list, indent: int = 2) -> str:
+    """Format audit results as JSON."""
+    return json.dumps(audit_results, indent=indent)
 
 
-def format_uptime(seconds: int) -> str:
-    """Convert uptime seconds to human-readable format."""
-    if not seconds:
-        return "Unknown"
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    return f"{days}d {hours}h"
+def format_csv_output(audit_results: list) -> str:
+    """Format audit results as CSV."""
+    if not audit_results:
+        return "No results to report."
+    
+    fieldnames = ["device", "status", "response_time_ms", "timestamp", "error"]
+    output_lines = []
+    writer_obj = None
+    
+    import io
+    csv_buffer = io.StringIO()
+    writer_obj = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+    writer_obj.writeheader()
+    
+    for result in audit_results:
+        row = {f: result.get(f, "") for f in fieldnames}
+        writer_obj.writerow(row)
+    
+    return csv_buffer.getvalue()
 
 
-def generate_report(
-    results: List[Dict],
-    output_file: Optional[str] = None
-) -> None:
-    """Generate and display health report."""
-    print("\n" + "="*80)
-    print("DEVICE HEALTH REPORT")
-    print("="*80)
-
-    healthy = 0
-    warned = 0
-
-    for status in results:
-        if status is None:
-            continue
-
-        print(f"\nHost: {status['host']} ({status['model']})")
-        print(f"  Uptime: {format_uptime(status['uptime'])}")
-        print(f"  CPU: {status['cpu']}%")
-        print(f"  Memory: {status['memory']}%")
-
-        if status['warnings']:
-            warned += 1
-            print("  ⚠ Warnings:")
-            for warning in status['warnings']:
-                print(f"    - {warning}")
-        else:
-            healthy += 1
-            print("  ✓ Healthy")
-
-    print("\n" + "="*80)
-    print(f"Summary: {healthy} healthy, {warned} with warnings")
-    print("="*80 + "\n")
-
-    if output_file:
-        try:
-            with open(output_file, 'w') as f:
-                f.write("Hostname,Model,Uptime,CPU,Memory,Warnings\n")
-                for status in results:
-                    if status:
-                        warnings_str = "; ".join(status['warnings']) or "None"
-                        f.write(
-                            f"{status['host']},{status['model']},"
-                            f"{format_uptime(status['uptime'])},"
-                            f"{status['cpu']}%,{status['memory']}%,"
-                            f"\"{warnings_str}\"\n"
-                        )
-            logging.info(f"Report saved to {output_file}")
-        except IOError as e:
-            logging.error(f"Failed to write output file: {e}")
+def print_summary(audit_results: list) -> None:
+    """Print audit summary statistics."""
+    total = len(audit_results)
+    reachable = sum(1 for r in audit_results if r["status"] == "reachable")
+    unreachable = total - reachable
+    
+    if reachable > 0:
+        avg_response = sum(
+            r["response_time_ms"] for r in audit_results 
+            if r["status"] == "reachable"
+        ) / reachable
+    else:
+        avg_response = 0
+    
+    print("\n" + "="*60)
+    print("REACHABILITY AUDIT SUMMARY")
+    print("="*60)
+    print(f"Total Devices:      {total}")
+    print(f"Reachable:          {reachable} ({100*reachable//total if total else 0}%)")
+    print(f"Unreachable:        {unreachable} ({100*unreachable//total if total else 0}%)")
+    print(f"Avg Response Time:  {avg_response:.2f}ms")
+    print("="*60 + "\n")
 
 
 def main():
-    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description='Monitor network device health metrics'
+        description="Audit device reachability and response times"
     )
     parser.add_argument(
-        '--hosts',
-        type=str,
-        default='all',
-        help='Comma-separated list of hosts or "all"'
+        "--inventory",
+        default="inventory.yaml",
+        help="Path to Nornir inventory file (default: inventory.yaml)"
     )
     parser.add_argument(
-        '--group',
-        type=str,
-        help='Filter by device group'
+        "--username",
+        help="Device username for authentication"
     )
     parser.add_argument(
-        '--cpu-threshold',
+        "--password",
+        help="Device password for authentication"
+    )
+    parser.add_argument(
+        "--timeout",
         type=int,
-        default=80,
-        help='CPU utilization warning threshold (%%, default: 80)'
+        default=10,
+        help="Connection timeout in seconds (default: 10)"
     )
     parser.add_argument(
-        '--mem-threshold',
-        type=int,
-        default=85,
-        help='Memory usage warning threshold (%%, default: 85)'
+        "--filter",
+        help="Filter devices by name (glob pattern)"
     )
     parser.add_argument(
-        '--output',
-        type=str,
-        help='Export results to CSV file'
+        "--output",
+        help="Output file path (optional)"
     )
     parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='Enable verbose logging'
+        "--format",
+        choices=["json", "csv"],
+        default="json",
+        help="Output format (default: json)"
     )
-
+    
     args = parser.parse_args()
-    setup_logging(args.verbose)
-
+    
     try:
-        nr = InitNornir(config_file='config.yaml')
-
-        if args.group:
-            nr = nr.filter(group=args.group)
-        elif args.hosts != 'all':
-            hosts_list = [h.strip() for h in args.hosts.split(',')]
-            nr = nr.filter(filter_func=lambda h: h.name in hosts_list)
-
-        logging.info(f"Running health check on {len(nr.inventory.hosts)} devices")
-
-        results = nr.run(task=get_device_health)
-
-        health_statuses = []
-        for host_name, multi_result in results.items():
-            for task_result in multi_result.values():
-                if task_result.result:
-                    status = check_health_thresholds(
-                        task_result.result,
-                        args.cpu_threshold,
-                        args.mem_threshold
-                    )
-                    health_statuses.append(status)
-                else:
-                    logging.warning(f"No data retrieved for {host_name}")
-
-        generate_report(health_statuses, args.output)
-
+        logger.info(f"Loading inventory from {args.inventory}")
+        nr = InitNornir(config_file=args.inventory)
+        
+        if args.filter:
+            nr = nr.filter(name=args.filter)
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices")
+        
+        if args.username:
+            nr.inventory.defaults.username = args.username
+        if args.password:
+            nr.inventory.defaults.password = args.password
+        
+        logger.info(f"Starting reachability audit on {len(nr.inventory.hosts)} devices")
+        
+        results = nr.run(task=test_device_reachability, timeout=args.timeout)
+        
+        audit_results = []
+        for host, task_results in results.items():
+            for task_result in task_results:
+                audit_results.append(task_result.result)
+        
+        audit_results.sort(key=lambda x: x["device"])
+        
+        if args.format == "json":
+            output = format_json_output(audit_results)
+        else:
+            output = format_csv_output(audit_results)
+        
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output)
+            logger.info(f"Audit results written to {args.output}")
+        else:
+            print(output)
+        
+        print_summary(audit_results)
+        
     except Exception as e:
-        logging.error(f"Fatal error: {e}", exc_info=args.verbose)
-        sys.exit(1)
+        logger.error(f"Audit failed: {e}", exc_info=True)
+        raise
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 ```
