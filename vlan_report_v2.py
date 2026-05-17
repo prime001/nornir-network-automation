@@ -1,19 +1,22 @@
 ```python
 """
-Network Device Inventory Report
+Device System Information Collector
 
-Collects detailed device inventory information including hardware details,
-software versions, installed modules, and serial numbers. Generates a
-comprehensive inventory report useful for lifecycle management and
-audit compliance.
+Purpose:
+    Collects system information (hostname, model, serial number, uptime,
+    OS version, memory) from network devices and generates an inventory
+    report suitable for asset management and compliance tracking.
 
 Usage:
-    python device_inventory.py [--inventory INVENTORY] [--format json|csv]
-    
+    python device_inventory.py --output inventory_report.csv
+    python device_inventory.py --devices core-* --format json --output core_devices.json
+    python device_inventory.py --inventory custom_inventory.yaml --format pretty
+
 Prerequisites:
-    - Nornir with napalm plugin configured
-    - Network device access (SSH)
-    - Devices support get_facts() napalm method
+    - Nornir installed and configured with device inventory
+    - Device credentials in nornir config or environment variables
+    - Network connectivity to all target devices
+    - Support for 'show version' and 'show inventory' commands
 """
 
 import argparse
@@ -21,218 +24,250 @@ import csv
 import json
 import logging
 import sys
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Any
 
 from nornir import InitNornir
 from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.plugins.tasks.networking import netmiko_send_command
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def collect_inventory(task: Task) -> Result:
+def gather_system_info(task: Task) -> Result:
     """
-    Collect device inventory information using NAPALM get_facts.
+    Collect system information from network device.
     
-    Returns:
-        dict: Device inventory with hostname, OS, serial, model, uptime
+    Gathers version, uptime, model, serial number, and memory information.
     """
-    device_name = task.host.name
-    inventory_data = {
-        "device": device_name,
-        "hostname": None,
-        "os_version": None,
-        "serial_number": None,
-        "vendor": None,
-        "model": None,
-        "uptime_seconds": None,
-        "interfaces_count": 0,
-        "error": None
-    }
-    
     try:
-        result = task.run(napalm_get, getters=["facts"])
-        facts = result[0].result.get("facts", {})
+        version_output = task.run(
+            netmiko_send_command,
+            command_string="show version",
+            use_textfsm=False
+        )
         
-        if facts:
-            inventory_data["hostname"] = facts.get("hostname", device_name)
-            inventory_data["os_version"] = facts.get("os_version")
-            inventory_data["serial_number"] = facts.get("serial_number", "N/A")
-            inventory_data["vendor"] = facts.get("vendor")
-            inventory_data["model"] = facts.get("model")
-            inventory_data["uptime_seconds"] = facts.get("uptime_seconds")
-            inventory_data["interfaces_count"] = facts.get("interfaces_count", 0)
+        inventory_output = task.run(
+            netmiko_send_command,
+            command_string="show inventory",
+            use_textfsm=False
+        )
         
         return Result(
             host=task.host,
-            result=inventory_data,
-            changed=False
+            result={
+                'version': version_output[0].result,
+                'inventory': inventory_output[1].result
+            }
         )
-    
     except Exception as e:
-        logger.error(f"Failed to collect inventory for {device_name}: {str(e)}")
-        inventory_data["error"] = str(e)
-        return Result(
-            host=task.host,
-            result=inventory_data,
-            failed=True,
-            exception=e
-        )
+        logger.error(f"{task.host.name}: Failed to collect system info - {e}")
+        return Result(host=task.host, failed=True, exception=e)
 
 
-def format_uptime_short(seconds: int) -> str:
-    """Convert uptime seconds to short format."""
-    if not seconds:
-        return "Unknown"
+def parse_system_info(host_name: str, outputs: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Parse system information from command outputs.
     
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    
-    return f"{days}d {hours}h"
-
-
-def generate_json_report(inventory_list: List[Dict[str, Any]]) -> None:
-    """Output inventory as JSON."""
-    output = {
-        "inventory": inventory_list,
-        "device_count": len(inventory_list),
-        "vendors": list(set(
-            item.get("vendor") for item in inventory_list if item.get("vendor")
-        ))
+    Extracts key fields like model, serial, uptime from show version/inventory.
+    """
+    info = {
+        'hostname': host_name,
+        'model': 'Unknown',
+        'serial_number': 'Unknown',
+        'os_version': 'Unknown',
+        'uptime_days': 'Unknown',
+        'memory_mb': 'Unknown'
     }
-    print(json.dumps(output, indent=2))
+    
+    version_lines = outputs.get('version', '').split('\n')
+    inventory_lines = outputs.get('inventory', '').split('\n')
+    
+    for line in version_lines:
+        line_lower = line.lower()
+        
+        if 'uptime is' in line_lower:
+            parts = line.split()
+            try:
+                for i, part in enumerate(parts):
+                    if 'day' in part.lower() and i > 0:
+                        info['uptime_days'] = parts[i-1]
+                        break
+            except (IndexError, ValueError):
+                pass
+        
+        if 'model' in line_lower or 'device id' in line_lower:
+            info['model'] = line.strip()
+        
+        if 'version' in line_lower and 'ios' in line_lower:
+            info['os_version'] = line.split('Version')[1].strip() if 'Version' in line else line.strip()
+        
+        if 'memory:' in line_lower or 'total memory' in line_lower:
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if 'k' in part.lower() or 'm' in part.lower() or 'g' in part.lower():
+                    try:
+                        info['memory_mb'] = part.rstrip(',')
+                        break
+                    except (IndexError, ValueError):
+                        pass
+    
+    for line in inventory_lines:
+        if 'sn' in line.lower() or 'serial' in line.lower():
+            parts = line.split()
+            if len(parts) > 1:
+                info['serial_number'] = parts[-1]
+                break
+    
+    return info
 
 
-def generate_csv_report(inventory_list: List[Dict[str, Any]]) -> None:
-    """Output inventory as CSV."""
-    if not inventory_list:
-        logger.warning("No inventory data to report")
+def generate_csv_report(devices_info: List[Dict[str, Any]], output_file: Path) -> None:
+    """Generate CSV inventory report."""
+    if not devices_info:
+        logger.warning("No device information to report")
         return
     
-    fieldnames = [
-        "device", "hostname", "vendor", "model", "os_version",
-        "serial_number", "uptime", "interfaces_count", "error"
+    fieldnames = devices_info[0].keys()
+    
+    try:
+        with open(output_file, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(devices_info)
+        logger.info(f"CSV report written to {output_file}")
+    except IOError as e:
+        logger.error(f"Failed to write CSV report: {e}")
+        raise
+
+
+def generate_json_report(devices_info: List[Dict[str, Any]], output_file: Path) -> None:
+    """Generate JSON inventory report."""
+    try:
+        with open(output_file, 'w') as jsonfile:
+            json.dump(
+                {
+                    'generated': datetime.now().isoformat(),
+                    'device_count': len(devices_info),
+                    'devices': devices_info
+                },
+                jsonfile,
+                indent=2
+            )
+        logger.info(f"JSON report written to {output_file}")
+    except IOError as e:
+        logger.error(f"Failed to write JSON report: {e}")
+        raise
+
+
+def generate_pretty_report(devices_info: List[Dict[str, Any]]) -> str:
+    """Generate human-readable text report."""
+    lines = [
+        "\n" + "="*80,
+        f"Device Inventory Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "="*80,
+        f"\nTotal Devices: {len(devices_info)}\n"
     ]
     
-    writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
-    writer.writeheader()
+    for device in devices_info:
+        lines.extend([
+            f"Hostname: {device.get('hostname', 'N/A')}",
+            f"  Model: {device.get('model', 'N/A')}",
+            f"  Serial: {device.get('serial_number', 'N/A')}",
+            f"  OS Version: {device.get('os_version', 'N/A')}",
+            f"  Uptime (days): {device.get('uptime_days', 'N/A')}",
+            f"  Memory: {device.get('memory_mb', 'N/A')}",
+            "-"*80
+        ])
     
-    for item in inventory_list:
-        row = {
-            "device": item.get("device"),
-            "hostname": item.get("hostname"),
-            "vendor": item.get("vendor"),
-            "model": item.get("model"),
-            "os_version": item.get("os_version"),
-            "serial_number": item.get("serial_number"),
-            "uptime": format_uptime_short(item.get("uptime_seconds", 0))
-            if item.get("uptime_seconds") else "Unknown",
-            "interfaces_count": item.get("interfaces_count", 0),
-            "error": item.get("error", "")
-        }
-        writer.writerow(row)
+    return "\n".join(lines)
 
 
-def generate_table_report(inventory_list: List[Dict[str, Any]]) -> None:
-    """Output inventory as formatted table."""
-    print("\n" + "="*100)
-    print("NETWORK DEVICE INVENTORY REPORT")
-    print("="*100)
-    print(f"{'Device':<15} {'Hostname':<15} {'Vendor':<12} {'Model':<20} "
-          f"{'OS Version':<12} {'Serial':<12} {'Uptime':<12}")
-    print("-"*100)
-    
-    for item in inventory_list:
-        status = "FAIL" if item.get("error") else "OK"
-        uptime = format_uptime_short(item.get("uptime_seconds", 0)) \
-                 if item.get("uptime_seconds") else "Unknown"
-        
-        print(f"{item.get('device', 'N/A'):<15} "
-              f"{(item.get('hostname', 'N/A')[:14]):<15} "
-              f"{(item.get('vendor', 'N/A')[:11]):<12} "
-              f"{(item.get('model', 'N/A')[:19]):<20} "
-              f"{(item.get('os_version', 'N/A')[:11]):<12} "
-              f"{(item.get('serial_number', 'N/A')[:11]):<12} "
-              f"{uptime:<12}")
-        
-        if item.get("error"):
-            print(f"  └─ Error: {item['error']}")
-    
-    print("="*100)
-    print(f"Total Devices: {len(inventory_list)}")
-    successful = sum(1 for item in inventory_list if not item.get("error"))
-    print(f"Successful: {successful} | Failed: {len(inventory_list) - successful}\n")
-
-
-def main():
+def main() -> int:
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Collect network device inventory information"
+        description='Collect system information from network devices'
     )
     parser.add_argument(
-        "--inventory",
-        default="inventory",
-        help="Path to inventory directory (default: inventory)"
+        '--output',
+        default='device_inventory.csv',
+        help='Output file path (default: device_inventory.csv)'
     )
     parser.add_argument(
-        "--format",
-        choices=["table", "json", "csv"],
-        default="table",
-        help="Output format (default: table)"
+        '--format',
+        choices=['csv', 'json', 'pretty'],
+        default='csv',
+        help='Output format (default: csv)'
     )
     parser.add_argument(
-        "--devices",
-        help="Comma-separated list of devices to include"
+        '--devices',
+        help='Filter devices by name pattern (regex)'
     )
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)"
+        '--config',
+        default='config.yaml',
+        help='Nornir config file (default: config.yaml)'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
     )
     
     args = parser.parse_args()
     
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        nr = InitNornir(config_file=args.config)
         
         if args.devices:
-            device_list = [d.strip() for d in args.devices.split(",")]
-            nr = nr.filter(name__in=device_list)
+            nr = nr.filter(name__regex=args.devices)
         
-        if not nr.inventory.hosts:
-            logger.error("No devices found in inventory")
-            return
+        if len(nr.inventory.hosts) == 0:
+            logger.error("No devices found matching filter criteria")
+            return 1
         
-        logger.info(f"Collecting inventory from {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=collect_inventory)
+        logger.info(f"Collecting system info from {len(nr.inventory.hosts)} devices")
         
-        inventory_list = [
-            host_data[0].result
-            for host_data in results.values()
-            if host_data
-        ]
+        results = nr.run(task=gather_system_info)
         
-        if args.format == "json":
-            generate_json_report(inventory_list)
-        elif args.format == "csv":
-            generate_csv_report(inventory_list)
-        else:
-            generate_table_report(inventory_list)
-    
-    except FileNotFoundError as e:
-        logger.error(f"Configuration file not found: {e}")
-        sys.exit(1)
+        devices_info = []
+        for host_name, multi_result in results.items():
+            if not multi_result.failed:
+                parsed = parse_system_info(host_name, multi_result[0].result)
+                devices_info.append(parsed)
+            else:
+                logger.warning(f"Failed to collect info from {host_name}")
+        
+        output_path = Path(args.output)
+        
+        if args.format == 'csv':
+            generate_csv_report(devices_info, output_path)
+        elif args.format == 'json':
+            generate_json_report(devices_info, output_path)
+        elif args.format == 'pretty':
+            report = generate_pretty_report(devices_info)
+            print(report)
+            if args.output != 'device_inventory.csv':
+                with open(output_path, 'w') as f:
+                    f.write(report)
+                logger.info(f"Report written to {output_path}")
+        
+        logger.info(f"Successfully collected info from {len(devices_info)} devices")
+        return 0
+        
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        sys.exit(1)
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
 ```
