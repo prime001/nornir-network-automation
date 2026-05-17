@@ -1,205 +1,184 @@
 ```python
-#!/usr/bin/env python3
-"""
-Device Uptime and System Information Reporter
+"""config_drift.py - Detect configuration drift between running and startup configs.
 
 Purpose:
-    Collects device uptime, system information, and generates reports on
-    device reliability and maintenance history. Useful for identifying
-    unstable devices, tracking reboots, and planning maintenance windows.
+    Connects to network devices via Nornir/Netmiko and compares each device's
+    running-config against its startup-config. Devices with unsaved changes are
+    flagged so engineers can identify what will be lost on the next reboot.
+    Outputs a per-device unified diff and an optional summary report file.
+    Exits non-zero when drift is found, making it usable in scheduled CI checks.
 
 Usage:
-    python device_uptime_report.py --output report.json
-    python device_uptime_report.py --devices router1,router2 --format table
-    python device_uptime_report.py --filter-group access
+    python config_drift.py --hosts router1,router2 --username admin --password secret
+    python config_drift.py --group core --username admin --save-report drift.txt
+    python config_drift.py --group all --username admin --fail-on-drift
 
 Prerequisites:
-    - Nornir installed with netmiko driver
-    - Inventory configured with SSH credentials
-    - Network devices supporting 'show version' command
-    - SSH connectivity to all devices
+    pip install nornir nornir-netmiko nornir-utils netmiko
+    Inventory files: inventory/hosts.yaml, inventory/groups.yaml, inventory/defaults.yaml
 """
 
 import argparse
-import csv
-import json
+import difflib
 import logging
-from datetime import datetime
-from io import StringIO
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.tasks.networking import netmiko_send_command
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging output."""
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s - %(levelname)s - %(message)s",
+def _fetch_config(task: Task, command: str) -> str:
+    result = task.run(
+        task=netmiko_send_command,
+        command_string=command,
+        use_textfsm=False,
+        name=command,
+    )
+    return result.result
+
+
+def check_drift(task: Task) -> Result:
+    running = _fetch_config(task, "show running-config")
+    startup = _fetch_config(task, "show startup-config")
+
+    diff = list(
+        difflib.unified_diff(
+            startup.splitlines(keepends=True),
+            running.splitlines(keepends=True),
+            fromfile=f"{task.host.name}:startup-config",
+            tofile=f"{task.host.name}:running-config",
+            lineterm="",
+        )
+    )
+    return Result(
+        host=task.host,
+        result={"has_drift": bool(diff), "diff": diff},
     )
 
 
-def parse_device_list(device_str: str) -> List[str]:
-    """Parse comma-separated device names."""
-    return [d.strip() for d in device_str.split(",") if d.strip()]
-
-
-def collect_uptime_info(nr, devices: List[str] = None) -> Dict:
-    """Collect uptime information from devices."""
-    results = {}
-    logger = logging.getLogger(__name__)
-    
-    if devices:
-        inventory = nr.filter(F(name__in=devices))
-    else:
-        inventory = nr
-    
-    for host in inventory.inventory.hosts.values():
-        logger.info(f"Collecting uptime from {host.name}")
-        results[host.name] = {"timestamp": datetime.now().isoformat()}
-        
-        try:
-            task = host.run_task(netmiko_send_command, command_string="show version")
-            
-            if task.ok:
-                output = task.result
-                results[host.name]["status"] = "success"
-                
-                for line in output.split("\n"):
-                    if "uptime" in line.lower():
-                        results[host.name]["uptime"] = line.strip()
-                        break
-                else:
-                    results[host.name]["uptime"] = "Unable to parse"
-            else:
-                results[host.name]["status"] = "failed"
-                results[host.name]["error"] = "Command execution failed"
-                
-        except Exception as e:
-            logger.error(f"Error from {host.name}: {e}")
-            results[host.name]["status"] = "error"
-            results[host.name]["error"] = str(e)
-    
-    return results
-
-
-def format_table(results: Dict) -> str:
-    """Format results as ASCII table."""
-    lines = [
-        "\n" + "=" * 90,
-        "Device Uptime Report",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 90,
-        f"{'Device':<25} {'Status':<12} {'Uptime Information':<50}",
-        "-" * 90,
-    ]
-    
-    for device, info in results.items():
-        status = info.get("status", "unknown").upper()
-        uptime = info.get("uptime", info.get("error", "N/A"))[:48]
-        lines.append(f"{device:<25} {status:<12} {uptime:<50}")
-    
-    lines.append("=" * 90)
-    return "\n".join(lines) + "\n"
-
-
-def format_csv(results: Dict) -> str:
-    """Format results as CSV."""
-    output = StringIO()
-    writer = csv.DictWriter(
-        output, fieldnames=["device", "status", "timestamp", "uptime", "error"]
+def build_nornir(args: argparse.Namespace):
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": args.host_file,
+                "group_file": args.group_file,
+                "defaults_file": args.defaults_file,
+            },
+        },
+        logging={"enabled": False},
     )
-    writer.writeheader()
-    
-    for device, info in results.items():
-        writer.writerow({
-            "device": device,
-            "status": info.get("status", "unknown"),
-            "timestamp": info.get("timestamp", ""),
-            "uptime": info.get("uptime", ""),
-            "error": info.get("error", ""),
-        })
-    
-    return output.getvalue()
+
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
+
+    if args.hosts:
+        targets = [h.strip() for h in args.hosts.split(",")]
+        nr = nr.filter(F(name__any=targets))
+    elif args.group:
+        nr = nr.filter(F(groups__contains=args.group))
+
+    return nr
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect device uptime and system information",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Detect unsaved config changes (running vs startup) across network devices."
     )
-    
+    parser.add_argument("--hosts", help="Comma-separated hostnames to target")
+    parser.add_argument("--group", help="Inventory group to target")
+    parser.add_argument("--username", help="SSH username (overrides inventory defaults)")
+    parser.add_argument("--password", help="SSH password (overrides inventory defaults)")
     parser.add_argument(
-        "--devices", help="Comma-separated device names (default: all)"
+        "--workers", type=int, default=10, help="Parallel workers (default: 10)"
     )
+    parser.add_argument("--host-file", default="inventory/hosts.yaml")
+    parser.add_argument("--group-file", default="inventory/groups.yaml")
+    parser.add_argument("--defaults-file", default="inventory/defaults.yaml")
     parser.add_argument(
-        "--filter-group",
-        help="Filter inventory by group name",
-    )
-    parser.add_argument(
-        "--output", help="Output file (default: stdout)"
-    )
-    parser.add_argument(
-        "--format",
-        choices=["json", "table", "csv"],
-        default="table",
-        help="Output format (default: table)",
+        "--save-report", metavar="FILE", help="Write diff report to this file"
     )
     parser.add_argument(
-        "--inventory",
-        default="nornir_inventory",
-        help="Path to nornir inventory directory",
+        "--fail-on-drift",
+        action="store_true",
+        help="Exit with code 1 if any device has unsaved changes (CI mode)",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
-    )
-    
-    args = parser.parse_args()
-    setup_logging(args.log_level)
-    logger = logging.getLogger(__name__)
-    
-    try:
-        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
-        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
-        
-        if args.filter_group:
-            nr = nr.filter(F(groups__contains=args.filter_group))
-            logger.info(f"Filtered to group '{args.filter_group}': {len(nr.inventory.hosts)} devices")
-        
-        devices = parse_device_list(args.devices) if args.devices else None
-        results = collect_uptime_info(nr, devices)
-        
-        if args.format == "json":
-            output = json.dumps(results, indent=2, default=str)
-        elif args.format == "csv":
-            output = format_csv(results)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    nr = build_nornir(args)
+
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched the given filter. Check --hosts / --group.")
+        return 2
+
+    total = len(nr.inventory.hosts)
+    logger.info("Checking config drift on %d device(s)...", total)
+    results = nr.run(task=check_drift, name="config-drift-check")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    report_lines = [f"Config Drift Report — {timestamp}\n", "=" * 60 + "\n"]
+    drifted = []
+    errors = []
+
+    for hostname, multi_result in results.items():
+        if multi_result.failed:
+            exc = multi_result[0].exception
+            logger.error("%s: connection/task failed — %s", hostname, exc)
+            errors.append(hostname)
+            report_lines.append(f"\n[{hostname}] — ERROR: {exc}\n")
+            continue
+
+        data = multi_result[0].result
+        if data["has_drift"]:
+            drifted.append(hostname)
+            diff_text = "\n".join(data["diff"])
+            logger.warning(
+                "%s: DRIFT DETECTED — %d changed lines", hostname, len(data["diff"])
+            )
+            report_lines.append(f"\n[{hostname}] — DRIFT DETECTED\n")
+            report_lines.append(diff_text + "\n")
         else:
-            output = format_table(results)
-        
-        if args.output:
-            Path(args.output).write_text(output)
-            logger.info(f"Report written to {args.output}")
-        else:
-            print(output)
-        
-        successful = sum(1 for r in results.values() if r.get("status") == "success")
-        logger.info(f"Successfully collected from {successful}/{len(results)} devices")
-        
-    except FileNotFoundError as e:
-        logger.error(f"Inventory not found: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
+            logger.info("%s: clean — running matches startup", hostname)
+            report_lines.append(f"\n[{hostname}] — CLEAN\n")
+
+    report_lines.append("\n" + "=" * 60 + "\n")
+    report_lines.append(
+        f"Summary: {len(drifted)} drifted / {len(errors)} errors / {total} total\n"
+    )
+    if drifted:
+        report_lines.append("Drifted devices: " + ", ".join(drifted) + "\n")
+    if errors:
+        report_lines.append("Errored devices: " + ", ".join(errors) + "\n")
+
+    report_text = "".join(report_lines)
+    print(report_text)
+
+    if args.save_report:
+        Path(args.save_report).write_text(report_text)
+        logger.info("Report saved to %s", args.save_report)
+
+    if args.fail_on_drift and drifted:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
