@@ -1,222 +1,300 @@
-The nornir repo content is in the user's prompt — I have what I need. Writing the script now, targeting BGP prefix-limit utilization monitoring as a non-duplicate angle.
+Now I have a clear picture. `bgp_summary.py` is a NAPALM tabular display; `bgp_summary_v2.py` is actually DNS/NTP. The gap is a **prefix-limit utilization monitor** — checks received prefixes against configured max-prefix thresholds and alerts before sessions drop. That's operationally critical and distinct from what's there.
 
+```python
 """
-BGP Prefix Limit Monitor
+BGP Prefix-Limit Utilization Monitor
 
-Queries routers for per-neighbor BGP prefix counts and configured maximum-prefix
-limits, then reports utilization percentages and flags sessions approaching or
-exceeding a configurable warning threshold.
-
-Unlike bgp_summary.py (session health) and bgp_summary_v2.py (per-VRF reporting),
-this script answers the capacity-planning question: how close is each BGP session
-to its configured prefix ceiling?
-
-Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
+Purpose:
+    Collect BGP neighbor state and compare received-prefix counts against
+    configured max-prefix limits on each session.  Sessions approaching or
+    exceeding their limit will drop silently on many platforms, causing
+    hard-to-diagnose outages.  This script surfaces utilization as a
+    percentage and groups neighbors into CRITICAL / WARNING / OK tiers so
+    NOC engineers can act before the limit is hit.
 
 Usage:
-    Single host:
-        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret
+    python bgp_prefix_limits.py --hosts inventory/hosts.yaml \
+        --groups inventory/groups.yaml --defaults inventory/defaults.yaml
+    python bgp_prefix_limits.py --filter role=edge --warn 75 --crit 90
+    python bgp_prefix_limits.py --filter site=nyc --json
 
-    Multiple hosts via YAML inventory:
-        python bgp_prefix_monitor.py --inventory hosts.yaml -u admin -p secret
+Prerequisites:
+    pip install nornir nornir-netmiko netmiko
 
-    Custom warning threshold (default 75 %):
-        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret \
-            --threshold 80
+    Inventory defaults.yaml must contain username, password, and platform
+    (cisco_ios, cisco_xe, cisco_xr, cisco_nxos, or junos).
 
-    Write report to file:
-        python bgp_prefix_monitor.py --host 192.0.2.1 -u admin -p secret \
-            --output report.txt
+    Cisco: "show bgp neighbors" is parsed for MaxPfxWarn / Max prefix.
+    Junos: "show bgp neighbor" is parsed for prefix-limit fields.
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, TextIO
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
 
 from nornir import InitNornir
-from nornir.core.inventory import ConnectionOptions, Defaults, Groups, Host, Hosts
+from nornir.core.filter import F
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("bgp_prefix_monitor")
-
-_SUMMARY_RE = re.compile(
-    r"^(?P<peer>\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+"
-    r"\S+\s+(?P<state_or_pfx>\S+)",
-    re.MULTILINE,
-)
-_MAX_PREFIX_RE = re.compile(
-    r"Maximum prefixes allowed\s+(?P<limit>\d+)"
-    r"(?:\s+\((?P<warn_pct>\d+)%\))?"
-)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NeighborLimit:
+class PeerLimitData:
+    host: str
     peer: str
-    received: int
-    prefix_limit: Optional[int] = None
-    device_warn_pct: int = 75
-
-    @property
-    def utilization(self) -> Optional[float]:
-        if self.prefix_limit and self.prefix_limit > 0:
-            return (self.received / self.prefix_limit) * 100.0
-        return None
-
-    @property
-    def status(self) -> str:
-        util = self.utilization
-        if util is None:
-            return "NO_LIMIT"
-        if util >= 100.0:
-            return "CRITICAL"
-        if util >= self.device_warn_pct:
-            return "WARNING"
-        return "OK"
+    vrf: str = "default"
+    remote_as: int = 0
+    state: str = "unknown"
+    received_prefixes: int = 0
+    max_prefix_limit: Optional[int] = None
+    utilization_pct: Optional[float] = None
+    severity: str = "UNKNOWN"
+    raw_error: str = ""
 
 
-def collect_bgp_prefix_data(task: Task) -> Result:
-    summary_out = task.run(
-        task=netmiko_send_command,
-        command_string="show ip bgp summary",
-        name="bgp_summary",
-    ).result
+def _parse_cisco_neighbors(output: str, hostname: str) -> list[PeerLimitData]:
+    peers: list[PeerLimitData] = []
+    current: dict = {}
 
-    established: List[NeighborLimit] = []
-    for m in _SUMMARY_RE.finditer(summary_out):
-        peer = m.group("peer")
-        state_or_pfx = m.group("state_or_pfx")
-        if not state_or_pfx.isdigit():
-            logger.debug("%s: peer %s not established (%s), skipping", task.host, peer, state_or_pfx)
-            continue
-        established.append(NeighborLimit(peer=peer, received=int(state_or_pfx)))
-
-    for nbr in established:
-        detail_out = task.run(
-            task=netmiko_send_command,
-            command_string=f"show ip bgp neighbors {nbr.peer}",
-            name=f"bgp_neighbor_{nbr.peer}",
-        ).result
-
-        m = _MAX_PREFIX_RE.search(detail_out)
+    for line in output.splitlines():
+        m = re.match(r"^BGP neighbor is (\S+),\s+remote AS (\d+)", line)
         if m:
-            nbr.prefix_limit = int(m.group("limit"))
-            if m.group("warn_pct"):
-                nbr.device_warn_pct = int(m.group("warn_pct"))
+            if current:
+                peers.append(_build_cisco_peer(current, hostname))
+            current = {"peer": m.group(1), "remote_as": int(m.group(2)),
+                       "state": "unknown", "rcv": 0, "max": None, "vrf": "default"}
+            continue
 
-    return Result(host=task.host, result=established)
+        if not current:
+            continue
 
+        m = re.search(r"BGP state = (\w+)", line)
+        if m:
+            current["state"] = m.group(1)
 
-def print_report(
-    device_results: Dict[str, List[NeighborLimit]],
-    threshold: int,
-    fh: TextIO,
-) -> int:
-    col = "{:<20} {:<18} {:>10} {:>12} {:>9}  {}"
-    header = col.format("Device", "Peer", "Received", "MaxPrefix", "Util%", "Status")
-    separator = "-" * len(header)
-    fh.write(f"\n{header}\n{separator}\n")
+        m = re.search(r"Prefixes Current:\s+(\d+)", line, re.IGNORECASE)
+        if m:
+            current["rcv"] = int(m.group(1))
 
-    flagged = 0
-    for device, neighbors in sorted(device_results.items()):
-        for nbr in sorted(neighbors, key=lambda n: n.peer):
-            util_str = f"{nbr.utilization:.1f}" if nbr.utilization is not None else "n/a"
-            limit_str = str(nbr.prefix_limit) if nbr.prefix_limit else "none"
-            status = nbr.status
-            if nbr.utilization is not None and nbr.utilization >= threshold:
-                flagged += 1
-            fh.write(
-                col.format(device, nbr.peer, nbr.received, limit_str, util_str, status)
-                + "\n"
-            )
+        m = re.search(r"Maximum prefixes:\s+(\d+)", line, re.IGNORECASE)
+        if m:
+            current["max"] = int(m.group(1))
 
-    fh.write(f"\n{flagged} neighbor(s) at or above {threshold}% utilization.\n")
-    return flagged
+        m = re.search(r"for address family:\s+\S+\s+in VRF\s+(\S+)", line)
+        if m:
+            current["vrf"] = m.group(1)
+
+    if current:
+        peers.append(_build_cisco_peer(current, hostname))
+
+    return peers
 
 
-def build_nornir_from_host(host: str, username: str, password: str, platform: str):
-    conn_opts = ConnectionOptions(extras={"device_type": platform})
-    hosts = Hosts(
-        {
-            host: Host(
-                name=host,
-                hostname=host,
-                username=username,
-                password=password,
-                connection_options={"netmiko": conn_opts},
-            )
-        }
+def _build_cisco_peer(c: dict, hostname: str) -> PeerLimitData:
+    return PeerLimitData(
+        host=hostname,
+        peer=c["peer"],
+        vrf=c.get("vrf", "default"),
+        remote_as=c.get("remote_as", 0),
+        state=c.get("state", "unknown"),
+        received_prefixes=c.get("rcv", 0),
+        max_prefix_limit=c.get("max"),
     )
-    return InitNornir(
-        inventory={"plugin": "SimpleInventory"},
-        runner={"plugin": "threaded", "options": {"num_workers": 10}},
-        logging={"enabled": False},
-        core={"raise_on_error": False},
-        _hosts=hosts,
-        _groups=Groups(),
-        _defaults=Defaults(),
+
+
+def _parse_junos_neighbors(output: str, hostname: str) -> list[PeerLimitData]:
+    peers: list[PeerLimitData] = []
+    current: dict = {}
+
+    for line in output.splitlines():
+        m = re.match(r"^Peer:\s+(\S+)\s+AS\s+(\d+)", line)
+        if m:
+            if current:
+                peers.append(_build_junos_peer(current, hostname))
+            current = {"peer": m.group(1), "remote_as": int(m.group(2)),
+                       "state": "unknown", "rcv": 0, "max": None, "vrf": "master"}
+
+        if not current:
+            continue
+
+        m = re.search(r"Type:\s+\S+\s+State:\s+(\w+)", line)
+        if m:
+            current["state"] = m.group(1)
+
+        m = re.search(r"Received\s+prefixes\s+(\d+)", line)
+        if m:
+            current["rcv"] = int(m.group(1))
+
+        m = re.search(r"Prefix limit:\s+(\d+)", line)
+        if m:
+            current["max"] = int(m.group(1))
+
+    if current:
+        peers.append(_build_junos_peer(current, hostname))
+
+    return peers
+
+
+def _build_junos_peer(c: dict, hostname: str) -> PeerLimitData:
+    return PeerLimitData(
+        host=hostname,
+        peer=c["peer"],
+        vrf=c.get("vrf", "master"),
+        remote_as=c.get("remote_as", 0),
+        state=c.get("state", "unknown"),
+        received_prefixes=c.get("rcv", 0),
+        max_prefix_limit=c.get("max"),
     )
+
+
+def collect_prefix_limits(task: Task) -> Result:
+    platform = task.host.get("platform", "")
+    hostname = task.host.name
+
+    if "junos" in platform:
+        cmd = "show bgp neighbor"
+    else:
+        cmd = "show bgp all neighbors"
+
+    result = task.run(task=netmiko_send_command, command_string=cmd)
+    output = result[0].result
+
+    if "junos" in platform:
+        peers = _parse_junos_neighbors(output, hostname)
+    else:
+        peers = _parse_cisco_neighbors(output, hostname)
+
+    return Result(host=task.host, result=peers)
+
+
+def classify(peers: list[PeerLimitData], warn_pct: float, crit_pct: float) -> list[PeerLimitData]:
+    for p in peers:
+        if p.max_prefix_limit and p.max_prefix_limit > 0:
+            p.utilization_pct = round(p.received_prefixes / p.max_prefix_limit * 100, 1)
+            if p.utilization_pct >= crit_pct:
+                p.severity = "CRITICAL"
+            elif p.utilization_pct >= warn_pct:
+                p.severity = "WARNING"
+            else:
+                p.severity = "OK"
+        else:
+            p.severity = "NO-LIMIT"
+    return peers
+
+
+def render_table(peers: list[PeerLimitData]) -> None:
+    order = {"CRITICAL": 0, "WARNING": 1, "NO-LIMIT": 2, "OK": 3, "UNKNOWN": 4}
+    sorted_peers = sorted(peers, key=lambda p: (order.get(p.severity, 9), p.host, p.peer))
+
+    header = f"{'HOST':<18} {'PEER':<18} {'AS':>7} {'STATE':<12} {'RCV':>8} {'LIMIT':>8} {'UTIL%':>7}  SEVERITY"
+    sep = "-" * len(header)
+    print(f"\n{sep}\nBGP PREFIX-LIMIT UTILIZATION REPORT\n{sep}")
+    print(header)
+    print(sep)
+
+    for p in sorted_peers:
+        util = f"{p.utilization_pct:>6.1f}%" if p.utilization_pct is not None else "   n/a "
+        limit = str(p.max_prefix_limit) if p.max_prefix_limit else "none"
+        tag = {"CRITICAL": "[CRIT]", "WARNING": "[WARN]", "OK": "[ OK ]"}.get(p.severity, f"[{p.severity[:4]:4}]")
+        print(f"{p.host:<18} {p.peer:<18} {p.remote_as:>7} {p.state:<12} "
+              f"{p.received_prefixes:>8} {limit:>8} {util}  {tag}")
+
+    counts = {k: sum(1 for p in peers if p.severity == k) for k in ("CRITICAL", "WARNING", "OK", "NO-LIMIT")}
+    print(sep)
+    print(f"Total: {len(peers)} peers  |  CRITICAL: {counts['CRITICAL']}  "
+          f"WARNING: {counts['WARNING']}  OK: {counts['OK']}  NO-LIMIT: {counts['NO-LIMIT']}")
+    print(sep + "\n")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BGP prefix-limit utilization monitor")
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--host", help="Single device hostname or IP")
-    src.add_argument("--inventory", help="Path to Nornir SimpleInventory hosts.yaml")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform type")
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=75,
-        help="Utilization %% at which to flag a neighbor (default: 75)",
+    parser = argparse.ArgumentParser(
+        description="BGP prefix-limit utilization monitor — Nornir + Netmiko"
     )
-    parser.add_argument("--output", help="Write report to this file path")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--hosts", default="inventory/hosts.yaml", metavar="FILE")
+    parser.add_argument("--groups", default="inventory/groups.yaml", metavar="FILE")
+    parser.add_argument("--defaults", default="inventory/defaults.yaml", metavar="FILE")
+    parser.add_argument("--filter", metavar="KEY=VAL[,KEY=VAL]",
+                        help="Nornir host filter (e.g. role=edge,site=nyc)")
+    parser.add_argument("--warn", type=float, default=75.0, metavar="PCT",
+                        help="Warning threshold %% (default: 75)")
+    parser.add_argument("--crit", type=float, default=90.0, metavar="PCT",
+                        help="Critical threshold %% (default: 90)")
+    parser.add_argument("--workers", type=int, default=10, metavar="N")
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of table")
+    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger("bgp_prefix_monitor").setLevel(logging.DEBUG)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
 
-    if args.host:
-        nr = build_nornir_from_host(args.host, args.username, args.password, args.platform)
+    for f in (args.hosts, args.groups, args.defaults):
+        if not Path(f).exists():
+            print(f"ERROR: inventory file not found: {f}", file=sys.stderr)
+            return 2
+
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": args.hosts,
+                "group_file": args.groups,
+                "defaults_file": args.defaults,
+            },
+        },
+        logging={"enabled": False},
+    )
+
+    if args.filter:
+        f_kwargs = {}
+        for token in args.filter.split(","):
+            k, _, v = token.partition("=")
+            if k.strip() and v.strip():
+                f_kwargs[k.strip()] = v.strip()
+        nr = nr.filter(F(**f_kwargs))
+
+    if not nr.inventory.hosts:
+        print("No hosts matched — check inventory and --filter.", file=sys.stderr)
+        return 2
+
+    results = nr.run(task=collect_prefix_limits)
+
+    all_peers: list[PeerLimitData] = []
+    failed: list[tuple[str, str]] = []
+
+    for host, multi in results.items():
+        if multi.failed:
+            failed.append((host, str(multi.exception)))
+            logger.error("Failed on %s: %s", host, multi.exception)
+        else:
+            all_peers.extend(multi[0].result)
+
+    classify(all_peers, args.warn, args.crit)
+
+    if args.json:
+        print(json.dumps([asdict(p) for p in all_peers], indent=2))
     else:
-        nr = InitNornir(
-            config_file=args.inventory,
-            runner={"plugin": "threaded", "options": {"num_workers": 10}},
-            logging={"enabled": False},
-        )
-        nr.inventory.defaults.username = args.username
-        nr.inventory.defaults.password = args.password
+        if all_peers:
+            render_table(all_peers)
+        else:
+            print("No BGP prefix-limit data returned.", file=sys.stderr)
 
-    results = nr.run(task=collect_bgp_prefix_data, name="bgp_prefix_monitor")
+    for host, err in failed:
+        print(f"ERROR  {host}: {err}", file=sys.stderr)
 
-    device_data: Dict[str, List[NeighborLimit]] = {}
-    for host_name, multi_result in results.items():
-        if multi_result.failed:
-            logger.error("Failed to collect data from %s: %s", host_name, multi_result[0].exception)
-            continue
-        device_data[host_name] = multi_result[0].result
-
-    fh = open(args.output, "w") if args.output else sys.stdout
-    try:
-        flagged = print_report(device_data, args.threshold, fh)
-    finally:
-        if args.output:
-            fh.close()
-
-    return 1 if flagged else 0
+    has_critical = any(p.severity == "CRITICAL" for p in all_peers)
+    return 2 if failed else (1 if has_critical else 0)
 
 
 if __name__ == "__main__":
     sys.exit(main())
+```
