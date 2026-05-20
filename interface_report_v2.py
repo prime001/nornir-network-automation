@@ -1,213 +1,235 @@
-The existing `interface_report.py` covers status/IP/protocol, and `interface_report_v2.py` is actually a route validator. I'll write an interface **error counter** script — collects CRC/drop/reset counters, flags interfaces exceeding thresholds.
+Now I have enough context. Writing the script:
 
-```python
+```
 """
-Interface Error Counter Report
+interface_error_report.py - Interface Error Counter Report using Nornir
 
-Collects per-interface error counters (input errors, CRC, drops, resets,
-runts, giants) from network devices via Nornir and flags interfaces that
-exceed configurable thresholds. Useful for identifying physical-layer
-problems and congestion points before they cause outages.
+Purpose:
+    Queries network devices for per-interface error counters (CRC errors,
+    input/output errors, drops, runts, giants) and flags interfaces that
+    exceed a configurable threshold. Useful for proactively identifying
+    degraded links before they cause outages, or for post-incident triage.
 
 Usage:
-    python interface_errors.py --config config.yaml
-    python interface_errors.py --devices core-1,core-2 --threshold 100
-    python interface_errors.py --format json --min-errors 1 > errors.json
+    python interface_error_report.py --inventory hosts.yaml \
+        --groups-file groups.yaml --defaults-file defaults.yaml
+    python interface_error_report.py --inventory hosts.yaml --group core \
+        --threshold 10 --output errors.csv --workers 20
 
 Prerequisites:
-    - Nornir inventory configured (config.yaml, hosts.yaml, groups.yaml)
-    - Device credentials available via inventory or environment variables
-    - nornir-netmiko installed: pip install nornir-netmiko
-    - Supported platforms: Cisco IOS/IOS-XE, NX-OS, Arista EOS
+    pip install nornir nornir-netmiko nornir-utils netmiko
+    A valid Nornir SimpleInventory (hosts.yaml, groups.yaml, defaults.yaml)
+    SSH access with privilege level sufficient to run 'show interfaces'
+    Tested against Cisco IOS/IOS-XE. Adjust parse_show_interfaces() for
+    other vendors (NX-OS, EOS, JunOS) as needed.
 """
 
 import argparse
-import json
+import csv
 import logging
 import re
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from nornir import InitNornir
 from nornir.core.filter import F
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
+
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("interface_error_report")
 
-_COUNTER_PATTERNS = [
-    ("input_errors", r"(\d+) input errors"),
-    ("crc", r"(\d+) CRC"),
-    ("frame", r"(\d+) frame"),
-    ("output_errors", r"(\d+) output errors"),
-    ("drops_input", r"(\d+) input drops"),
-    ("drops_output", r"(\d+) output drops"),
-    ("resets", r"(\d+) resets"),
-    ("runts", r"(\d+) runts"),
-    ("giants", r"(\d+) giants"),
-    ("collisions", r"(\d+) collisions"),
-]
+ERROR_FIELDS = ("input_errors", "output_errors", "crc", "drops", "runts", "giants")
 
 
-def _parse_counters(block: str) -> Dict[str, int]:
-    counters: Dict[str, int] = {}
-    for key, pattern in _COUNTER_PATTERNS:
-        m = re.search(pattern, block, re.IGNORECASE)
-        counters[key] = int(m.group(1)) if m else 0
-    return counters
+def parse_show_interfaces(output: str) -> List[Dict]:
+    interfaces = []
+    current: Dict = {}
 
-
-def collect_errors(task: Task, interface_filter: Optional[str]) -> Result:
-    """Run 'show interfaces' and parse error counters per interface."""
-    platform = (task.host.platform or "ios").lower()
-
-    if "nxos" in platform:
-        cmd = "show interface"
-    elif "eos" in platform or "arista" in platform:
-        cmd = "show interfaces"
-    else:
-        cmd = "show interfaces"
-
-    result = task.run(task=netmiko_send_command, command_string=cmd)
-    raw = result.result
-
-    # Split on interface headers — lines starting with a word char + slash or space
-    blocks = re.split(r"(?=^\S)", raw, flags=re.MULTILINE)
-
-    interfaces: List[Dict] = []
-    for block in blocks:
-        header = block.split("\n")[0].strip()
-        if not header or header.startswith(" "):
+    for line in output.splitlines():
+        iface_match = re.match(r"^(\S+)\s+is\s+(up|down|administratively down)", line)
+        if iface_match:
+            if current:
+                interfaces.append(current)
+            current = {
+                "name": iface_match.group(1),
+                "status": iface_match.group(2),
+                "input_errors": 0,
+                "output_errors": 0,
+                "crc": 0,
+                "drops": 0,
+                "runts": 0,
+                "giants": 0,
+            }
             continue
 
-        intf_name = header.split()[0]
-
-        if interface_filter and not re.search(interface_filter, intf_name, re.IGNORECASE):
+        if not current:
             continue
 
-        counters = _parse_counters(block)
-        total_errors = (
-            counters["input_errors"]
-            + counters["output_errors"]
-            + counters["crc"]
-            + counters["drops_input"]
-            + counters["drops_output"]
-        )
+        m = re.search(r"(\d+)\s+input errors.*?(\d+)\s+CRC", line)
+        if m:
+            current["input_errors"] = int(m.group(1))
+            current["crc"] = int(m.group(2))
+            continue
 
-        interfaces.append({
-            "interface": intf_name,
-            "total_errors": total_errors,
-            **counters,
-        })
+        m = re.search(r"(\d+)\s+output errors", line)
+        if m:
+            current["output_errors"] = int(m.group(1))
 
-    interfaces.sort(key=lambda x: x["total_errors"], reverse=True)
-    return Result(host=task.host, result=interfaces)
+        m = re.search(r"(\d+)\s+runts.*?(\d+)\s+giants", line)
+        if m:
+            current["runts"] = int(m.group(1))
+            current["giants"] = int(m.group(2))
+
+        m = re.search(r"(\d+)\s+(?:input\s+)?drops", line)
+        if m:
+            current["drops"] = int(m.group(1))
+
+    if current:
+        interfaces.append(current)
+
+    return interfaces
 
 
-def _print_table(report: Dict[str, List[Dict]], threshold: int, min_errors: int) -> None:
-    header = (
-        f"{'Device':<16} {'Interface':<22} {'InErr':>7} {'CRC':>7} "
-        f"{'OutErr':>7} {'Drops':>7} {'Resets':>6} {'Total':>7}"
+def collect_errors(task: Task, threshold: int) -> Result:
+    cmd_result = task.run(
+        task=netmiko_send_command,
+        command_string="show interfaces",
+        use_textfsm=False,
     )
-    print(header)
-    print("-" * len(header))
+    interfaces = parse_show_interfaces(cmd_result.result)
+    flagged = [
+        iface for iface in interfaces
+        if any(iface.get(f, 0) >= threshold for f in ERROR_FIELDS)
+    ]
+    return Result(host=task.host, result=flagged)
 
-    for device, interfaces in sorted(report.items()):
-        if isinstance(interfaces, str):
-            print(f"{device:<16}  ERROR: {interfaces}")
+
+def build_rows(nr_results, threshold: int) -> List[Dict]:
+    rows = []
+    for host, multi in nr_results.items():
+        if multi.failed:
+            logger.warning("%-20s  FAILED: %s", host, multi[0].exception)
             continue
-        for intf in interfaces:
-            if intf["total_errors"] < min_errors:
-                continue
-            flag = " !" if intf["total_errors"] >= threshold else "  "
-            drops = intf["drops_input"] + intf["drops_output"]
-            print(
-                f"{device:<16} {intf['interface']:<22} "
-                f"{intf['input_errors']:>7} {intf['crc']:>7} "
-                f"{intf['output_errors']:>7} {drops:>7} "
-                f"{intf['resets']:>6} {intf['total_errors']:>7}{flag}"
-            )
+        for iface in multi[0].result:
+            rows.append({
+                "host": host,
+                "interface": iface["name"],
+                "status": iface["status"],
+                "input_errors": iface["input_errors"],
+                "output_errors": iface["output_errors"],
+                "crc": iface["crc"],
+                "drops": iface["drops"],
+                "runts": iface["runts"],
+                "giants": iface["giants"],
+            })
+    return rows
+
+
+def print_table(rows: List[Dict], threshold: int) -> None:
+    if not rows:
+        print(f"\nAll interfaces clean (threshold={threshold}). No errors found.")
+        return
+
+    hdr = f"{'HOST':<20} {'INTERFACE':<26} {'STATUS':<10} {'INERR':>6} {'OUTERR':>6} {'CRC':>6} {'DROPS':>6} {'RUNTS':>6} {'GIANTS':>7}"
+    print(f"\n{hdr}")
+    print("-" * len(hdr))
+    for r in rows:
+        print(
+            f"{r['host']:<20} {r['interface']:<26} {r['status']:<10} "
+            f"{r['input_errors']:>6} {r['output_errors']:>6} {r['crc']:>6} "
+            f"{r['drops']:>6} {r['runts']:>6} {r['giants']:>7}"
+        )
+    print(f"\n{len(rows)} interface(s) flagged.")
+
+
+def write_csv(rows: List[Dict], path: str) -> None:
+    fields = ["host", "interface", "status", "input_errors", "output_errors",
+              "crc", "drops", "runts", "giants"]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("CSV written to %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Report interface error counters across a Nornir inventory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--inventory", default="hosts.yaml",
+                   help="Nornir hosts file (default: hosts.yaml)")
+    p.add_argument("--groups-file", default="groups.yaml",
+                   help="Nornir groups file (default: groups.yaml)")
+    p.add_argument("--defaults-file", default="defaults.yaml",
+                   help="Nornir defaults file (default: defaults.yaml)")
+    p.add_argument("--group",
+                   help="Limit run to hosts in this Nornir group")
+    p.add_argument("--threshold", type=int, default=1,
+                   help="Minimum counter value to flag (default: 1)")
+    p.add_argument("--output", metavar="FILE",
+                   help="Write flagged interfaces to a CSV file")
+    p.add_argument("--workers", type=int, default=10,
+                   help="Concurrent Nornir threads (default: 10)")
+    p.add_argument("--verbose", action="store_true",
+                   help="Enable DEBUG logging")
+    return p.parse_args()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Report interface error counters and flag problematic interfaces"
-    )
-    parser.add_argument("--config", default="config.yaml", help="Nornir config file")
-    parser.add_argument(
-        "--devices", help="Comma-separated device names (default: all)"
-    )
-    parser.add_argument(
-        "--interface-filter",
-        metavar="REGEX",
-        help="Regex to restrict which interfaces are reported (e.g. 'GigabitEthernet')",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=1000,
-        help="Total error count that marks an interface as flagged (default: 1000)",
-    )
-    parser.add_argument(
-        "--min-errors",
-        type=int,
-        default=0,
-        help="Hide interfaces with fewer total errors than this (default: 0)",
-    )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)",
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
+    args = parse_args()
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
-        nr = InitNornir(config_file=args.config)
+        nr = InitNornir(
+            runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+            inventory={
+                "plugin": "SimpleInventory",
+                "options": {
+                    "host_file": args.inventory,
+                    "group_file": args.groups_file,
+                    "defaults_file": args.defaults_file,
+                },
+            },
+        )
     except Exception as exc:
-        logger.error("Failed to initialize Nornir: %s", exc)
+        logger.error("Nornir init failed: %s", exc)
         return 1
 
-    if args.devices:
-        names = [d.strip() for d in args.devices.split(",")]
-        nr = nr.filter(F(name__in=names))
+    if args.group:
+        nr = nr.filter(F(groups__contains=args.group))
+        if not nr.inventory.hosts:
+            logger.error("No hosts matched group '%s'", args.group)
+            return 1
 
-    if not nr.inventory.hosts:
-        logger.error("No hosts matched — check --devices or inventory.")
-        return 1
-
-    logger.debug("Targeting %d host(s)", len(nr.inventory.hosts))
-
-    results = nr.run(
-        task=collect_errors,
-        interface_filter=args.interface_filter,
+    logger.info(
+        "Querying %d host(s) for interface errors (threshold=%d)",
+        len(nr.inventory.hosts),
+        args.threshold,
     )
+    results = nr.run(task=collect_errors, threshold=args.threshold)
 
-    report: Dict[str, List[Dict]] = {}
-    for hostname, multi in results.items():
-        top = multi[0]
-        if top.failed:
-            report[hostname] = str(top.exception or top.result)
-        else:
-            report[hostname] = top.result
+    rows = build_rows(results, args.threshold)
+    print_table(rows, args.threshold)
 
-    if args.format == "json":
-        print(json.dumps(report, indent=2))
-    else:
-        _print_table(report, args.threshold, args.min_errors)
-        if any(
-            isinstance(v, list) and any(i["total_errors"] >= args.threshold for i in v)
-            for v in report.values()
-        ):
-            print("\n  ! = exceeds threshold of", args.threshold, "total errors")
+    if args.output:
+        try:
+            write_csv(rows, args.output)
+        except OSError as exc:
+            logger.error("CSV write failed: %s", exc)
+            return 1
+
+    failed = [h for h, r in results.items() if r.failed]
+    if failed:
+        logger.warning("Unreachable hosts: %s", ", ".join(str(h) for h in failed))
+        return 2
 
     return 0
 
