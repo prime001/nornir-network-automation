@@ -1,199 +1,192 @@
 ```python
+#!/usr/bin/env python3
 """
-Device Uptime and System Health Reporter
+ARP Table Analyzer - Detect ARP inconsistencies across network devices.
 
-Gathers device uptime and key system metrics from network devices, identifies
-recently rebooted or high-uptime devices, and generates a comprehensive health
-report for capacity planning and maintenance scheduling.
-
-Prerequisites:
-  - Nornir inventory configured with device credentials (config.yaml)
-  - Devices must support 'show version' (IOS, IOS-XE, NX-OS) or equivalent
-  - Netmiko connector with valid SSH/telnet credentials
-  - Devices accessible from execution host
+Collects ARP tables from devices and identifies:
+- Duplicate IP addresses (same IP, different MACs)
+- Broadcast/invalid MAC addresses
+- Device-wide ARP statistics
 
 Usage:
-  python device_uptime_reporter.py
-  python device_uptime_reporter.py --group core --format json
-  python device_uptime_reporter.py --threshold 30 --sort uptime
-  python device_uptime_reporter.py --log-level DEBUG
+    python arp_analyzer.py -i inventory.yaml -u admin -p password
+    python arp_analyzer.py -i inventory.yaml -u admin -p password --filter site1
+    python arp_analyzer.py -i inventory.yaml -u admin -p password --output json
+
+Prerequisites:
+    - nornir and napalm installed
+    - Network devices accessible via SSH
+    - NAPALM-compatible OS (Cisco IOS, Arista EOS, etc.)
 """
 
-import logging
 import argparse
 import json
-from datetime import datetime
-from typing import Dict, List, Any, Optional
+import logging
+from collections import defaultdict
+
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Task, Result
-from nornir_netmiko.tasks import netmiko_send_command
-from nornir_utils.plugins.functions import print_result
+from nornir.plugins.tasks.napalm_plugins import napalm_get
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
-def parse_uptime_string(uptime_text: str) -> Optional[float]:
-    """
-    Extract uptime days from device output.
-    Handles Cisco IOS/NX-OS format: "X days, Y hours, Z minutes"
-    """
-    try:
-        import re
-        match = re.search(r'(\d+)\s+day', uptime_text)
-        if match:
-            days = int(match.group(1))
-            hours_match = re.search(r'(\d+)\s+hour', uptime_text)
-            hours = int(hours_match.group(1)) if hours_match else 0
-            return days + (hours / 24)
-        return None
-    except (ValueError, AttributeError) as e:
-        logger.warning(f"Failed to parse uptime: {e}")
-        return None
+def get_arp_tables(nr, device_filter=None):
+    """Retrieve ARP tables from devices using NAPALM."""
+    if device_filter:
+        nr = nr.filter(F(groups__contains=device_filter))
+
+    logger.info(f"Collecting ARP from {len(nr.inventory.hosts)} devices")
+    results = nr.run(task=napalm_get, getters=["arp_table"])
+    arp_tables = {}
+
+    for device_name, task_result in results.items():
+        if not task_result[0].failed:
+            arp_tables[device_name] = task_result[0].result.get("arp_table", {})
+        else:
+            logger.warning(f"Failed to get ARP from {device_name}")
+
+    logger.info(f"Successfully collected ARP from {len(arp_tables)} devices")
+    return arp_tables
 
 
-def gather_device_uptime(task: Task) -> Result:
-    """
-    Execute 'show version' on device and extract uptime information.
-    Returns structured dict with device health metrics.
-    """
-    try:
-        result = task.run(
-            netmiko_send_command,
-            command_string="show version",
-            use_textfsm=False
-        )
-        output = result[0].result
-        uptime_days = parse_uptime_string(output)
+def analyze_arp_tables(arp_tables):
+    """Analyze ARP tables for inconsistencies and anomalies."""
+    duplicates = defaultdict(list)
+    broadcast_macs = []
+    summary = {}
+    ip_map = defaultdict(list)
 
-        health_status = "healthy"
-        if uptime_days is not None:
-            if uptime_days < 7:
-                health_status = "recently_rebooted"
-            elif uptime_days > 1825:  # ~5 years
-                health_status = "long_uptime"
+    for device_name, arp_data in arp_tables.items():
+        entry_count = 0
 
-        return Result(
-            host=task.host,
-            result={
-                "device": task.host.name,
-                "platform": task.host.platform,
-                "uptime_days": uptime_days,
-                "status": "reachable",
-                "health": health_status,
-                "timestamp": datetime.now().isoformat()
-            }
-        )
-    except Exception as e:
-        logger.error(f"Device {task.host.name} failed: {str(e)}")
-        return Result(
-            host=task.host,
-            result={
-                "device": task.host.name,
-                "platform": task.host.platform,
-                "uptime_days": None,
-                "status": "unreachable",
-                "health": "unknown",
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            },
-            failed=True
-        )
+        for vlan_name, arp_entries in arp_data.items():
+            for entry in arp_entries:
+                ip = entry.get("ip")
+                mac = entry.get("mac")
+
+                if not ip or not mac:
+                    continue
+
+                entry_count += 1
+                ip_map[ip].append({
+                    "device": device_name,
+                    "mac": mac,
+                    "vlan": vlan_name,
+                })
+
+                if mac.upper() in ["FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00"]:
+                    broadcast_macs.append({
+                        "device": device_name,
+                        "ip": ip,
+                        "mac": mac,
+                    })
+
+        summary[device_name] = entry_count
+
+    for ip, entries in ip_map.items():
+        unique_macs = set(e["mac"] for e in entries)
+        if len(unique_macs) > 1:
+            duplicates[ip] = entries
+
+    logger.info(f"Found {len(duplicates)} IPs with multiple MACs")
+    return {
+        "duplicates": dict(duplicates),
+        "broadcast_macs": broadcast_macs,
+        "summary": summary,
+    }
 
 
-def format_text_report(devices: List[Dict[str, Any]]) -> str:
-    """Format results as human-readable text report."""
-    lines = [
-        "\n" + "=" * 80,
-        f"{'Device':<20} {'Platform':<12} {'Uptime (Days)':<18} {'Health Status':<15}",
-        "-" * 80
-    ]
+def format_output(analysis, output_format="text"):
+    """Format analysis results for display."""
+    if output_format == "json":
+        return json.dumps(analysis, indent=2, default=str)
 
-    for device in devices:
-        uptime = device.get("uptime_days")
-        uptime_str = f"{uptime:.1f}" if uptime is not None else "N/A"
-        health = device.get("health", "unknown").replace("_", " ").title()
+    lines = ["ARP Table Analysis Report", "=" * 50, ""]
 
-        lines.append(
-            f"{device['device']:<20} {device.get('platform', 'N/A'):<12} "
-            f"{uptime_str:<18} {health:<15}"
-        )
+    if analysis["duplicates"]:
+        lines.append("[!] Duplicate IPs (Multiple MACs):")
+        for ip, entries in sorted(analysis["duplicates"].items()):
+            lines.append(f"  {ip}:")
+            for entry in entries:
+                lines.append(
+                    f"    {entry['device']} - {entry['mac']} "
+                    f"(VLAN {entry['vlan']})"
+                )
+    else:
+        lines.append("[+] No duplicate IPs detected")
 
-    lines.append("=" * 80)
+    if analysis["broadcast_macs"]:
+        lines.append("\n[!] Broadcast/Invalid MAC Addresses:")
+        for entry in analysis["broadcast_macs"]:
+            lines.append(
+                f"  {entry['device']}: {entry['ip']} -> {entry['mac']}"
+            )
+    else:
+        lines.append("\n[+] No broadcast MACs detected")
+
+    lines.append("\nARP Summary (entries per device):")
+    for device, count in sorted(analysis["summary"].items()):
+        lines.append(f"  {device}: {count} ARP entries")
+
     return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--group",
-        help="Filter devices by inventory group"
+        "-i", "--inventory", required=True, help="Path to inventory file"
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=30,
-        help="Alert if device uptime is below N days (default: 30)"
+        "-u", "--username", required=True, help="Device username"
     )
     parser.add_argument(
-        "--sort",
-        choices=["name", "uptime", "health"],
-        default="name",
-        help="Sort output by field"
+        "-p", "--password", required=True, help="Device password"
     )
     parser.add_argument(
-        "--format",
+        "-f", "--filter", help="Filter devices by group name"
+    )
+    parser.add_argument(
+        "-o", "--output",
         choices=["text", "json"],
         default="text",
-        help="Output format"
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity"
+        help="Output format (default: text)",
     )
 
     args = parser.parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
 
     try:
-        nr = InitNornir(config_file="config.yaml")
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} devices")
+        nr = InitNornir(config_file=args.inventory)
+        nr.inventory.defaults.username = args.username
+        nr.inventory.defaults.password = args.password
 
-        if args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices in group '{args.group}'")
+        arp_tables = get_arp_tables(nr, args.filter)
+        if not arp_tables:
+            logger.error("No ARP tables collected from any device")
+            return 1
 
-        results = nr.run(task=gather_device_uptime)
-        devices = [r[0].result for r in results.values()]
+        analysis = analyze_arp_tables(arp_tables)
+        output = format_output(analysis, args.output)
+        print(output)
 
-        sort_key = {
-            "name": lambda x: x["device"],
-            "uptime": lambda x: x["uptime_days"] or 0,
-            "health": lambda x: x["health"]
-        }
-        devices_sorted = sorted(devices, key=sort_key[args.sort])
+        return 0
 
-        if args.format == "json":
-            print(json.dumps(devices_sorted, indent=2))
-        else:
-            print(format_text_report(devices_sorted))
-            recent = [d for d in devices_sorted if d.get("uptime_days", 999) < args.threshold]
-            if recent:
-                logger.warning(f"{len(recent)} device(s) rebooted in last {args.threshold} days")
-
+    except FileNotFoundError:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        return 1
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
-        raise
+        logger.error(f"Script execution failed: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
