@@ -1,213 +1,257 @@
 ```python
 """
-vlan_report_v3.py - Cross-Device VLAN Trunk Consistency Report
+DNS and NTP Synchronization Validator
+
+Validates DNS resolution and NTP synchronization status across network devices,
+identifying devices with time drift, DNS failures, or synchronization issues.
 
 Purpose:
-    Queries trunk interfaces across multiple switches and identifies VLAN
-    allowed-list mismatches. Catches the common operational mistake of adding
-    a VLAN on one trunk end without updating the peer, which causes silent
-    traffic drops for that VLAN across the network.
+  - Verify DNS resolution on all devices
+  - Check NTP peer status and synchronization
+  - Detect time drift across the network
+  - Identify devices with invalid NTP configuration
+  - Generate compliance report
 
 Usage:
-    python vlan_report_v3.py --hosts-file hosts.yaml --groups-file groups.yaml
-    python vlan_report_v3.py --hosts-file hosts.yaml --username admin --password secret
-    python vlan_report_v3.py --hosts-file hosts.yaml --vlan 100
-    python vlan_report_v3.py --hosts-file hosts.yaml --strict
+  python dns_ntp_validator.py --inventory inventory/
+  python dns_ntp_validator.py --device router1 router2 --output report.json
+  python dns_ntp_validator.py --inventory inventory/ --ntp-threshold 100
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils netmiko
-    Cisco IOS/IOS-XE devices with SSH access.
-    hosts.yaml and groups.yaml in Nornir simple inventory format.
+  - Nornir with netmiko plugin
+  - SSH access to devices
+  - Devices must support 'show ntp status' and 'show ip dns'
 """
 
 import argparse
+import json
 import logging
-import sys
-from collections import defaultdict
-from typing import Dict, List, Optional, Set
-
+from datetime import datetime
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import netmiko_send_command
+
 
 logger = logging.getLogger(__name__)
 
 
-def expand_vlan_range(vlan_str: str) -> Set[int]:
-    """Expand a Cisco VLAN range string like '1-5,10,20-25' into a set of ints."""
-    vlans: Set[int] = set()
-    if not vlan_str or vlan_str.strip() in ("none", "ALL"):
-        return vlans
-    for part in vlan_str.split(","):
-        part = part.strip()
-        if "-" in part:
-            try:
-                start, end = part.split("-", 1)
-                vlans.update(range(int(start), int(end) + 1))
-            except ValueError:
-                logger.debug("Could not parse VLAN range segment: %s", part)
-        else:
-            try:
-                vlans.add(int(part))
-            except ValueError:
-                logger.debug("Could not parse VLAN id: %s", part)
-    return vlans
-
-
-def parse_trunk_vlans(output: str) -> Dict[str, Set[int]]:
-    """Parse `show interfaces trunk` output into {interface: set_of_allowed_vlans}."""
-    port_vlans: Dict[str, Set[int]] = {}
-    lines = output.strip().splitlines()
-    in_allowed = False
-    for line in lines:
-        if "VLANs allowed on trunk" in line:
-            in_allowed = True
-            continue
-        if in_allowed:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith("Port"):
-                # Next section — only capture the allowed-on-trunk section
-                break
-            parts = stripped.split()
-            if len(parts) >= 2:
-                port_vlans[parts[0]] = expand_vlan_range(parts[1])
-    return port_vlans
-
-
-def collect_trunk_data(task: Task) -> Result:
-    r = task.run(
-        task=netmiko_send_command,
-        command_string="show interfaces trunk",
-        name="show interfaces trunk",
-    )
-    return Result(host=task.host, result=r.result)
-
-
-def find_mismatches(
-    device_data: Dict[str, Dict[str, Set[int]]],
-    filter_vlan: Optional[int],
-) -> List[Dict]:
-    """
-    Identify VLANs present on some devices' trunk ports but not others.
-    Returns a list of mismatch records sorted by VLAN ID.
-    """
-    vlan_locations: Dict[int, List[str]] = defaultdict(list)
-    for device, trunk_map in device_data.items():
-        for interface, vlans in trunk_map.items():
-            for vlan in vlans:
-                vlan_locations[vlan].append(f"{device}:{interface}")
-
-    all_devices = set(device_data.keys())
-    issues = []
-
-    candidates = [filter_vlan] if filter_vlan else sorted(vlan_locations)
-    for vlan in candidates:
-        locations = vlan_locations.get(vlan, [])
-        devices_with = {loc.split(":")[0] for loc in locations}
-        missing = sorted(all_devices - devices_with)
-        if missing:
-            issues.append({
-                "vlan": vlan,
-                "present_on": sorted(locations),
-                "absent_from": missing,
-            })
-
-    return issues
-
-
-def print_report(
-    device_data: Dict[str, Dict[str, Set[int]]],
-    issues: List[Dict],
-    filter_vlan: Optional[int],
-) -> None:
-    print("\n" + "=" * 68)
-    print("VLAN TRUNK CONSISTENCY REPORT")
-    print("=" * 68)
-    print(f"\nDevices queried: {len(device_data)}")
-    for device, trunk_map in sorted(device_data.items()):
-        unique_vlans = len({v for vlans in trunk_map.values() for v in vlans})
-        print(f"  {device}: {len(trunk_map)} trunk port(s), {unique_vlans} unique VLAN(s)")
-    print(f"\nVLAN MISMATCHES")
-    print("-" * 68)
-    if not issues:
-        target = f"VLAN {filter_vlan}" if filter_vlan else "all VLANs"
-        print(f"  No consistency issues found for {target}.")
-    else:
-        for issue in issues:
-            print(f"\n  VLAN {issue['vlan']} carried on:")
-            for loc in issue["present_on"]:
-                print(f"    + {loc}")
-            print(f"  Not found on device(s):")
-            for dev in issue["absent_from"]:
-                print(f"    - {dev}")
-    print("\n" + "=" * 68)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Cross-device VLAN trunk consistency report using Nornir"
-    )
-    parser.add_argument("--hosts-file", default="hosts.yaml")
-    parser.add_argument("--groups-file", default="groups.yaml")
-    parser.add_argument("--defaults-file", default="defaults.yaml")
-    parser.add_argument("--username", help="Override SSH username from inventory")
-    parser.add_argument("--password", help="Override SSH password from inventory")
-    parser.add_argument("--vlan", type=int, metavar="VLAN_ID",
-                        help="Report on a specific VLAN only")
-    parser.add_argument("--workers", type=int, default=10,
-                        help="Concurrent device connections (default: 10)")
-    parser.add_argument("--strict", action="store_true",
-                        help="Exit with code 1 if any mismatch is found")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
+def setup_logging(verbose=False):
+    """Configure logging output."""
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    nr = InitNornir(
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.hosts_file,
-                "group_file": args.groups_file,
-                "defaults_file": args.defaults_file,
-            },
-        },
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        logging={"enabled": False},
+
+def validate_dns(task: Task) -> Result:
+    """Test DNS resolution on device."""
+    dns_result = {'device': task.host.name, 'dns_working': False, 'servers': []}
+    
+    try:
+        output = task.run(netmiko_send_command, command_string='show ip dns')
+        dns_result['raw_output'] = output[0].result
+        dns_result['dns_working'] = parse_dns_servers(output[0].result, dns_result)
+    except Exception as e:
+        logger.warning(f"{task.host.name}: DNS check failed - {e}")
+        dns_result['error'] = str(e)
+    
+    return Result(host=task.host, result=dns_result)
+
+
+def validate_ntp(task: Task, threshold_ms=100) -> Result:
+    """Check NTP synchronization status."""
+    ntp_result = {
+        'device': task.host.name,
+        'synchronized': False,
+        'peers': [],
+        'stratum': None,
+        'offset_ms': None
+    }
+    
+    try:
+        output = task.run(netmiko_send_command, command_string='show ntp status')
+        parse_ntp_status(output[0].result, ntp_result, threshold_ms)
+    except Exception as e:
+        logger.warning(f"{task.host.name}: NTP check failed - {e}")
+        ntp_result['error'] = str(e)
+    
+    return Result(host=task.host, result=ntp_result)
+
+
+def parse_dns_servers(output, dns_result):
+    """Extract DNS servers from output."""
+    try:
+        for line in output.split('\n'):
+            if 'server' in line.lower() or 'nameserver' in line.lower():
+                parts = line.split()
+                if len(parts) >= 2 and '.' in parts[-1]:
+                    dns_result['servers'].append(parts[-1])
+        return len(dns_result['servers']) > 0
+    except:
+        return False
+
+
+def parse_ntp_status(output, ntp_result, threshold_ms):
+    """Extract NTP status from output."""
+    try:
+        lines = output.split('\n')
+        
+        for line in lines:
+            lower = line.lower()
+            
+            if 'synchronized' in lower or 'sync' in lower:
+                ntp_result['synchronized'] = 'yes' in lower or 'true' in lower
+            
+            if 'stratum' in lower:
+                parts = line.split(':')
+                if len(parts) > 1:
+                    ntp_result['stratum'] = parts[1].strip().split()[0]
+            
+            if 'offset' in lower:
+                parts = line.split(':')
+                if len(parts) > 1:
+                    try:
+                        offset = float(parts[1].split()[0].rstrip('ms'))
+                        ntp_result['offset_ms'] = offset
+                        if abs(offset) > threshold_ms:
+                            ntp_result['time_drift'] = True
+                    except:
+                        pass
+            
+            if 'reference' in lower or 'peer' in lower:
+                if len(line.split()) > 1:
+                    ntp_result['peers'].append(line.strip())
+    
+    except Exception as e:
+        logger.debug(f"NTP parsing error: {e}")
+
+
+def check_device(task: Task, ntp_threshold=100):
+    """Run all validation checks on device."""
+    dns_check = task.run(validate_dns)
+    ntp_check = task.run(validate_ntp, threshold_ms=ntp_threshold)
+    
+    return Result(
+        host=task.host,
+        result={
+            'device': task.host.name,
+            'dns': dns_check[0].result,
+            'ntp': ntp_check[0].result
+        }
     )
 
-    if args.username:
-        nr.inventory.defaults.username = args.username
-    if args.password:
-        nr.inventory.defaults.password = args.password
 
-    logger.info("Querying %d device(s)", len(nr.inventory.hosts))
-    results = nr.run(task=collect_trunk_data, name="Collect trunk VLANs")
+def generate_report(results, output_file=None):
+    """Compile and output validation report."""
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'total_devices': len(results),
+        'dns_compliant': 0,
+        'ntp_compliant': 0,
+        'devices': []
+    }
+    
+    for device_name, multi_result in results.items():
+        if not multi_result:
+            continue
+        
+        device_data = multi_result[0].result
+        report['devices'].append(device_data)
+        
+        if device_data['dns']['dns_working']:
+            report['dns_compliant'] += 1
+        if device_data['ntp']['synchronized']:
+            report['ntp_compliant'] += 1
+    
+    if output_file:
+        with open(output_file, 'w') as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Report saved to {output_file}")
+    else:
+        print_report(report)
+    
+    return report
 
-    failed = [h for h, r in results.items() if r.failed]
-    if failed:
-        logger.warning("Failed devices (%d): %s", len(failed), ", ".join(failed))
 
-    device_data: Dict[str, Dict[str, Set[int]]] = {}
-    for host, multi in results.items():
-        if not multi.failed:
-            device_data[host] = parse_trunk_vlans(multi[0].result or "")
+def print_report(report):
+    """Print formatted validation report."""
+    print("\n" + "="*80)
+    print("DNS AND NTP SYNCHRONIZATION VALIDATION REPORT")
+    print("="*80)
+    print(f"Timestamp: {report['timestamp']}")
+    print(f"Total Devices: {report['total_devices']}")
+    print(f"DNS Compliant: {report['dns_compliant']}/{report['total_devices']}")
+    print(f"NTP Synchronized: {report['ntp_compliant']}/{report['total_devices']}\n")
+    
+    for device in report['devices']:
+        print(f"Device: {device['device']}")
+        
+        dns = device['dns']
+        dns_status = "✓" if dns['dns_working'] else "✗"
+        print(f"  DNS {dns_status}: {len(dns.get('servers', []))} servers configured")
+        
+        ntp = device['ntp']
+        ntp_status = "✓" if ntp['synchronized'] else "✗"
+        offset = ntp.get('offset_ms', 'N/A')
+        print(f"  NTP {ntp_status}: Stratum {ntp.get('stratum', '?')}, Offset {offset}ms")
+        print()
 
-    if not device_data:
-        print("ERROR: No usable data collected. Check connectivity and credentials.",
-              file=sys.stderr)
-        sys.exit(2)
 
-    issues = find_mismatches(device_data, filter_vlan=args.vlan)
-    print_report(device_data, issues, filter_vlan=args.vlan)
-
-    if args.strict and issues:
-        sys.exit(1)
+def main():
+    """Main execution."""
+    parser = argparse.ArgumentParser(
+        description='Validate DNS and NTP on network devices'
+    )
+    parser.add_argument(
+        '--inventory',
+        default='inventory/',
+        help='Nornir inventory path'
+    )
+    parser.add_argument(
+        '--device',
+        action='append',
+        dest='devices',
+        help='Target specific device(s)'
+    )
+    parser.add_argument(
+        '--output',
+        help='JSON output file path'
+    )
+    parser.add_argument(
+        '--ntp-threshold',
+        type=int,
+        default=100,
+        help='NTP offset threshold in milliseconds'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Verbose logging'
+    )
+    
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+    
+    try:
+        logger.info("Initializing Nornir...")
+        nr = InitNornir(config_file=f"{args.inventory}config.yaml")
+        
+        if args.devices:
+            nr = nr.filter(name__in=args.devices)
+        
+        logger.info(f"Validating {len(nr.inventory.hosts)} devices...")
+        results = nr.run(
+            task=check_device,
+            ntp_threshold=args.ntp_threshold
+        )
+        
+        generate_report(results, args.output)
+        logger.info("Validation complete")
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
+        exit(1)
 
 
 if __name__ == "__main__":
