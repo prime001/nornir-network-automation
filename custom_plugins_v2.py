@@ -1,172 +1,216 @@
 ```python
 """
-Multi-Device Command Output Comparator
+Configuration Drift Detection Tool
 
-Purpose:
-    Execute the same command across multiple devices and compare outputs to identify
-    discrepancies, validate configurations, and troubleshoot inconsistencies. Useful
-    for detecting configuration drift, verifying synchronization, and network audits.
+Detects configuration differences between running and startup configurations
+on network devices. Useful for identifying manual changes made outside
+of configuration management systems.
 
 Usage:
-    python command_comparator.py --devices core1,core2,core3 --command "show version" \\
-        --username admin --password secret --config config.yaml
+    python config_drift_detector.py --device core-router-1 --username admin --password secret
+    python config_drift_detector.py --group core --username admin --password secret
 
 Prerequisites:
-    - Nornir installed and configured with device inventory
-    - netmiko library for SSH connectivity
-    - Devices must support the specified command
-    - SSH access to all target devices
+    - Nornir installed with netmiko plugin
+    - Inventory file with device definitions
+    - Network devices accessible via SSH
+    - Netmiko support for target device types
 
 Output:
-    Displays command outputs from each device with visual diff highlighting
-    and a summary of unique responses.
+    - Console report with drift summary
+    - Log file with detailed information
+    - Exit code: 0 (no drift), 1 (drift detected), 2 (error)
 """
 
-import argparse
 import logging
+import argparse
 import sys
-from typing import Dict, List, Set
 from difflib import unified_diff
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Task, Result
+from nornir.core.task import Result, Task
 from nornir.plugins.tasks.networking import netmiko_send_command
 
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("config_drift.log")
+    ]
 )
 logger = logging.getLogger(__name__)
 
 
-def execute_command(task: Task, command: str) -> Result:
-    """Execute command on device via netmiko."""
+def detect_drift(task: Task) -> Result:
+    """
+    Compare running and startup configurations to detect drift.
+    
+    Args:
+        task: Nornir task object
+        
+    Returns:
+        Result containing drift detection status and differences
+    """
     try:
-        result = task.run(netmiko_send_command, command_string=command)
-        output = result[0].result
-        return Result(host=task.host, result=output)
-    except Exception as e:
-        logger.error(f"Command failed on {task.host.name}: {str(e)}")
-        return Result(host=task.host, result=None, failed=True, exception=e)
-
-
-def normalize_output(output: str) -> str:
-    """Normalize output for comparison (strip whitespace, lowercase)."""
-    return '\n'.join(line.rstrip() for line in output.strip().split('\n'))
-
-
-def identify_unique_outputs(results: Dict) -> Dict[str, List[str]]:
-    """Group devices by output uniqueness."""
-    output_map = {}
-    unique_outputs = {}
-    
-    for device_name, task_result in results.items():
-        if task_result[0].failed or not task_result[0].result:
-            device_list = output_map.setdefault('ERROR', [])
-            device_list.append(device_name)
-            continue
+        # Retrieve running configuration
+        running_result = task.run(
+            netmiko_send_command,
+            command_string="show running-config"
+        )
+        running_config = running_result.result
         
-        output = normalize_output(task_result[0].result)
-        output_hash = hash(output)
+        # Retrieve startup configuration
+        startup_result = task.run(
+            netmiko_send_command,
+            command_string="show startup-config"
+        )
+        startup_config = startup_result.result
         
-        if output_hash not in unique_outputs:
-            unique_outputs[output_hash] = {
-                'output': output,
-                'devices': []
+        # Split configs into lines for comparison
+        running_lines = running_config.splitlines(keepends=True)
+        startup_lines = startup_config.splitlines(keepends=True)
+        
+        # Generate unified diff
+        diff_lines = list(unified_diff(
+            startup_lines,
+            running_lines,
+            fromfile="startup-config",
+            tofile="running-config",
+            lineterm=""
+        ))
+        
+        drift_detected = len(diff_lines) > 0
+        
+        return Result(
+            host=task.host,
+            result={
+                "drift_detected": drift_detected,
+                "diff_count": len(diff_lines),
+                "diff": "\n".join(diff_lines) if diff_lines else "No differences"
             }
-        unique_outputs[output_hash]['devices'].append(device_name)
-    
-    result = {}
-    for output_hash, data in unique_outputs.items():
-        key = f"Output_{len(result)+1}"
-        result[key] = data['devices']
-    
-    if 'ERROR' in output_map:
-        result['ERRORS'] = output_map['ERROR']
-    
-    return result
-
-
-def print_results(results: Dict, command: str) -> None:
-    """Display command outputs and comparison summary."""
-    print("\n" + "="*80)
-    print(f"COMMAND: {command}")
-    print("="*80)
-    
-    success_count = 0
-    error_count = 0
-    
-    for device_name, task_result in sorted(results.items()):
-        print(f"\n[{device_name}]")
-        print("-" * 80)
+        )
         
-        if task_result[0].failed:
-            print(f"ERROR: Command execution failed")
-            error_count += 1
-            continue
-        
-        output = task_result[0].result
-        if output:
-            print(output)
-            success_count += 1
-        else:
-            print("No output")
-    
-    print("\n" + "="*80)
-    print(f"SUMMARY: {success_count} successful, {error_count} failed")
-    
-    unique_outputs = identify_unique_outputs(results)
-    print(f"\nUnique Outputs Detected: {len(unique_outputs)}")
-    
-    for output_type, devices in unique_outputs.items():
-        print(f"  {output_type}: {', '.join(devices)}")
-    
-    if len(unique_outputs) > 1:
-        print("\nWARNING: Output discrepancies detected across devices")
+    except Exception as e:
+        logger.error(f"Drift detection failed for {task.host}: {e}")
+        return Result(
+            host=task.host,
+            failed=True,
+            exception=e
+        )
 
 
 def main():
+    """Main entry point with argument parsing and execution."""
     parser = argparse.ArgumentParser(
-        description='Compare command outputs across multiple devices',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Detect configuration drift between running and startup configs"
     )
-    parser.add_argument('--config', default='config.yaml',
-                        help='Nornir config file (default: config.yaml)')
-    parser.add_argument('--devices', required=True,
-                        help='Comma-separated device names')
-    parser.add_argument('--command', required=True,
-                        help='Command to execute on all devices')
-    parser.add_argument('--threads', type=int, default=5,
-                        help='Number of concurrent connections (default: 5)')
+    parser.add_argument(
+        "--device",
+        help="Target specific device"
+    )
+    parser.add_argument(
+        "--group",
+        help="Target device group"
+    )
+    parser.add_argument(
+        "--username",
+        required=True,
+        help="Device authentication username"
+    )
+    parser.add_argument(
+        "--password",
+        required=True,
+        help="Device authentication password"
+    )
+    parser.add_argument(
+        "--inventory",
+        default="inventory.yaml",
+        help="Nornir inventory file"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
     
     args = parser.parse_args()
     
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     try:
-        nr = InitNornir(config_file=args.config)
-    except FileNotFoundError:
-        logger.error(f"Config file not found: {args.config}")
-        sys.exit(1)
-    
-    devices = [d.strip() for d in args.devices.split(',')]
-    filtered_nr = nr.filter(F(name__in=devices))
-    
-    if len(filtered_nr.inventory.hosts) == 0:
-        logger.error(f"No devices matched: {devices}")
-        sys.exit(1)
-    
-    logger.info(f"Executing '{args.command}' on {len(filtered_nr.inventory.hosts)} devices")
-    
-    results = filtered_nr.run(
-        task=execute_command,
-        command=args.command,
-        num_workers=args.threads
-    )
-    
-    print_results(results, args.command)
-    
-    return 0
+        # Initialize Nornir
+        nr = InitNornir(config_file=args.inventory)
+        
+        # Apply filters
+        if args.device:
+            nr = nr.filter(F(name=args.device))
+        elif args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+        else:
+            logger.error("Must specify --device or --group")
+            return 2
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices matched filter")
+            return 2
+        
+        # Set credentials on filtered hosts
+        for host in nr.inventory.hosts.values():
+            host.username = args.username
+            host.password = args.password
+        
+        # Execute drift detection
+        logger.info(f"Checking {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=detect_drift)
+        
+        # Process and display results
+        drift_detected_count = 0
+        error_count = 0
+        
+        print(f"\n{'='*70}")
+        print("Configuration Drift Detection Report")
+        print(f"{'='*70}\n")
+        
+        for host_name, multi_result in results.items():
+            result = multi_result[0]
+            
+            if result.failed:
+                logger.error(f"{host_name}: {result.exception}")
+                error_count += 1
+                print(f"✗ {host_name}: ERROR - {result.exception}")
+            elif result.result["drift_detected"]:
+                drift_detected_count += 1
+                diff_count = result.result["diff_count"]
+                logger.warning(f"{host_name}: Drift detected ({diff_count} lines)")
+                print(f"⚠ {host_name}: DRIFT DETECTED ({diff_count} differences)")
+                
+                # Show first few diff lines
+                diff_text = result.result["diff"]
+                diff_preview = "\n  ".join(diff_text.split("\n")[:10])
+                if len(diff_text.split("\n")) > 10:
+                    diff_preview += "\n  ..."
+                print(f"  {diff_preview}\n")
+            else:
+                logger.info(f"{host_name}: No drift")
+                print(f"✓ {host_name}: No drift detected")
+        
+        # Summary
+        print(f"\n{'='*70}")
+        print("Summary")
+        print(f"{'='*70}")
+        print(f"Total devices: {len(nr.inventory.hosts)}")
+        print(f"Drift detected: {drift_detected_count}")
+        print(f"Errors: {error_count}")
+        
+        return 1 if drift_detected_count > 0 else 0
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        return 2
 
 
 if __name__ == "__main__":
