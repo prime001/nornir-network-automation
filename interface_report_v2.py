@@ -1,237 +1,235 @@
-Now I have enough context. Writing the script:
-
-```
+```python
 """
-interface_error_report.py - Interface Error Counter Report using Nornir
+Interface Redundancy Checker - Nornir Network Automation Script
 
 Purpose:
-    Queries network devices for per-interface error counters (CRC errors,
-    input/output errors, drops, runts, giants) and flags interfaces that
-    exceed a configurable threshold. Useful for proactively identifying
-    degraded links before they cause outages, or for post-incident triage.
+    Verify interface redundancy configurations including port-channels, LAGs,
+    and failover links. Identifies single points of failure and redundancy gaps
+    in network infrastructure.
 
 Usage:
-    python interface_error_report.py --inventory hosts.yaml \
-        --groups-file groups.yaml --defaults-file defaults.yaml
-    python interface_error_report.py --inventory hosts.yaml --group core \
-        --threshold 10 --output errors.csv --workers 20
+    python interface_redundancy_check.py --inventory hosts.yaml
+    python interface_redundancy_check.py --device "router1" --output json
+    python interface_redundancy_check.py --output-file report.json --verbose
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils netmiko
-    A valid Nornir SimpleInventory (hosts.yaml, groups.yaml, defaults.yaml)
-    SSH access with privilege level sufficient to run 'show interfaces'
-    Tested against Cisco IOS/IOS-XE. Adjust parse_show_interfaces() for
-    other vendors (NX-OS, EOS, JunOS) as needed.
+    - nornir with napalm or netmiko
+    - SSH access to network devices
+    - Inventory file with device definitions
+    - Credentials configured via environment or inventory
 """
 
-import argparse
-import csv
 import logging
-import re
+import argparse
+import json
 import sys
 from typing import Dict, List
-
+from collections import defaultdict
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir_napalm.plugins.tasks import napalm_get
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("interface_error_report")
-
-ERROR_FIELDS = ("input_errors", "output_errors", "crc", "drops", "runts", "giants")
+logger = logging.getLogger(__name__)
 
 
-def parse_show_interfaces(output: str) -> List[Dict]:
-    interfaces = []
-    current: Dict = {}
-
-    for line in output.splitlines():
-        iface_match = re.match(r"^(\S+)\s+is\s+(up|down|administratively down)", line)
-        if iface_match:
-            if current:
-                interfaces.append(current)
-            current = {
-                "name": iface_match.group(1),
-                "status": iface_match.group(2),
-                "input_errors": 0,
-                "output_errors": 0,
-                "crc": 0,
-                "drops": 0,
-                "runts": 0,
-                "giants": 0,
-            }
-            continue
-
-        if not current:
-            continue
-
-        m = re.search(r"(\d+)\s+input errors.*?(\d+)\s+CRC", line)
-        if m:
-            current["input_errors"] = int(m.group(1))
-            current["crc"] = int(m.group(2))
-            continue
-
-        m = re.search(r"(\d+)\s+output errors", line)
-        if m:
-            current["output_errors"] = int(m.group(1))
-
-        m = re.search(r"(\d+)\s+runts.*?(\d+)\s+giants", line)
-        if m:
-            current["runts"] = int(m.group(1))
-            current["giants"] = int(m.group(2))
-
-        m = re.search(r"(\d+)\s+(?:input\s+)?drops", line)
-        if m:
-            current["drops"] = int(m.group(1))
-
-    if current:
-        interfaces.append(current)
-
-    return interfaces
-
-
-def collect_errors(task: Task, threshold: int) -> Result:
-    cmd_result = task.run(
-        task=netmiko_send_command,
-        command_string="show interfaces",
-        use_textfsm=False,
-    )
-    interfaces = parse_show_interfaces(cmd_result.result)
-    flagged = [
-        iface for iface in interfaces
-        if any(iface.get(f, 0) >= threshold for f in ERROR_FIELDS)
-    ]
-    return Result(host=task.host, result=flagged)
-
-
-def build_rows(nr_results, threshold: int) -> List[Dict]:
-    rows = []
-    for host, multi in nr_results.items():
-        if multi.failed:
-            logger.warning("%-20s  FAILED: %s", host, multi[0].exception)
-            continue
-        for iface in multi[0].result:
-            rows.append({
-                "host": host,
-                "interface": iface["name"],
-                "status": iface["status"],
-                "input_errors": iface["input_errors"],
-                "output_errors": iface["output_errors"],
-                "crc": iface["crc"],
-                "drops": iface["drops"],
-                "runts": iface["runts"],
-                "giants": iface["giants"],
-            })
-    return rows
-
-
-def print_table(rows: List[Dict], threshold: int) -> None:
-    if not rows:
-        print(f"\nAll interfaces clean (threshold={threshold}). No errors found.")
-        return
-
-    hdr = f"{'HOST':<20} {'INTERFACE':<26} {'STATUS':<10} {'INERR':>6} {'OUTERR':>6} {'CRC':>6} {'DROPS':>6} {'RUNTS':>6} {'GIANTS':>7}"
-    print(f"\n{hdr}")
-    print("-" * len(hdr))
-    for r in rows:
-        print(
-            f"{r['host']:<20} {r['interface']:<26} {r['status']:<10} "
-            f"{r['input_errors']:>6} {r['output_errors']:>6} {r['crc']:>6} "
-            f"{r['drops']:>6} {r['runts']:>6} {r['giants']:>7}"
-        )
-    print(f"\n{len(rows)} interface(s) flagged.")
-
-
-def write_csv(rows: List[Dict], path: str) -> None:
-    fields = ["host", "interface", "status", "input_errors", "output_errors",
-              "crc", "drops", "runts", "giants"]
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    logger.info("CSV written to %s", path)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Report interface error counters across a Nornir inventory",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument("--inventory", default="hosts.yaml",
-                   help="Nornir hosts file (default: hosts.yaml)")
-    p.add_argument("--groups-file", default="groups.yaml",
-                   help="Nornir groups file (default: groups.yaml)")
-    p.add_argument("--defaults-file", default="defaults.yaml",
-                   help="Nornir defaults file (default: defaults.yaml)")
-    p.add_argument("--group",
-                   help="Limit run to hosts in this Nornir group")
-    p.add_argument("--threshold", type=int, default=1,
-                   help="Minimum counter value to flag (default: 1)")
-    p.add_argument("--output", metavar="FILE",
-                   help="Write flagged interfaces to a CSV file")
-    p.add_argument("--workers", type=int, default=10,
-                   help="Concurrent Nornir threads (default: 10)")
-    p.add_argument("--verbose", action="store_true",
-                   help="Enable DEBUG logging")
-    return p.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+def check_redundancy(task):
+    """
+    Check interface redundancy status on device.
+    Analyzes port-channels, LAGs, and single points of failure.
+    """
     try:
-        nr = InitNornir(
-            runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-            inventory={
-                "plugin": "SimpleInventory",
-                "options": {
-                    "host_file": args.inventory,
-                    "group_file": args.groups_file,
-                    "defaults_file": args.defaults_file,
-                },
-            },
-        )
-    except Exception as exc:
-        logger.error("Nornir init failed: %s", exc)
-        return 1
+        result = task.run(napalm_get, getters=["interfaces"])
+        interfaces = result[0].result.get("interfaces", {})
+        
+        status = {
+            "device": task.host.name,
+            "port_channels": [],
+            "eth_uplinks": [],
+            "single_points_of_failure": [],
+        }
+        
+        # Identify and check port-channels/LAGs
+        for iface_name, iface_data in interfaces.items():
+            name_lower = iface_name.lower()
+            
+            # Port-channel/LAG detection
+            if any(x in name_lower for x in ["port-channel", "lag", "po"]):
+                status["port_channels"].append({
+                    "name": iface_name,
+                    "is_up": iface_data.get("is_up", False),
+                    "mtu": iface_data.get("mtu"),
+                    "speed": iface_data.get("speed"),
+                })
+            
+            # Uplink detection
+            elif any(x in name_lower for x in ["uplink", "wan", "core"]):
+                status["eth_uplinks"].append({
+                    "name": iface_name,
+                    "is_up": iface_data.get("is_up", False),
+                    "speed": iface_data.get("speed"),
+                })
+        
+        # Flag single points of failure
+        if len(status["eth_uplinks"]) == 1:
+            status["single_points_of_failure"].append({
+                "type": "single_uplink",
+                "interface": status["eth_uplinks"][0]["name"],
+                "severity": "critical",
+                "recommendation": "Add redundant uplink",
+            })
+        
+        down_port_channels = [
+            pc for pc in status["port_channels"] if not pc["is_up"]
+        ]
+        if down_port_channels:
+            status["single_points_of_failure"].append({
+                "type": "down_redundancy_link",
+                "count": len(down_port_channels),
+                "severity": "high",
+                "recommendation": "Investigate failed port-channel member links",
+            })
+        
+        task.host["redundancy_status"] = status
+        
+    except Exception as e:
+        logger.warning(f"Error checking {task.host.name}: {e}")
+        task.host["redundancy_status"] = {
+            "device": task.host.name,
+            "error": str(e),
+        }
 
-    if args.group:
-        nr = nr.filter(F(groups__contains=args.group))
-        if not nr.inventory.hosts:
-            logger.error("No hosts matched group '%s'", args.group)
-            return 1
 
-    logger.info(
-        "Querying %d host(s) for interface errors (threshold=%d)",
-        len(nr.inventory.hosts),
-        args.threshold,
+def format_text_report(results: List[Dict]) -> str:
+    """Format results as human-readable text report."""
+    report = "Interface Redundancy Check Report\n"
+    report += "=" * 70 + "\n\n"
+    
+    total_devices = len(results)
+    devices_with_issues = sum(1 for r in results if r.get("single_points_of_failure"))
+    
+    report += f"Summary:\n"
+    report += f"  Total Devices: {total_devices}\n"
+    report += f"  Devices with Issues: {devices_with_issues}\n\n"
+    
+    for result in results:
+        report += f"Device: {result['device']}\n"
+        report += "-" * 70 + "\n"
+        
+        if "error" in result:
+            report += f"  Error: {result['error']}\n"
+            continue
+        
+        port_channels = result.get("port_channels", [])
+        uplinks = result.get("eth_uplinks", [])
+        spofs = result.get("single_points_of_failure", [])
+        
+        report += f"  Port-Channels: {len(port_channels)}\n"
+        for pc in port_channels:
+            status_str = "UP" if pc["is_up"] else "DOWN"
+            report += f"    {pc['name']:20} [{status_str}]\n"
+        
+        report += f"  Uplinks: {len(uplinks)}\n"
+        for ul in uplinks:
+            status_str = "UP" if ul["is_up"] else "DOWN"
+            report += f"    {ul['name']:20} [{status_str}]\n"
+        
+        if spofs:
+            report += f"  Issues Found: {len(spofs)}\n"
+            for spof in spofs:
+                report += f"    [{spof['severity'].upper()}] {spof['type']}\n"
+                report += f"      → {spof['recommendation']}\n"
+        else:
+            report += f"  Status: No redundancy issues found\n"
+        
+        report += "\n"
+    
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check interface redundancy and identify single points of failure"
     )
-    results = nr.run(task=collect_errors, threshold=args.threshold)
-
-    rows = build_rows(results, args.threshold)
-    print_table(rows, args.threshold)
-
-    if args.output:
-        try:
-            write_csv(rows, args.output)
-        except OSError as exc:
-            logger.error("CSV write failed: %s", exc)
+    parser.add_argument(
+        "--inventory",
+        default="hosts.yaml",
+        help="Nornir inventory file path"
+    )
+    parser.add_argument(
+        "--device",
+        help="Filter results to specific device"
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format"
+    )
+    parser.add_argument(
+        "--output-file",
+        help="Write report to file"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
+    
+    args = parser.parse_args()
+    
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    
+    try:
+        nr = InitNornir(config_file=args.inventory)
+        
+        if args.device:
+            nr = nr.filter(F(name=args.device))
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices found matching filter criteria")
             return 1
-
-    failed = [h for h, r in results.items() if r.failed]
-    if failed:
-        logger.warning("Unreachable hosts: %s", ", ".join(str(h) for h in failed))
-        return 2
-
-    return 0
+        
+        logger.info(f"Starting redundancy check on {len(nr.inventory.hosts)} device(s)")
+        
+        nr.run(task=check_redundancy)
+        
+        results = [
+            host.get("redundancy_status", {})
+            for host in nr.inventory.hosts.values()
+        ]
+        
+        if args.output == "json":
+            output = json.dumps(results, indent=2)
+        else:
+            output = format_text_report(results)
+        
+        print(output)
+        
+        if args.output_file:
+            with open(args.output_file, "w") as f:
+                f.write(output)
+            logger.info(f"Report written to {args.output_file}")
+        
+        issues_count = sum(
+            len(r.get("single_points_of_failure", []))
+            for r in results
+            if "error" not in r
+        )
+        logger.info(f"Redundancy check complete. Found {issues_count} issue(s)")
+        
+        return 0 if issues_count == 0 else 1
+    
+    except FileNotFoundError as e:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        return 1
+    except Exception as e:
+        logger.error(f"Redundancy check failed: {e}", exc_info=args.verbose)
+        return 1
 
 
 if __name__ == "__main__":
