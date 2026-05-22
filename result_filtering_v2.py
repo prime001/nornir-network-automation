@@ -1,190 +1,186 @@
 ```python
 """
-ARP Table Cross-Device Filter — nornir-network-automation
+Device Inventory Audit
 
-Collects ARP tables from multiple devices via Nornir/Netmiko and filters
-results by IP subnet, MAC OUI prefix, interface, or duplicate IP detection.
-Useful for host location, duplicate IP auditing, and vendor-specific MAC
-hunting across an entire site.
+Purpose:
+    Collect and report device inventory information including hostname, model,
+    serial number, and software version. Useful for asset management and
+    compliance auditing.
 
 Usage:
-    python arp_table_filter.py --subnet 10.10.0.0/24
-    python arp_table_filter.py --mac-prefix 00:1a:2b
-    python arp_table_filter.py --interface vlan
-    python arp_table_filter.py --duplicate-ips
-    python arp_table_filter.py --hosts r1,r2 --subnet 192.168.0.0/16
+    python device_inventory_audit.py
+    python device_inventory_audit.py --group core --output json
+    python device_inventory_audit.py --devices r1,r2,r3 --output csv
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    nornir.yaml with hosts.yaml and groups.yaml inventory configured
+    - Nornir inventory configured with device credentials
+    - Devices must support 'show version' command
 """
 
 import argparse
-import ipaddress
+import csv
+import json
 import logging
-import re
 import sys
-from collections import defaultdict
-from typing import Dict, List, Optional
+from datetime import datetime
 
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.core.filter import F
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import netmiko_send_command
 
-logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Matches Cisco IOS/IOS-XE ARP output lines
-_ARP_LINE = re.compile(
-    r"(?:Internet)\s+"
-    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+"
-    r"(?P<age>[\d\-]+)\s+"
-    r"(?P<mac>[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
-    r"\S+\s+"
-    r"(?P<iface>\S+)"
-)
+
+def gather_inventory(task: Task) -> Result:
+    """Collect device model, serial number, and version information."""
+    inventory_data = {
+        "hostname": task.host.name,
+        "timestamp": datetime.now().isoformat(),
+        "reachable": False
+    }
+    
+    try:
+        version_result = task.run(
+            netmiko_send_command,
+            command_string="show version"
+        )
+        inventory_data["version_output"] = version_result.result
+        inventory_data["reachable"] = True
+    except Exception as e:
+        logger.warning(f"Failed to gather inventory for {task.host.name}: {e}")
+        inventory_data["error"] = str(e)
+    
+    return Result(host=task.host, result=inventory_data)
 
 
-def _dotted_to_colon(mac: str) -> str:
-    """Convert Cisco aabb.ccdd.eeff notation to 00:aa:bb:cc:dd:ee."""
-    raw = mac.replace(".", "")
-    return ":".join(raw[i:i + 2] for i in range(0, 12, 2)).lower()
+def parse_device_info(version_output: str) -> dict:
+    """Extract model, serial, and version from show version output."""
+    info = {"model": "Unknown", "serial": "Unknown", "version": "Unknown"}
+    
+    lines = version_output.split('\n')
+    for i, line in enumerate(lines):
+        if 'Serial Number' in line or 'serial number' in line.lower():
+            info["serial"] = line.split(':')[-1].strip()
+        if 'Model Number' in line or 'model number' in line.lower():
+            info["model"] = line.split(':')[-1].strip()
+        if any(x in line for x in ['Software Version', 'Version', 'IOS']):
+            parts = line.split()
+            for j, part in enumerate(parts):
+                if part[0].isdigit():
+                    info["version"] = part
+                    break
+    
+    return info
 
 
-def collect_arp_table(task: Task) -> Result:
-    """Nornir task: run 'show ip arp' and parse entries into a list of dicts."""
-    cmd_result = task.run(
-        task=netmiko_send_command,
-        command_string="show ip arp",
-    )
-    entries = []
-    for line in cmd_result.result.splitlines():
-        match = _ARP_LINE.search(line)
-        if match:
-            entries.append({
-                "ip": match.group("ip"),
-                "mac": _dotted_to_colon(match.group("mac")),
-                "interface": match.group("iface"),
-                "age": match.group("age"),
+def format_output(results: dict, output_format: str = "text"):
+    """Format and display inventory audit results."""
+    inventory = []
+    
+    for host, task_results in results.items():
+        result = task_results[0].result
+        if result["reachable"]:
+            parsed = parse_device_info(result.get("version_output", ""))
+            inventory.append({
+                "hostname": host,
+                "model": parsed["model"],
+                "serial": parsed["serial"],
+                "version": parsed["version"],
+                "status": "reachable"
             })
-    return Result(host=task.host, result=entries)
+        else:
+            inventory.append({
+                "hostname": host,
+                "model": "UNREACHABLE",
+                "serial": "N/A",
+                "version": result.get("error", "Unknown"),
+                "status": "unreachable"
+            })
+    
+    if output_format == "json":
+        print(json.dumps(inventory, indent=2))
+    elif output_format == "csv":
+        if inventory:
+            writer = csv.DictWriter(sys.stdout, fieldnames=inventory[0].keys())
+            writer.writeheader()
+            writer.writerows(inventory)
+    else:
+        print("\n" + "=" * 90)
+        print("DEVICE INVENTORY AUDIT")
+        print("=" * 90)
+        print(f"{'Hostname':<20} {'Model':<20} {'Serial':<20} {'Version':<15} {'Status':<12}")
+        print("-" * 90)
+        for item in inventory:
+            print(f"{item['hostname']:<20} {item['model']:<20} {item['serial']:<20} "
+                  f"{item['version']:<15} {item['status']:<12}")
+        print("-" * 90)
+        reachable = sum(1 for item in inventory if item["status"] == "reachable")
+        print(f"Total devices: {len(inventory)} | Reachable: {reachable} | "
+              f"Unreachable: {len(inventory) - reachable}\n")
 
 
-def apply_filters(
-    entries: List[dict],
-    subnet: Optional[str],
-    mac_prefix: Optional[str],
-    interface: Optional[str],
-) -> List[dict]:
-    result = entries
-
-    if subnet:
-        try:
-            network = ipaddress.ip_network(subnet, strict=False)
-        except ValueError as exc:
-            logger.error("Invalid subnet '%s': %s", subnet, exc)
-            sys.exit(1)
-        result = [e for e in result if ipaddress.ip_address(e["ip"]) in network]
-
-    if mac_prefix:
-        # Accept 00:1a:2b, 001a2b, or 00-1a-2b forms
-        normalized = mac_prefix.lower().replace("-", ":").replace(".", "")
-        if len(normalized) == 6 and ":" not in normalized:
-            normalized = ":".join(normalized[i:i + 2] for i in range(0, 6, 2))
-        result = [e for e in result if e["mac"].startswith(normalized)]
-
-    if interface:
-        result = [e for e in result if interface.lower() in e["interface"].lower()]
-
-    return result
-
-
-def find_duplicate_ips(all_entries: Dict[str, List[dict]]) -> Dict[str, List[str]]:
-    ip_to_hosts: Dict[str, List[str]] = defaultdict(list)
-    for host, entries in all_entries.items():
-        for entry in entries:
-            ip_to_hosts[entry["ip"]].append(host)
-    return {ip: hosts for ip, hosts in ip_to_hosts.items() if len(hosts) > 1}
-
-
-def print_table(host: str, entries: List[dict]) -> None:
-    print(f"\n{'=' * 62}")
-    print(f"  {host}  ({len(entries)} entries)")
-    print(f"{'=' * 62}")
-    print(f"  {'IP':<18} {'MAC':<20} {'Interface':<20} Age")
-    print(f"  {'-' * 17} {'-' * 19} {'-' * 19} ---")
-    for e in sorted(entries, key=lambda x: tuple(int(o) for o in x["ip"].split("."))):
-        print(f"  {e['ip']:<18} {e['mac']:<20} {e['interface']:<20} {e['age']}")
-
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="Filter ARP tables across Nornir-managed devices.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--config", default="nornir.yaml", help="Nornir config file")
-    parser.add_argument("--subnet", metavar="CIDR", help="Filter by IP subnet (e.g. 10.0.0.0/24)")
-    parser.add_argument("--mac-prefix", metavar="OUI", help="Filter by MAC prefix (e.g. 00:1a:2b)")
-    parser.add_argument("--interface", metavar="NAME", help="Filter by interface name substring")
-    parser.add_argument(
-        "--duplicate-ips", action="store_true",
-        help="Report IPs that appear in ARP tables on more than one device",
+        description="Audit and report on device inventory information"
     )
     parser.add_argument(
-        "--hosts", metavar="H1,H2",
-        help="Comma-separated list of hostnames to target (default: all)",
+        "--config",
+        default="nornir_config.yaml",
+        help="Path to Nornir configuration file (default: nornir_config.yaml)"
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--devices",
+        help="Comma-separated list of device hostnames to audit"
+    )
+    parser.add_argument(
+        "--group",
+        help="Audit devices in a specific group"
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json", "csv"],
+        default="text",
+        help="Output format (default: text)"
+    )
+    parser.add_argument(
+        "--loglevel",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level"
+    )
+    
     args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+    logger.setLevel(getattr(logging, args.loglevel))
+    
     try:
         nr = InitNornir(config_file=args.config)
-    except Exception as exc:
-        logger.error("Failed to initialize Nornir: %s", exc)
+    except FileNotFoundError:
+        logger.error(f"Configuration file '{args.config}' not found")
         sys.exit(1)
-
-    if args.hosts:
-        target = {h.strip() for h in args.hosts.split(",")}
-        nr = nr.filter(lambda h: h.name in target)
-
+    except Exception as e:
+        logger.error(f"Failed to initialize Nornir: {e}")
+        sys.exit(1)
+    
+    if args.devices:
+        device_list = [d.strip() for d in args.devices.split(',')]
+        nr = nr.filter(F(name__in=device_list))
+    elif args.group:
+        nr = nr.filter(F(groups__contains=args.group))
+    
     if not nr.inventory.hosts:
-        logger.error("No hosts matched the given filter.")
+        logger.error("No devices found matching filter criteria")
         sys.exit(1)
-
-    logger.info("Collecting ARP tables from %d host(s).", len(nr.inventory.hosts))
-    aggregated = nr.run(task=collect_arp_table)
-
-    all_entries: Dict[str, List[dict]] = {}
-    for host, multi in aggregated.items():
-        if multi.failed:
-            logger.warning("%-20s  FAILED: %s", host, multi[0].exception)
-            continue
-        all_entries[host] = multi[0].result
-
-    if args.duplicate_ips:
-        dupes = find_duplicate_ips(all_entries)
-        if not dupes:
-            print("No duplicate IPs found across collected ARP tables.")
-            return
-        print(f"\nDuplicate IPs ({len(dupes)} found):")
-        for ip in sorted(dupes, key=lambda x: tuple(int(o) for o in x.split("."))):
-            print(f"  {ip:<18}  seen on: {', '.join(sorted(dupes[ip]))}")
-        return
-
-    found_any = False
-    for host in sorted(all_entries):
-        filtered = apply_filters(
-            all_entries[host], args.subnet, args.mac_prefix, args.interface
-        )
-        if filtered:
-            found_any = True
-            print_table(host, filtered)
-
-    if not found_any:
-        print("No matching ARP entries found.")
+    
+    logger.info(f"Starting inventory audit for {len(nr.inventory.hosts)} device(s)")
+    results = nr.run(task=gather_inventory)
+    
+    format_output(dict(results), args.output)
+    logger.info("Inventory audit completed")
 
 
 if __name__ == "__main__":
