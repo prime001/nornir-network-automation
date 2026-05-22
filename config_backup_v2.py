@@ -1,83 +1,136 @@
+Writing a config drift detection script — distinct from the existing backup scripts, practical for real-world change auditing.
+
 ```python
-"""config_drift.py - Detect configuration drift between running and startup configs.
+"""
+config_diff.py — Configuration Drift Detection for Network Devices
 
 Purpose:
-    Connects to network devices via Nornir/Netmiko and compares each device's
-    running-config against its startup-config. Devices with unsaved changes are
-    flagged so engineers can identify what will be lost on the next reboot.
-    Outputs a per-device unified diff and an optional summary report file.
-    Exits non-zero when drift is found, making it usable in scheduled CI checks.
+    Retrieve running configurations from network devices via Nornir and compare
+    them against previously saved baseline snapshots. Produces unified diffs that
+    highlight configuration changes between audit intervals, enabling drift
+    detection and unauthorized-change alerting.
 
 Usage:
-    python config_drift.py --hosts router1,router2 --username admin --password secret
-    python config_drift.py --group core --username admin --save-report drift.txt
-    python config_drift.py --group all --username admin --fail-on-drift
+    # First run: establish baselines
+    python config_diff.py --save-baseline --baseline-dir ./baselines
+
+    # Subsequent runs: detect drift
+    python config_diff.py --baseline-dir ./baselines --output-dir ./diffs
+
+    # Target specific hosts or groups
+    python config_diff.py --hosts router-01 router-02 --baseline-dir ./baselines
+    python config_diff.py --groups core-routers --baseline-dir ./baselines
 
 Prerequisites:
     pip install nornir nornir-netmiko nornir-utils netmiko
-    Inventory files: inventory/hosts.yaml, inventory/groups.yaml, inventory/defaults.yaml
+    hosts.yaml and groups.yaml in the working directory (or set NORNIR_CONFIG)
 """
 
 import argparse
 import difflib
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from nornir import InitNornir
 from nornir.core.filter import F
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
+SHOW_RUN = {
+    "cisco_ios": "show running-config",
+    "cisco_ios_xe": "show running-config",
+    "cisco_nxos": "show running-config",
+    "cisco_xr": "show running-config",
+    "arista_eos": "show running-config",
+    "juniper_junos": "show configuration",
+    "linux": "cat /etc/network/interfaces",
+}
+DEFAULT_COMMAND = "show running-config"
 
-def _fetch_config(task: Task, command: str) -> str:
+
+def retrieve_config(task: Task) -> Result:
+    platform = task.host.platform or "cisco_ios"
+    command = SHOW_RUN.get(platform, DEFAULT_COMMAND)
     result = task.run(
         task=netmiko_send_command,
         command_string=command,
         use_textfsm=False,
-        name=command,
     )
-    return result.result
+    return Result(host=task.host, result=result.result)
 
 
-def check_drift(task: Task) -> Result:
-    running = _fetch_config(task, "show running-config")
-    startup = _fetch_config(task, "show startup-config")
+def load_baseline(host: str, baseline_dir: Path) -> Optional[str]:
+    path = baseline_dir / f"{host}.cfg"
+    if path.exists():
+        return path.read_text()
+    logger.warning("No baseline found for %s at %s", host, path)
+    return None
 
-    diff = list(
-        difflib.unified_diff(
-            startup.splitlines(keepends=True),
-            running.splitlines(keepends=True),
-            fromfile=f"{task.host.name}:startup-config",
-            tofile=f"{task.host.name}:running-config",
-            lineterm="",
-        )
+
+def save_config(host: str, config: str, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"{host}.cfg"
+    path.write_text(config)
+    logger.info("Baseline saved: %s", path)
+
+
+def unified_diff(baseline: str, current: str, host: str) -> str:
+    diff = difflib.unified_diff(
+        baseline.splitlines(keepends=True),
+        current.splitlines(keepends=True),
+        fromfile=f"{host}/baseline",
+        tofile=f"{host}/current",
+        lineterm="",
     )
-    return Result(
-        host=task.host,
-        result={"has_drift": bool(diff), "diff": diff},
+    return "\n".join(diff)
+
+
+def write_diff_report(host: str, diff: str, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = output_dir / f"{host}_{ts}.diff"
+    path.write_text(diff)
+    return path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Detect configuration drift against saved baselines",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--hosts", nargs="+", metavar="HOST", help="Filter by hostname")
+    p.add_argument("--groups", nargs="+", metavar="GROUP", help="Filter by inventory group")
+    p.add_argument("--baseline-dir", default="baselines", metavar="DIR",
+                   help="Directory for baseline .cfg files (default: baselines/)")
+    p.add_argument("--output-dir", default="diffs", metavar="DIR",
+                   help="Directory for diff reports (default: diffs/)")
+    p.add_argument("--save-baseline", action="store_true",
+                   help="Save current configs as new baselines instead of diffing")
+    p.add_argument("--username", metavar="USER", help="Override inventory username")
+    p.add_argument("--password", metavar="PASS", help="Override inventory password")
+    p.add_argument("--platform", metavar="PLATFORM",
+                   help="Override platform for all hosts (e.g. cisco_ios)")
+    p.add_argument("--workers", type=int, default=10, metavar="N",
+                   help="Parallel worker threads (default: 10)")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-
-def build_nornir(args: argparse.Namespace):
     nr = InitNornir(
         runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.host_file,
-                "group_file": args.group_file,
-                "defaults_file": args.defaults_file,
-            },
-        },
         logging={"enabled": False},
     )
 
@@ -85,98 +138,67 @@ def build_nornir(args: argparse.Namespace):
         nr.inventory.defaults.username = args.username
     if args.password:
         nr.inventory.defaults.password = args.password
+    if args.platform:
+        nr.inventory.defaults.platform = args.platform
 
+    target = nr
     if args.hosts:
-        targets = [h.strip() for h in args.hosts.split(",")]
-        nr = nr.filter(F(name__any=targets))
-    elif args.group:
-        nr = nr.filter(F(groups__contains=args.group))
+        target = target.filter(F(name__any=args.hosts))
+    if args.groups:
+        target = target.filter(F(groups__any=args.groups))
 
-    return nr
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Detect unsaved config changes (running vs startup) across network devices."
-    )
-    parser.add_argument("--hosts", help="Comma-separated hostnames to target")
-    parser.add_argument("--group", help="Inventory group to target")
-    parser.add_argument("--username", help="SSH username (overrides inventory defaults)")
-    parser.add_argument("--password", help="SSH password (overrides inventory defaults)")
-    parser.add_argument(
-        "--workers", type=int, default=10, help="Parallel workers (default: 10)"
-    )
-    parser.add_argument("--host-file", default="inventory/hosts.yaml")
-    parser.add_argument("--group-file", default="inventory/groups.yaml")
-    parser.add_argument("--defaults-file", default="inventory/defaults.yaml")
-    parser.add_argument(
-        "--save-report", metavar="FILE", help="Write diff report to this file"
-    )
-    parser.add_argument(
-        "--fail-on-drift",
-        action="store_true",
-        help="Exit with code 1 if any device has unsaved changes (CI mode)",
-    )
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    nr = build_nornir(args)
-
-    if not nr.inventory.hosts:
-        logger.error("No hosts matched the given filter. Check --hosts / --group.")
+    if not target.inventory.hosts:
+        logger.error("No hosts matched — check --hosts / --groups filters")
         return 2
 
-    total = len(nr.inventory.hosts)
-    logger.info("Checking config drift on %d device(s)...", total)
-    results = nr.run(task=check_drift, name="config-drift-check")
+    logger.info("Querying %d host(s)...", len(target.inventory.hosts))
+    results = target.run(task=retrieve_config, name="retrieve_config")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    report_lines = [f"Config Drift Report — {timestamp}\n", "=" * 60 + "\n"]
-    drifted = []
-    errors = []
+    baseline_dir = Path(args.baseline_dir)
+    output_dir = Path(args.output_dir)
+    changed, clean, errors = [], [], []
 
-    for hostname, multi_result in results.items():
+    for host, multi_result in results.items():
         if multi_result.failed:
             exc = multi_result[0].exception
-            logger.error("%s: connection/task failed — %s", hostname, exc)
-            errors.append(hostname)
-            report_lines.append(f"\n[{hostname}] — ERROR: {exc}\n")
+            logger.error("Failed on %s: %s", host, exc)
+            errors.append(host)
             continue
 
-        data = multi_result[0].result
-        if data["has_drift"]:
-            drifted.append(hostname)
-            diff_text = "\n".join(data["diff"])
-            logger.warning(
-                "%s: DRIFT DETECTED — %d changed lines", hostname, len(data["diff"])
-            )
-            report_lines.append(f"\n[{hostname}] — DRIFT DETECTED\n")
-            report_lines.append(diff_text + "\n")
+        config = multi_result[0].result
+
+        if args.save_baseline:
+            save_config(host, config, baseline_dir)
+            continue
+
+        baseline = load_baseline(host, baseline_dir)
+        if baseline is None:
+            errors.append(host)
+            continue
+
+        diff = unified_diff(baseline, config, host)
+        if diff:
+            report_path = write_diff_report(host, diff, output_dir)
+            logger.warning("DRIFT on %-30s → %s", host, report_path)
+            print(f"\n{'='*64}\nDrift detected: {host}\n{'='*64}\n{diff}")
+            changed.append(host)
         else:
-            logger.info("%s: clean — running matches startup", hostname)
-            report_lines.append(f"\n[{hostname}] — CLEAN\n")
+            logger.info("Clean: %s", host)
+            clean.append(host)
 
-    report_lines.append("\n" + "=" * 60 + "\n")
-    report_lines.append(
-        f"Summary: {len(drifted)} drifted / {len(errors)} errors / {total} total\n"
-    )
-    if drifted:
-        report_lines.append("Drifted devices: " + ", ".join(drifted) + "\n")
+    if args.save_baseline:
+        logger.info("Done. Baselines saved to %s/", baseline_dir)
+        return 0
+
+    print(f"\n{'='*64}")
+    print(f"Summary: {len(changed)} drifted  |  {len(clean)} clean  |  {len(errors)} errors")
+    if changed:
+        print(f"Changed : {', '.join(changed)}")
     if errors:
-        report_lines.append("Errored devices: " + ", ".join(errors) + "\n")
+        print(f"Errors  : {', '.join(errors)}")
+    print(f"{'='*64}")
 
-    report_text = "".join(report_lines)
-    print(report_text)
-
-    if args.save_report:
-        Path(args.save_report).write_text(report_text)
-        logger.info("Report saved to %s", args.save_report)
-
-    if args.fail_on_drift and drifted:
-        return 1
-    return 0
+    return 1 if (changed or errors) else 0
 
 
 if __name__ == "__main__":
