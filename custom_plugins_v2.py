@@ -1,216 +1,250 @@
+Writing an NTP compliance audit script — distinct from all existing scripts in the repo.
+
 ```python
 """
-Configuration Drift Detection Tool
+NTP Compliance Auditor
 
-Detects configuration differences between running and startup configurations
-on network devices. Useful for identifying manual changes made outside
-of configuration management systems.
+Purpose:
+    Connects to network devices via Nornir/Netmiko, collects NTP association
+    data, and reports synchronization status, stratum level, and reference
+    server compliance across the fleet. Identifies unsynchronized devices,
+    stratum violations, and unauthorized NTP peer usage.
 
 Usage:
-    python config_drift_detector.py --device core-router-1 --username admin --password secret
-    python config_drift_detector.py --group core --username admin --password secret
+    python ntp_audit.py
+    python ntp_audit.py --group core-routers --max-stratum 3
+    python ntp_audit.py --hosts r1,r2 --required-server 10.0.0.1 --output json
+    python ntp_audit.py --output csv > ntp_report.csv
 
 Prerequisites:
-    - Nornir installed with netmiko plugin
-    - Inventory file with device definitions
-    - Network devices accessible via SSH
-    - Netmiko support for target device types
-
-Output:
-    - Console report with drift summary
-    - Log file with detailed information
-    - Exit code: 0 (no drift), 1 (drift detected), 2 (error)
+    pip install nornir nornir-netmiko nornir-utils
+    Nornir inventory files: hosts.yaml, groups.yaml, defaults.yaml
+    SSH access to devices; IOS/IOS-XE/EOS compatible output expected.
 """
 
-import logging
 import argparse
+import json
+import logging
+import re
 import sys
-from difflib import unified_diff
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from nornir import InitNornir
-from nornir.core.filter import F
 from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import netmiko_send_command
-
+from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("config_drift.log")
-    ]
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-def detect_drift(task: Task) -> Result:
-    """
-    Compare running and startup configurations to detect drift.
-    
-    Args:
-        task: Nornir task object
-        
-    Returns:
-        Result containing drift detection status and differences
-    """
+@dataclass
+class NTPStatus:
+    hostname: str
+    synced: bool = False
+    stratum: int = 16
+    reference: str = ""
+    peers: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def label(self, max_stratum: int = 3, required_server: Optional[str] = None) -> str:
+        if self.error and not self.synced:
+            return "ERROR"
+        if not self.synced:
+            return "NOT SYNCED"
+        issues = []
+        if self.stratum > max_stratum:
+            issues.append(f"STRATUM {self.stratum}")
+        if required_server and required_server not in self.peers:
+            issues.append("MISSING SERVER")
+        return ", ".join(issues) if issues else "OK"
+
+
+def parse_ntp_associations(output: str, hostname: str) -> NTPStatus:
+    """Parse 'show ntp associations' from IOS/IOS-XE/EOS."""
+    status = NTPStatus(hostname=hostname)
+    peers: List[str] = []
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or re.match(r"^(address|~address|ind|ref)", stripped, re.I):
+            continue
+
+        # * in columns 0-2 marks the system peer (we're synchronized to it)
+        is_sys_peer = "*" in line[:3]
+
+        # remove all leading marker characters: * + - x ~ space
+        clean = re.sub(r"^[*+\-x~\s]+", "", stripped)
+        parts = clean.split()
+        if len(parts) < 3:
+            continue
+
+        peer_addr = parts[0]
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", peer_addr):
+            continue
+
+        peers.append(peer_addr)
+
+        if is_sys_peer:
+            status.reference = peer_addr
+            status.synced = True
+            try:
+                status.stratum = int(parts[2])
+            except (ValueError, IndexError):
+                pass
+
+    status.peers = peers
+    return status
+
+
+def audit_ntp(task: Task, max_stratum: int, required_server: Optional[str]) -> Result:
+    hostname = task.host.name
     try:
-        # Retrieve running configuration
-        running_result = task.run(
-            netmiko_send_command,
-            command_string="show running-config"
+        sub = task.run(
+            task=netmiko_send_command,
+            command_string="show ntp associations",
+            name="show ntp associations",
         )
-        running_config = running_result.result
-        
-        # Retrieve startup configuration
-        startup_result = task.run(
-            netmiko_send_command,
-            command_string="show startup-config"
-        )
-        startup_config = startup_result.result
-        
-        # Split configs into lines for comparison
-        running_lines = running_config.splitlines(keepends=True)
-        startup_lines = startup_config.splitlines(keepends=True)
-        
-        # Generate unified diff
-        diff_lines = list(unified_diff(
-            startup_lines,
-            running_lines,
-            fromfile="startup-config",
-            tofile="running-config",
-            lineterm=""
-        ))
-        
-        drift_detected = len(diff_lines) > 0
-        
+        output = sub[0].result
+    except Exception as exc:
+        logger.warning("Failed to collect NTP data from %s: %s", hostname, exc)
         return Result(
             host=task.host,
-            result={
-                "drift_detected": drift_detected,
-                "diff_count": len(diff_lines),
-                "diff": "\n".join(diff_lines) if diff_lines else "No differences"
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Drift detection failed for {task.host}: {e}")
-        return Result(
-            host=task.host,
+            result=NTPStatus(hostname=hostname, error=str(exc)),
             failed=True,
-            exception=e
+        )
+
+    status = parse_ntp_associations(output, hostname)
+    status_label = status.label(max_stratum, required_server)
+    if status_label not in ("OK", "ERROR"):
+        logger.warning("%s: %s", hostname, status_label)
+
+    return Result(host=task.host, result=status)
+
+
+def render_table(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
+    widths = (22, 16, 8, 18, 7)
+    header = (
+        f"{'HOSTNAME':<{widths[0]}} {'STATUS':<{widths[1]}} "
+        f"{'STRATUM':<{widths[2]}} {'REFERENCE':<{widths[3]}} {'PEERS':<{widths[4]}}"
+    )
+    print(header)
+    print("-" * (sum(widths) + len(widths)))
+    for s in statuses:
+        lbl = s.label(max_stratum, required_server)
+        print(
+            f"{s.hostname:<{widths[0]}} {lbl:<{widths[1]}} "
+            f"{s.stratum:<{widths[2]}} {s.reference:<{widths[3]}} "
+            f"{len(s.peers):<{widths[4]}}"
         )
 
 
-def main():
-    """Main entry point with argument parsing and execution."""
-    parser = argparse.ArgumentParser(
-        description="Detect configuration drift between running and startup configs"
+def render_json(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
+    rows = [
+        {
+            "hostname": s.hostname,
+            "status": s.label(max_stratum, required_server),
+            "synced": s.synced,
+            "stratum": s.stratum,
+            "reference": s.reference,
+            "peers": s.peers,
+            "error": s.error,
+        }
+        for s in statuses
+    ]
+    print(json.dumps(rows, indent=2))
+
+
+def render_csv(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
+    print("hostname,status,synced,stratum,reference,peer_count,error")
+    for s in statuses:
+        err = (s.error or "").replace(",", ";")
+        print(
+            f"{s.hostname},{s.label(max_stratum, required_server)},"
+            f"{s.synced},{s.stratum},{s.reference},{len(s.peers)},{err}"
+        )
+
+
+def build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Audit NTP synchronization compliance across network devices.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--device",
-        help="Target specific device"
+    p.add_argument("--hosts", metavar="H1,H2", help="Comma-separated hostnames to target")
+    p.add_argument("--group", metavar="GROUP", help="Nornir inventory group to target")
+    p.add_argument(
+        "--max-stratum", type=int, default=3, metavar="N",
+        help="Flag devices with stratum > N (default: 3)",
     )
-    parser.add_argument(
-        "--group",
-        help="Target device group"
+    p.add_argument(
+        "--required-server", metavar="IP",
+        help="Flag devices not peering with this NTP server",
     )
-    parser.add_argument(
-        "--username",
-        required=True,
-        help="Device authentication username"
+    p.add_argument(
+        "--output", choices=["table", "json", "csv"], default="table",
     )
-    parser.add_argument(
-        "--password",
-        required=True,
-        help="Device authentication password"
-    )
-    parser.add_argument(
-        "--inventory",
-        default="inventory.yaml",
-        help="Nornir inventory file"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging"
-    )
-    
-    args = parser.parse_args()
-    
+    p.add_argument("--config", default="config.yaml", help="Nornir config file")
+    p.add_argument("--workers", type=int, default=10)
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = build_args()
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     try:
-        # Initialize Nornir
-        nr = InitNornir(config_file=args.inventory)
-        
-        # Apply filters
-        if args.device:
-            nr = nr.filter(F(name=args.device))
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
+        nr = InitNornir(config_file=args.config, core={"num_workers": args.workers})
+    except Exception as exc:
+        logger.error("Nornir init failed: %s", exc)
+        return 1
+
+    if args.hosts:
+        names = {h.strip() for h in args.hosts.split(",")}
+        nr = nr.filter(filter_func=lambda h: h.name in names)
+    elif args.group:
+        nr = nr.filter(filter_func=lambda h: args.group in h.groups)
+
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched.")
+        return 1
+
+    logger.info("Auditing %d host(s)", len(nr.inventory.hosts))
+
+    results = nr.run(
+        task=audit_ntp,
+        max_stratum=args.max_stratum,
+        required_server=args.required_server,
+        name="NTP audit",
+    )
+
+    statuses: List[NTPStatus] = []
+    for host, multi in results.items():
+        top = multi[0]
+        if isinstance(top.result, NTPStatus):
+            statuses.append(top.result)
         else:
-            logger.error("Must specify --device or --group")
-            return 2
-        
-        if not nr.inventory.hosts:
-            logger.error("No devices matched filter")
-            return 2
-        
-        # Set credentials on filtered hosts
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            host.password = args.password
-        
-        # Execute drift detection
-        logger.info(f"Checking {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=detect_drift)
-        
-        # Process and display results
-        drift_detected_count = 0
-        error_count = 0
-        
-        print(f"\n{'='*70}")
-        print("Configuration Drift Detection Report")
-        print(f"{'='*70}\n")
-        
-        for host_name, multi_result in results.items():
-            result = multi_result[0]
-            
-            if result.failed:
-                logger.error(f"{host_name}: {result.exception}")
-                error_count += 1
-                print(f"✗ {host_name}: ERROR - {result.exception}")
-            elif result.result["drift_detected"]:
-                drift_detected_count += 1
-                diff_count = result.result["diff_count"]
-                logger.warning(f"{host_name}: Drift detected ({diff_count} lines)")
-                print(f"⚠ {host_name}: DRIFT DETECTED ({diff_count} differences)")
-                
-                # Show first few diff lines
-                diff_text = result.result["diff"]
-                diff_preview = "\n  ".join(diff_text.split("\n")[:10])
-                if len(diff_text.split("\n")) > 10:
-                    diff_preview += "\n  ..."
-                print(f"  {diff_preview}\n")
-            else:
-                logger.info(f"{host_name}: No drift")
-                print(f"✓ {host_name}: No drift detected")
-        
-        # Summary
-        print(f"\n{'='*70}")
-        print("Summary")
-        print(f"{'='*70}")
-        print(f"Total devices: {len(nr.inventory.hosts)}")
-        print(f"Drift detected: {drift_detected_count}")
-        print(f"Errors: {error_count}")
-        
-        return 1 if drift_detected_count > 0 else 0
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        return 2
+            statuses.append(NTPStatus(hostname=host, error="unexpected result"))
+
+    statuses.sort(key=lambda s: s.hostname)
+
+    if args.output == "json":
+        render_json(statuses, args.max_stratum, args.required_server)
+    elif args.output == "csv":
+        render_csv(statuses, args.max_stratum, args.required_server)
+    else:
+        render_table(statuses, args.max_stratum, args.required_server)
+
+    non_ok = [s for s in statuses if s.label(args.max_stratum, args.required_server) != "OK"]
+    if non_ok and args.output == "table":
+        print(f"\n{len(non_ok)} of {len(statuses)} device(s) non-compliant")
+
+    return 1 if non_ok else 0
 
 
 if __name__ == "__main__":
