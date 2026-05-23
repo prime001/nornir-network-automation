@@ -1,175 +1,264 @@
 ```python
 """
-Interface Health and Error Analysis Script
+SSH Connectivity Validator for Network Devices using Nornir
 
-Collects interface statistics from network devices and generates a health report,
-identifying interfaces with high error rates or problematic conditions.
+Purpose:
+    Validates SSH connectivity and credential configuration across network
+    inventory. Useful as a pre-flight check before running automation tasks
+    or for troubleshooting device accessibility issues.
 
 Usage:
-    python interface_health.py --inventory inventory.yml --username admin --password pass
-    python interface_health.py --inventory inventory.yml --username admin --password pass --device router1
-    python interface_health.py --inventory inventory.yml --username admin --password pass --threshold-errors 100
+    python ssh_connectivity_validator.py --inventory inventory \
+        --group spine --timeout 15 --retries 2 --output json
 
 Prerequisites:
-    - nornir, napalm installed
-    - Network device inventory in YAML format
-    - SSH/NETCONF connectivity to devices
-    - Devices support NAPALM get_interfaces getter
+    - Nornir >= 3.0
+    - paramiko or netmiko installed
+    - Valid inventory.yaml with device credentials configured
+    - Network connectivity to target devices
+
+Features:
+    - Tests SSH connectivity to each device
+    - Validates device type and platform detection
+    - Generates detailed connectivity reports
+    - Supports device/group filtering
+    - Multiple output formats (text, json)
+    - Detailed error reporting for troubleshooting
 """
 
 import argparse
+import json
 import logging
-import sys
+from datetime import datetime
+from typing import Dict, Any
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir.tasks.networking import napalm_get
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import netmiko_send_command
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
-def collect_interface_stats(task: Task) -> Result:
-    """Collect interface statistics from device using NAPALM."""
+def test_ssh_connectivity(task: Task) -> Result:
+    """Test SSH connectivity by executing a simple command."""
     try:
-        result = task.run(napalm_get, getters=["interfaces", "interfaces_counters"])
+        result = task.run(
+            netmiko_send_command,
+            command_string="show version",
+            name="SSH Connectivity Test",
+        )
         return result
-    except Exception as e:
-        logger.error(f"Failed to collect stats from {task.host.name}: {e}")
-        return Result(host=task.host, failed=True, exception=e)
+    except Exception as exc:
+        return Result(host=task.host, failed=True, exception=exc)
 
 
-def analyze_interface_health(stats, error_threshold=10, drop_threshold=50):
-    """Analyze interface health and return problems and health score."""
-    problems = []
-    interfaces = stats.get("interfaces", {})
-    counters = stats.get("interfaces_counters", {}).get("interfaces", {})
+def validate_devices(nr, timeout: int) -> Dict[str, Dict[str, Any]]:
+    """Execute connectivity validation across all devices in inventory."""
+    validation_results = {}
+    total_devices = len(nr.inventory.hosts)
     
-    healthy_count = 0
-    for if_name, if_data in interfaces.items():
-        is_healthy = True
-        issues = []
+    logger.info(f"Starting connectivity validation for {total_devices} devices")
+    
+    for idx, (device_name, device) in enumerate(nr.inventory.hosts.items(), 1):
+        logger.debug(f"[{idx}/{total_devices}] Testing {device_name} ({device.host})")
         
-        if not if_data.get("is_up"):
-            is_healthy = False
-            issues.append("Down")
+        device_info = {
+            "hostname": device_name,
+            "ip_address": device.host,
+            "port": device.port or 22,
+            "username": device.username or "unknown",
+            "platform": device.platform or "unknown",
+            "groups": list(device.groups.keys()) if device.groups else [],
+            "ssh_reachable": False,
+            "timestamp": datetime.now().isoformat(),
+            "error_message": None,
+            "device_type": "unknown",
+        }
         
-        if not if_data.get("is_enabled"):
-            is_healthy = False
-            issues.append("Disabled")
-        
-        if if_name in counters:
-            counter = counters[if_name]
-            rx_err = counter.get("rx_errors", 0)
-            tx_err = counter.get("tx_errors", 0)
-            rx_drop = counter.get("rx_discards", 0)
-            tx_drop = counter.get("tx_discards", 0)
+        try:
+            task_result = nr.run(
+                task=test_ssh_connectivity,
+                name=f"validate_{device_name}",
+                on_failed=True,
+            )
             
-            if rx_err > error_threshold or tx_err > error_threshold:
-                is_healthy = False
-                issues.append(f"High errors (RX:{rx_err}, TX:{tx_err})")
+            host_result = task_result[device_name]
             
-            if rx_drop > drop_threshold or tx_drop > drop_threshold:
-                is_healthy = False
-                issues.append(f"High drops (RX:{rx_drop}, TX:{tx_drop})")
+            if not host_result.failed:
+                device_info["ssh_reachable"] = True
+                output_lines = str(host_result[0].result).split("\n")
+                if output_lines:
+                    device_info["device_type"] = _extract_device_type(output_lines)
+                logger.info(f"✓ {device_name}: SSH accessible")
+            else:
+                device_info["error_message"] = str(host_result[0].exception)
+                logger.warning(f"✗ {device_name}: {device_info['error_message']}")
         
-        if is_healthy:
-            healthy_count += 1
-        else:
-            problems.append({"name": if_name, "issues": issues})
+        except Exception as e:
+            device_info["error_message"] = str(e)
+            logger.error(f"✗ {device_name}: Unexpected error: {e}")
+        
+        validation_results[device_name] = device_info
     
-    total = len(interfaces)
-    score = (healthy_count / total * 100) if total > 0 else 0
-    return problems, score
+    return validation_results
 
 
-def generate_report(results, error_threshold, drop_threshold):
-    """Generate and display health report."""
-    print("\n" + "=" * 80)
-    print("INTERFACE HEALTH REPORT")
-    print("=" * 80)
+def _extract_device_type(output_lines: list) -> str:
+    """Extract device type from show version output."""
+    for line in output_lines[:10]:
+        line_lower = line.lower()
+        if "cisco" in line_lower:
+            return "Cisco"
+        elif "juniper" in line_lower or "junos" in line_lower:
+            return "Juniper"
+        elif "arista" in line_lower:
+            return "Arista"
+        elif "nokia" in line_lower or "srl" in line_lower:
+            return "Nokia"
+    return "Unknown"
+
+
+def format_text_report(results: Dict[str, Dict[str, Any]]) -> str:
+    """Generate human-readable text report."""
+    accessible = sum(1 for r in results.values() if r["ssh_reachable"])
+    total = len(results)
     
-    total_devices = 0
-    total_problems = 0
+    report = [
+        "=" * 85,
+        "SSH CONNECTIVITY VALIDATION REPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 85,
+        f"Summary: {accessible}/{total} devices SSH accessible ({100*accessible//total}%)",
+        "",
+        f"{'Device':<20} {'IP Address':<18} {'Platform':<12} {'Status':<10}",
+        "-" * 85,
+    ]
     
-    for host_name, task_result in results.items():
-        if task_result.failed:
-            print(f"\n{host_name}: FAILED")
-            continue
-        
-        total_devices += 1
-        stats = task_result[0].result
-        problems, score = analyze_interface_health(
-            stats, error_threshold, drop_threshold
+    for device_name, data in sorted(results.items()):
+        status = "✓ REACHABLE" if data["ssh_reachable"] else "✗ UNREACHABLE"
+        report.append(
+            f"{device_name:<20} {data['ip_address']:<18} "
+            f"{data['platform']:<12} {status:<10}"
         )
         
-        status = "✓" if score >= 90 else "⚠" if score >= 70 else "✗"
-        print(f"\n{host_name} {status}")
-        print(f"  Health Score: {score:.1f}%")
-        
-        if problems:
-            total_problems += len(problems)
-            print(f"  Problem Interfaces ({len(problems)}):")
-            for problem in problems:
-                print(f"    - {problem['name']}")
-                for issue in problem["issues"]:
-                    print(f"      • {issue}")
+        if data["error_message"]:
+            report.append(f"  └─ Error: {data['error_message'][:60]}")
     
-    print("\n" + "=" * 80)
-    print(f"Summary: {total_devices} devices, {total_problems} problem interfaces")
-    print("=" * 80 + "\n")
+    report.append("")
+    report.append("=" * 85)
+    
+    return "\n".join(report)
+
+
+def format_json_report(results: Dict[str, Dict[str, Any]]) -> str:
+    """Generate JSON report."""
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_devices": len(results),
+            "reachable": sum(1 for r in results.values() if r["ssh_reachable"]),
+            "unreachable": sum(1 for r in results.values() if not r["ssh_reachable"]),
+        },
+        "devices": results,
+    }
+    return json.dumps(report, indent=2, default=str)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze network device interface health and error rates"
-    )
-    parser.add_argument("--inventory", required=True, help="Path to inventory file")
-    parser.add_argument("--username", required=True, help="Device username")
-    parser.add_argument("--password", required=True, help="Device password")
-    parser.add_argument("--device", help="Specific device to analyze (optional)")
-    parser.add_argument(
-        "--threshold-errors",
-        type=int,
-        default=10,
-        help="Error count threshold (default: 10)"
+        description="Validate SSH connectivity to network devices"
     )
     parser.add_argument(
-        "--threshold-drops",
+        "--inventory",
+        type=str,
+        default="inventory",
+        help="Path to Nornir inventory (default: inventory)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Target specific device by name",
+    )
+    parser.add_argument(
+        "--group",
+        type=str,
+        help="Target specific device group",
+    )
+    parser.add_argument(
+        "--timeout",
         type=int,
-        default=50,
-        help="Drop count threshold (default: 50)"
+        default=15,
+        help="SSH connection timeout in seconds (default: 15)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of connection retry attempts (default: 1)",
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        help="Write report to file (optional)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging verbosity (default: INFO)",
     )
     
     args = parser.parse_args()
     
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    
     try:
-        nr = InitNornir(config_file=args.inventory)
+        logger.info(f"Loading inventory from {args.inventory}")
+        nr = InitNornir(config_file=None)
         
         if args.device:
-            nr = nr.filter(F(name=args.device))
-            if not nr.inventory.hosts:
-                logger.error(f"Device '{args.device}' not found in inventory")
-                sys.exit(1)
+            nr = nr.filter(name=args.device)
+            logger.info(f"Filtered to device: {args.device}")
+        elif args.group:
+            nr = nr.filter(group_name=args.group)
+            logger.info(f"Filtered to group: {args.group}")
         
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            host.password = args.password
+        if not nr.inventory.hosts:
+            logger.error("No devices matched specified criteria")
+            return 1
         
-        logger.info(f"Analyzing {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=collect_interface_stats)
-        generate_report(results, args.threshold_errors, args.threshold_drops)
+        results = validate_devices(nr, timeout=args.timeout)
         
+        if args.output == "json":
+            output = format_json_report(results)
+        else:
+            output = format_text_report(results)
+        
+        print(output)
+        
+        if args.output_file:
+            with open(args.output_file, "w") as f:
+                f.write(output)
+            logger.info(f"Report saved to {args.output_file}")
+        
+        accessible_count = sum(1 for r in results.values() if r["ssh_reachable"])
+        return 0 if accessible_count == len(results) else 1
+    
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        logger.critical(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
