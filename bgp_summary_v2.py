@@ -1,234 +1,215 @@
-Now I have a clear picture. `bgp_summary.py` is a NAPALM tabular display; `bgp_summary_v2.py` is actually DNS/NTP. The gap is a **prefix-limit utilization monitor** — checks received prefixes against configured max-prefix thresholds and alerts before sessions drop. That's operationally critical and distinct from what's there.
-
 ```python
 """
-BGP Prefix-Limit Utilization Monitor
+bgp_route_analysis.py — BGP Routing Table AS-Path Analyzer
 
-Purpose:
-    Collect BGP neighbor state and compare received-prefix counts against
-    configured max-prefix limits on each session.  Sessions approaching or
-    exceeding their limit will drop silently on many platforms, causing
-    hard-to-diagnose outages.  This script surfaces utilization as a
-    percentage and groups neighbors into CRITICAL / WARNING / OK tiers so
-    NOC engineers can act before the limit is hit.
+Connects to one or more routers via Nornir + Netmiko, retrieves the full BGP
+routing table, and analyzes AS-path attributes to surface routing health issues:
+
+  • AS-path loops: same ASN repeated in a path (indicates misconfiguration)
+  • Private ASN leaks: ASNs in 64512-65534 or 4200000000-4294967294 ranges
+  • Excessive path length: routes exceeding a configurable hop threshold
+  • Per-device AS-path length distribution summary
+
+Complements bgp_summary.py (session health) and bgp_summary_v2.py
+(prefix-limit utilization) by analyzing the quality of learned routes,
+not the session state or capacity.
 
 Usage:
-    python bgp_prefix_limits.py --hosts inventory/hosts.yaml \
-        --groups inventory/groups.yaml --defaults inventory/defaults.yaml
-    python bgp_prefix_limits.py --filter role=edge --warn 75 --crit 90
-    python bgp_prefix_limits.py --filter site=nyc --json
+    Single device:
+        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret
+
+    Inventory file:
+        python bgp_route_analysis.py --inventory hosts.yaml -u admin -p secret
+
+    Custom thresholds:
+        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret \\
+            --max-path-len 6 --no-private-asn
+
+    Write CSV of all routes:
+        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret \\
+            --csv routes.csv
 
 Prerequisites:
-    pip install nornir nornir-netmiko netmiko
-
-    Inventory defaults.yaml must contain username, password, and platform
-    (cisco_ios, cisco_xe, cisco_xr, cisco_nxos, or junos).
-
-    Cisco: "show bgp neighbors" is parsed for MaxPfxWarn / Max prefix.
-    Junos: "show bgp neighbor" is parsed for prefix-limit fields.
+    pip install nornir nornir-netmiko nornir-utils
+    Cisco IOS / IOS-XE default; set --platform for other netmiko device types.
 """
 
 import argparse
-import json
+import csv
 import logging
 import re
 import sys
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional, TextIO
 
 from nornir import InitNornir
-from nornir.core.filter import F
+from nornir.core.inventory import ConnectionOptions, Defaults, Groups, Host, Hosts
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
 logger = logging.getLogger(__name__)
 
+PRIVATE_ASN_RANGES = [(64512, 65534), (4200000000, 4294967294)]
+
+# Matches best/valid-path lines from "show ip bgp":
+# >  10.0.0.0/24   192.0.2.1   0  0  0  65001 65002 i
+_ROUTE_RE = re.compile(
+    r"^[*si ]{0,2}[>]\s+(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+)\s+\S+\s+"
+    r"(?:\d+\s+){3}(?P<aspath>[\d ]*)[ie?]",
+    re.MULTILINE,
+)
+
 
 @dataclass
-class PeerLimitData:
-    host: str
-    peer: str
-    vrf: str = "default"
-    remote_as: int = 0
-    state: str = "unknown"
-    received_prefixes: int = 0
-    max_prefix_limit: Optional[int] = None
-    utilization_pct: Optional[float] = None
-    severity: str = "UNKNOWN"
-    raw_error: str = ""
+class RouteEntry:
+    device: str
+    prefix: str
+    as_path: List[int]
+
+    @property
+    def path_len(self) -> int:
+        return len(self.as_path)
+
+    @property
+    def has_loop(self) -> bool:
+        return len(self.as_path) != len(set(self.as_path))
+
+    @property
+    def private_asns(self) -> List[int]:
+        found = []
+        for asn in self.as_path:
+            for lo, hi in PRIVATE_ASN_RANGES:
+                if lo <= asn <= hi:
+                    found.append(asn)
+                    break
+        return found
 
 
-def _parse_cisco_neighbors(output: str, hostname: str) -> list[PeerLimitData]:
-    peers: list[PeerLimitData] = []
-    current: dict = {}
+def collect_bgp_routes(task: Task) -> Result:
+    raw = task.run(
+        task=netmiko_send_command,
+        command_string="show ip bgp",
+        name="show_ip_bgp",
+    ).result
 
-    for line in output.splitlines():
-        m = re.match(r"^BGP neighbor is (\S+),\s+remote AS (\d+)", line)
-        if m:
-            if current:
-                peers.append(_build_cisco_peer(current, hostname))
-            current = {"peer": m.group(1), "remote_as": int(m.group(2)),
-                       "state": "unknown", "rcv": 0, "max": None, "vrf": "default"}
-            continue
+    routes: List[RouteEntry] = []
+    for m in _ROUTE_RE.finditer(raw):
+        path_str = m.group("aspath").strip()
+        as_path = [int(a) for a in path_str.split()] if path_str else []
+        routes.append(RouteEntry(
+            device=task.host.name,
+            prefix=m.group("prefix"),
+            as_path=as_path,
+        ))
 
-        if not current:
-            continue
-
-        m = re.search(r"BGP state = (\w+)", line)
-        if m:
-            current["state"] = m.group(1)
-
-        m = re.search(r"Prefixes Current:\s+(\d+)", line, re.IGNORECASE)
-        if m:
-            current["rcv"] = int(m.group(1))
-
-        m = re.search(r"Maximum prefixes:\s+(\d+)", line, re.IGNORECASE)
-        if m:
-            current["max"] = int(m.group(1))
-
-        m = re.search(r"for address family:\s+\S+\s+in VRF\s+(\S+)", line)
-        if m:
-            current["vrf"] = m.group(1)
-
-    if current:
-        peers.append(_build_cisco_peer(current, hostname))
-
-    return peers
+    logger.info("%s: parsed %d best-path BGP routes", task.host, len(routes))
+    return Result(host=task.host, result=routes)
 
 
-def _build_cisco_peer(c: dict, hostname: str) -> PeerLimitData:
-    return PeerLimitData(
-        host=hostname,
-        peer=c["peer"],
-        vrf=c.get("vrf", "default"),
-        remote_as=c.get("remote_as", 0),
-        state=c.get("state", "unknown"),
-        received_prefixes=c.get("rcv", 0),
-        max_prefix_limit=c.get("max"),
+def print_report(
+    all_routes: List[RouteEntry],
+    max_path_len: int,
+    check_private: bool,
+    fh: TextIO,
+) -> int:
+    by_device: dict = {}
+    for r in all_routes:
+        by_device.setdefault(r.device, []).append(r)
+
+    fh.write("\n=== BGP AS-Path Analysis ===\n")
+    for device, routes in sorted(by_device.items()):
+        lengths = [r.path_len for r in routes]
+        avg = sum(lengths) / len(lengths) if lengths else 0
+        loops = sum(1 for r in routes if r.has_loop)
+        privates = sum(1 for r in routes if r.private_asns)
+        fh.write(
+            f"\n{device}: {len(routes)} routes | "
+            f"avg path {avg:.1f} | max path {max(lengths, default=0)} | "
+            f"{loops} loop(s) | {privates} private-ASN route(s)\n"
+        )
+
+    flagged = [
+        r for r in all_routes
+        if r.has_loop
+        or r.path_len > max_path_len
+        or (check_private and r.private_asns)
+    ]
+
+    if not flagged:
+        fh.write("\nNo flagged routes.\n")
+        return 0
+
+    col = "{:<20} {:<22} {:>7}  {}"
+    fh.write(f"\n{col.format('Device', 'Prefix', 'PathLen', 'Flags')}\n")
+    fh.write("-" * 68 + "\n")
+    for r in sorted(flagged, key=lambda x: (x.device, -x.path_len, x.prefix)):
+        flags = []
+        if r.has_loop:
+            flags.append("LOOP")
+        if r.path_len > max_path_len:
+            flags.append(f"LONG>{max_path_len}")
+        if check_private and r.private_asns:
+            flags.append(f"PRIVATE({','.join(str(a) for a in r.private_asns)})")
+        fh.write(col.format(r.device, r.prefix, r.path_len, " ".join(flags)) + "\n")
+
+    fh.write(f"\n{len(flagged)} flagged route(s).\n")
+    return len(flagged)
+
+
+def write_csv(routes: List[RouteEntry], path: str) -> None:
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["device", "prefix", "path_len", "has_loop", "private_asns", "as_path"])
+        for r in sorted(routes, key=lambda x: (x.device, x.prefix)):
+            w.writerow([
+                r.device, r.prefix, r.path_len, r.has_loop,
+                ";".join(str(a) for a in r.private_asns),
+                " ".join(str(a) for a in r.as_path),
+            ])
+    logger.info("CSV written to %s", path)
+
+
+def _build_single_host_nr(host: str, username: str, password: str, platform: str):
+    conn_opts = ConnectionOptions(extras={"device_type": platform})
+    hosts = Hosts({
+        host: Host(
+            name=host, hostname=host,
+            username=username, password=password,
+            connection_options={"netmiko": conn_opts},
+        )
+    })
+    return InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": 1}},
+        logging={"enabled": False},
+        inventory={"plugin": "SimpleInventory"},
+        _hosts=hosts, _groups=Groups(), _defaults=Defaults(),
     )
-
-
-def _parse_junos_neighbors(output: str, hostname: str) -> list[PeerLimitData]:
-    peers: list[PeerLimitData] = []
-    current: dict = {}
-
-    for line in output.splitlines():
-        m = re.match(r"^Peer:\s+(\S+)\s+AS\s+(\d+)", line)
-        if m:
-            if current:
-                peers.append(_build_junos_peer(current, hostname))
-            current = {"peer": m.group(1), "remote_as": int(m.group(2)),
-                       "state": "unknown", "rcv": 0, "max": None, "vrf": "master"}
-
-        if not current:
-            continue
-
-        m = re.search(r"Type:\s+\S+\s+State:\s+(\w+)", line)
-        if m:
-            current["state"] = m.group(1)
-
-        m = re.search(r"Received\s+prefixes\s+(\d+)", line)
-        if m:
-            current["rcv"] = int(m.group(1))
-
-        m = re.search(r"Prefix limit:\s+(\d+)", line)
-        if m:
-            current["max"] = int(m.group(1))
-
-    if current:
-        peers.append(_build_junos_peer(current, hostname))
-
-    return peers
-
-
-def _build_junos_peer(c: dict, hostname: str) -> PeerLimitData:
-    return PeerLimitData(
-        host=hostname,
-        peer=c["peer"],
-        vrf=c.get("vrf", "master"),
-        remote_as=c.get("remote_as", 0),
-        state=c.get("state", "unknown"),
-        received_prefixes=c.get("rcv", 0),
-        max_prefix_limit=c.get("max"),
-    )
-
-
-def collect_prefix_limits(task: Task) -> Result:
-    platform = task.host.get("platform", "")
-    hostname = task.host.name
-
-    if "junos" in platform:
-        cmd = "show bgp neighbor"
-    else:
-        cmd = "show bgp all neighbors"
-
-    result = task.run(task=netmiko_send_command, command_string=cmd)
-    output = result[0].result
-
-    if "junos" in platform:
-        peers = _parse_junos_neighbors(output, hostname)
-    else:
-        peers = _parse_cisco_neighbors(output, hostname)
-
-    return Result(host=task.host, result=peers)
-
-
-def classify(peers: list[PeerLimitData], warn_pct: float, crit_pct: float) -> list[PeerLimitData]:
-    for p in peers:
-        if p.max_prefix_limit and p.max_prefix_limit > 0:
-            p.utilization_pct = round(p.received_prefixes / p.max_prefix_limit * 100, 1)
-            if p.utilization_pct >= crit_pct:
-                p.severity = "CRITICAL"
-            elif p.utilization_pct >= warn_pct:
-                p.severity = "WARNING"
-            else:
-                p.severity = "OK"
-        else:
-            p.severity = "NO-LIMIT"
-    return peers
-
-
-def render_table(peers: list[PeerLimitData]) -> None:
-    order = {"CRITICAL": 0, "WARNING": 1, "NO-LIMIT": 2, "OK": 3, "UNKNOWN": 4}
-    sorted_peers = sorted(peers, key=lambda p: (order.get(p.severity, 9), p.host, p.peer))
-
-    header = f"{'HOST':<18} {'PEER':<18} {'AS':>7} {'STATE':<12} {'RCV':>8} {'LIMIT':>8} {'UTIL%':>7}  SEVERITY"
-    sep = "-" * len(header)
-    print(f"\n{sep}\nBGP PREFIX-LIMIT UTILIZATION REPORT\n{sep}")
-    print(header)
-    print(sep)
-
-    for p in sorted_peers:
-        util = f"{p.utilization_pct:>6.1f}%" if p.utilization_pct is not None else "   n/a "
-        limit = str(p.max_prefix_limit) if p.max_prefix_limit else "none"
-        tag = {"CRITICAL": "[CRIT]", "WARNING": "[WARN]", "OK": "[ OK ]"}.get(p.severity, f"[{p.severity[:4]:4}]")
-        print(f"{p.host:<18} {p.peer:<18} {p.remote_as:>7} {p.state:<12} "
-              f"{p.received_prefixes:>8} {limit:>8} {util}  {tag}")
-
-    counts = {k: sum(1 for p in peers if p.severity == k) for k in ("CRITICAL", "WARNING", "OK", "NO-LIMIT")}
-    print(sep)
-    print(f"Total: {len(peers)} peers  |  CRITICAL: {counts['CRITICAL']}  "
-          f"WARNING: {counts['WARNING']}  OK: {counts['OK']}  NO-LIMIT: {counts['NO-LIMIT']}")
-    print(sep + "\n")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="BGP prefix-limit utilization monitor — Nornir + Netmiko"
+        description="BGP routing table AS-path analyzer — loops, private ASNs, long paths"
     )
-    parser.add_argument("--hosts", default="inventory/hosts.yaml", metavar="FILE")
-    parser.add_argument("--groups", default="inventory/groups.yaml", metavar="FILE")
-    parser.add_argument("--defaults", default="inventory/defaults.yaml", metavar="FILE")
-    parser.add_argument("--filter", metavar="KEY=VAL[,KEY=VAL]",
-                        help="Nornir host filter (e.g. role=edge,site=nyc)")
-    parser.add_argument("--warn", type=float, default=75.0, metavar="PCT",
-                        help="Warning threshold %% (default: 75)")
-    parser.add_argument("--crit", type=float, default=90.0, metavar="PCT",
-                        help="Critical threshold %% (default: 90)")
-    parser.add_argument("--workers", type=int, default=10, metavar="N")
-    parser.add_argument("--json", action="store_true", help="Emit JSON instead of table")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--host", help="Single device hostname or IP")
+    src.add_argument("--inventory", metavar="FILE", help="Nornir SimpleInventory hosts.yaml")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "--platform", default="cisco_ios", metavar="TYPE",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument(
+        "--max-path-len", type=int, default=8, metavar="N",
+        help="Flag routes with AS-path longer than N hops (default: 8)",
+    )
+    parser.add_argument(
+        "--no-private-asn", action="store_true",
+        help="Disable private ASN leak detection",
+    )
+    parser.add_argument("--csv", metavar="FILE", help="Write full route table to CSV")
+    parser.add_argument("--output", metavar="FILE", help="Write report to file (default: stdout)")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -236,63 +217,42 @@ def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    for f in (args.hosts, args.groups, args.defaults):
-        if not Path(f).exists():
-            print(f"ERROR: inventory file not found: {f}", file=sys.stderr)
-            return 2
-
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.hosts,
-                "group_file": args.groups,
-                "defaults_file": args.defaults,
-            },
-        },
-        logging={"enabled": False},
-    )
-
-    if args.filter:
-        f_kwargs = {}
-        for token in args.filter.split(","):
-            k, _, v = token.partition("=")
-            if k.strip() and v.strip():
-                f_kwargs[k.strip()] = v.strip()
-        nr = nr.filter(F(**f_kwargs))
-
-    if not nr.inventory.hosts:
-        print("No hosts matched — check inventory and --filter.", file=sys.stderr)
-        return 2
-
-    results = nr.run(task=collect_prefix_limits)
-
-    all_peers: list[PeerLimitData] = []
-    failed: list[tuple[str, str]] = []
-
-    for host, multi in results.items():
-        if multi.failed:
-            failed.append((host, str(multi.exception)))
-            logger.error("Failed on %s: %s", host, multi.exception)
-        else:
-            all_peers.extend(multi[0].result)
-
-    classify(all_peers, args.warn, args.crit)
-
-    if args.json:
-        print(json.dumps([asdict(p) for p in all_peers], indent=2))
+    if args.host:
+        nr = _build_single_host_nr(args.host, args.username, args.password, args.platform)
     else:
-        if all_peers:
-            render_table(all_peers)
+        nr = InitNornir(
+            config_file=args.inventory,
+            runner={"plugin": "threaded", "options": {"num_workers": 10}},
+            logging={"enabled": False},
+        )
+        nr.inventory.defaults.username = args.username
+        nr.inventory.defaults.password = args.password
+
+    agg_results = nr.run(task=collect_bgp_routes, name="bgp_route_analysis")
+
+    all_routes: List[RouteEntry] = []
+    for host_name, multi in agg_results.items():
+        if multi.failed:
+            print(f"ERROR  {host_name}: {multi[0].exception}", file=sys.stderr)
         else:
-            print("No BGP prefix-limit data returned.", file=sys.stderr)
+            all_routes.extend(multi[0].result)
 
-    for host, err in failed:
-        print(f"ERROR  {host}: {err}", file=sys.stderr)
+    if not all_routes:
+        print("No routes collected.", file=sys.stderr)
+        return 1
 
-    has_critical = any(p.severity == "CRITICAL" for p in all_peers)
-    return 2 if failed else (1 if has_critical else 0)
+    if args.csv:
+        write_csv(all_routes, args.csv)
+
+    fh: Optional[TextIO] = None
+    try:
+        fh = open(args.output, "w") if args.output else sys.stdout
+        flagged = print_report(all_routes, args.max_path_len, not args.no_private_asn, fh)
+    finally:
+        if fh and args.output:
+            fh.close()
+
+    return 1 if flagged else 0
 
 
 if __name__ == "__main__":
