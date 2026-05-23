@@ -1,259 +1,165 @@
 ```python
+#!/usr/bin/env python3
 """
-DNS and NTP Synchronization Validator
-
-Validates DNS resolution and NTP synchronization status across network devices,
-identifying devices with time drift, DNS failures, or synchronization issues.
+LLDP Neighbor Discovery and Network Topology Report
 
 Purpose:
-  - Verify DNS resolution on all devices
-  - Check NTP peer status and synchronization
-  - Detect time drift across the network
-  - Identify devices with invalid NTP configuration
-  - Generate compliance report
+    Discovers network topology by collecting and reporting LLDP (Link Layer
+    Discovery Protocol) neighbor information from network devices. Useful for
+    mapping physical network interconnections and validating cabling.
 
 Usage:
-  python dns_ntp_validator.py --inventory inventory/
-  python dns_ntp_validator.py --device router1 router2 --output report.json
-  python dns_ntp_validator.py --inventory inventory/ --ntp-threshold 100
+    python lldp_neighbors.py -i inventory -u admin -p password
+    python lldp_neighbors.py -i inventory -u admin -p password --format json
+    python lldp_neighbors.py -i inventory -u admin -p password --filter site:west
 
 Prerequisites:
-  - Nornir with netmiko plugin
-  - SSH access to devices
-  - Devices must support 'show ntp status' and 'show ip dns'
+    - Nornir and NAPALM installed: pip install nornir napalm
+    - Devices must have LLDP enabled and configured
+    - Valid SSH/Netconf credentials required for device access
+    - Supported platforms: Cisco IOS/XE/XR, Juniper, Arista, and other NAPALM drivers
 """
 
 import argparse
 import json
 import logging
-from datetime import datetime
+import sys
+from typing import Any, Dict
+
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.tasks.networking import netmiko_send_command
+from nornir.core.filter import F
+from nornir.plugins.tasks.napalm import napalm_get
 
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbose=False):
-    """Configure logging output."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-
-def validate_dns(task: Task) -> Result:
-    """Test DNS resolution on device."""
-    dns_result = {'device': task.host.name, 'dns_working': False, 'servers': []}
-    
+def collect_lldp_neighbors(task) -> Dict[str, Any]:
+    """Gather LLDP neighbor data from device using NAPALM."""
     try:
-        output = task.run(netmiko_send_command, command_string='show ip dns')
-        dns_result['raw_output'] = output[0].result
-        dns_result['dns_working'] = parse_dns_servers(output[0].result, dns_result)
+        result = task.run(napalm_get, getters=["lldp_neighbors"])
+        neighbors = result[0].result.get("lldp_neighbors", {})
+        logger.debug(f"{task.host.name}: collected {len(neighbors)} interfaces with neighbors")
+        return {"status": "success", "data": neighbors}
     except Exception as e:
-        logger.warning(f"{task.host.name}: DNS check failed - {e}")
-        dns_result['error'] = str(e)
+        logger.error(f"{task.host.name}: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+def print_text_report(results: Dict) -> None:
+    """Print human-readable topology report."""
+    print("\n" + "=" * 70)
+    print("LLDP Network Topology Report".center(70))
+    print("=" * 70)
     
-    return Result(host=task.host, result=dns_result)
-
-
-def validate_ntp(task: Task, threshold_ms=100) -> Result:
-    """Check NTP synchronization status."""
-    ntp_result = {
-        'device': task.host.name,
-        'synchronized': False,
-        'peers': [],
-        'stratum': None,
-        'offset_ms': None
-    }
-    
-    try:
-        output = task.run(netmiko_send_command, command_string='show ntp status')
-        parse_ntp_status(output[0].result, ntp_result, threshold_ms)
-    except Exception as e:
-        logger.warning(f"{task.host.name}: NTP check failed - {e}")
-        ntp_result['error'] = str(e)
-    
-    return Result(host=task.host, result=ntp_result)
-
-
-def parse_dns_servers(output, dns_result):
-    """Extract DNS servers from output."""
-    try:
-        for line in output.split('\n'):
-            if 'server' in line.lower() or 'nameserver' in line.lower():
-                parts = line.split()
-                if len(parts) >= 2 and '.' in parts[-1]:
-                    dns_result['servers'].append(parts[-1])
-        return len(dns_result['servers']) > 0
-    except:
-        return False
-
-
-def parse_ntp_status(output, ntp_result, threshold_ms):
-    """Extract NTP status from output."""
-    try:
-        lines = output.split('\n')
+    for host_name in sorted(results.keys()):
+        host_result = results[host_name][0]
         
-        for line in lines:
-            lower = line.lower()
-            
-            if 'synchronized' in lower or 'sync' in lower:
-                ntp_result['synchronized'] = 'yes' in lower or 'true' in lower
-            
-            if 'stratum' in lower:
-                parts = line.split(':')
-                if len(parts) > 1:
-                    ntp_result['stratum'] = parts[1].strip().split()[0]
-            
-            if 'offset' in lower:
-                parts = line.split(':')
-                if len(parts) > 1:
-                    try:
-                        offset = float(parts[1].split()[0].rstrip('ms'))
-                        ntp_result['offset_ms'] = offset
-                        if abs(offset) > threshold_ms:
-                            ntp_result['time_drift'] = True
-                    except:
-                        pass
-            
-            if 'reference' in lower or 'peer' in lower:
-                if len(line.split()) > 1:
-                    ntp_result['peers'].append(line.strip())
-    
-    except Exception as e:
-        logger.debug(f"NTP parsing error: {e}")
-
-
-def check_device(task: Task, ntp_threshold=100):
-    """Run all validation checks on device."""
-    dns_check = task.run(validate_dns)
-    ntp_check = task.run(validate_ntp, threshold_ms=ntp_threshold)
-    
-    return Result(
-        host=task.host,
-        result={
-            'device': task.host.name,
-            'dns': dns_check[0].result,
-            'ntp': ntp_check[0].result
-        }
-    )
-
-
-def generate_report(results, output_file=None):
-    """Compile and output validation report."""
-    report = {
-        'timestamp': datetime.now().isoformat(),
-        'total_devices': len(results),
-        'dns_compliant': 0,
-        'ntp_compliant': 0,
-        'devices': []
-    }
-    
-    for device_name, multi_result in results.items():
-        if not multi_result:
+        if not host_result.result or host_result.result["status"] != "success":
+            error = host_result.result.get("error", "Unknown error")
+            print(f"\n{host_name}: FAILED - {error}")
             continue
         
-        device_data = multi_result[0].result
-        report['devices'].append(device_data)
+        neighbors = host_result.result.get("data", {})
+        if not neighbors:
+            print(f"\n{host_name}: No LLDP neighbors discovered")
+            continue
         
-        if device_data['dns']['dns_working']:
-            report['dns_compliant'] += 1
-        if device_data['ntp']['synchronized']:
-            report['ntp_compliant'] += 1
+        print(f"\n{host_name}:")
+        for local_int in sorted(neighbors.keys()):
+            print(f"  {local_int}:")
+            for neighbor in neighbors[local_int]:
+                remote_device = neighbor.get("hostname", "Unknown")
+                remote_int = neighbor.get("port", "Unknown")
+                print(f"    → {remote_device} ({remote_int})")
     
-    if output_file:
-        with open(output_file, 'w') as f:
-            json.dump(report, f, indent=2)
-        logger.info(f"Report saved to {output_file}")
-    else:
-        print_report(report)
-    
-    return report
+    print("\n" + "=" * 70 + "\n")
 
 
-def print_report(report):
-    """Print formatted validation report."""
-    print("\n" + "="*80)
-    print("DNS AND NTP SYNCHRONIZATION VALIDATION REPORT")
-    print("="*80)
-    print(f"Timestamp: {report['timestamp']}")
-    print(f"Total Devices: {report['total_devices']}")
-    print(f"DNS Compliant: {report['dns_compliant']}/{report['total_devices']}")
-    print(f"NTP Synchronized: {report['ntp_compliant']}/{report['total_devices']}\n")
-    
-    for device in report['devices']:
-        print(f"Device: {device['device']}")
-        
-        dns = device['dns']
-        dns_status = "✓" if dns['dns_working'] else "✗"
-        print(f"  DNS {dns_status}: {len(dns.get('servers', []))} servers configured")
-        
-        ntp = device['ntp']
-        ntp_status = "✓" if ntp['synchronized'] else "✗"
-        offset = ntp.get('offset_ms', 'N/A')
-        print(f"  NTP {ntp_status}: Stratum {ntp.get('stratum', '?')}, Offset {offset}ms")
-        print()
+def print_json_report(results: Dict) -> None:
+    """Print JSON-formatted topology data."""
+    output = {}
+    for host_name in sorted(results.keys()):
+        host_result = results[host_name][0]
+        output[host_name] = host_result.result
+    print(json.dumps(output, indent=2))
 
 
-def main():
-    """Main execution."""
+def main() -> int:
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Validate DNS and NTP on network devices'
+        description="Discover network topology using LLDP",
+        epilog="Example: %(prog)s -i inv -u admin -p secret --format json"
     )
     parser.add_argument(
-        '--inventory',
-        default='inventory/',
-        help='Nornir inventory path'
+        "-i", "--inventory",
+        default="inventory",
+        help="Nornir inventory location (default: inventory)"
     )
     parser.add_argument(
-        '--device',
-        action='append',
-        dest='devices',
-        help='Target specific device(s)'
+        "-u", "--username",
+        required=True,
+        help="Device username for authentication"
     )
     parser.add_argument(
-        '--output',
-        help='JSON output file path'
+        "-p", "--password",
+        required=True,
+        help="Device password for authentication"
     )
     parser.add_argument(
-        '--ntp-threshold',
-        type=int,
-        default=100,
-        help='NTP offset threshold in milliseconds'
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
     )
     parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Verbose logging'
+        "--filter",
+        help="Filter devices using Nornir filter (e.g., site:us)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
     )
     
     args = parser.parse_args()
-    setup_logging(args.verbose)
+    
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s"
+    )
     
     try:
-        logger.info("Initializing Nornir...")
-        nr = InitNornir(config_file=f"{args.inventory}config.yaml")
+        logger.info("Initializing Nornir inventory")
+        nr = InitNornir(config_file="config.yaml")
         
-        if args.devices:
-            nr = nr.filter(name__in=args.devices)
+        nr.inventory.defaults.username = args.username
+        nr.inventory.defaults.password = args.password
         
-        logger.info(f"Validating {len(nr.inventory.hosts)} devices...")
-        results = nr.run(
-            task=check_device,
-            ntp_threshold=args.ntp_threshold
-        )
+        if args.filter:
+            logger.info(f"Applying filter: {args.filter}")
+            nr = nr.filter(F(args.filter))
         
-        generate_report(results, args.output)
-        logger.info("Validation complete")
+        if not nr.inventory.hosts:
+            logger.error("No devices matched filter criteria")
+            return 1
         
+        logger.info(f"Starting LLDP discovery on {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=collect_lldp_neighbors)
+        
+        if args.format == "json":
+            print_json_report(results)
+        else:
+            print_text_report(results)
+        
+        logger.info("LLDP discovery completed successfully")
+        return 0
+    
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=args.verbose)
-        exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
