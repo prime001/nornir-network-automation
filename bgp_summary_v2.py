@@ -1,260 +1,275 @@
+I'll write the BGP origin validation script directly — distinct from the existing bgp_summary scripts which cover neighbor state/session summaries.
+
 ```python
 """
-bgp_route_analysis.py — BGP Routing Table AS-Path Analyzer
+BGP Route Origin Validator
 
-Connects to one or more routers via Nornir + Netmiko, retrieves the full BGP
-routing table, and analyzes AS-path attributes to surface routing health issues:
+Purpose:
+    Audit live BGP routing tables across network devices and validate that prefixes
+    are being received from their expected origin ASNs. Detects potential route
+    hijacks, misconfigurations, and unexpected path changes by comparing observed
+    BGP data against a declarative policy file.
 
-  • AS-path loops: same ASN repeated in a path (indicates misconfiguration)
-  • Private ASN leaks: ASNs in 64512-65534 or 4200000000-4294967294 ranges
-  • Excessive path length: routes exceeding a configurable hop threshold
-  • Per-device AS-path length distribution summary
-
-Complements bgp_summary.py (session health) and bgp_summary_v2.py
-(prefix-limit utilization) by analyzing the quality of learned routes,
-not the session state or capacity.
+    Unlike a BGP summary (which shows neighbor state and session counts), this tool
+    focuses on the data plane — what prefixes are actually installed and where they
+    claim to originate.
 
 Usage:
-    Single device:
-        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret
+    python bgp_origin_validator.py -i inventory.yaml -p policy.yaml
+    python bgp_origin_validator.py -i inventory.yaml -p policy.yaml --hosts r1,r2
+    python bgp_origin_validator.py -i inventory.yaml -p policy.yaml --json-out out.json
 
-    Inventory file:
-        python bgp_route_analysis.py --inventory hosts.yaml -u admin -p secret
-
-    Custom thresholds:
-        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret \\
-            --max-path-len 6 --no-private-asn
-
-    Write CSV of all routes:
-        python bgp_route_analysis.py --host 10.0.0.1 -u admin -p secret \\
-            --csv routes.csv
+Policy file format (YAML):
+    prefixes:
+      10.0.0.0/8: 65001
+      192.168.100.0/24: 65002
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    Cisco IOS / IOS-XE default; set --platform for other netmiko device types.
+    pip install nornir nornir-netmiko nornir-utils pyyaml
+    Nornir inventory files: hosts.yaml, groups.yaml, defaults.yaml
+    SSH access to IOS/IOS-XE devices
 """
 
 import argparse
-import csv
+import json
 import logging
-import re
 import sys
-from dataclasses import dataclass
-from typing import List, Optional, TextIO
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
 
+import yaml
 from nornir import InitNornir
-from nornir.core.inventory import ConnectionOptions, Defaults, Groups, Host, Hosts
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-logger = logging.getLogger(__name__)
-
-PRIVATE_ASN_RANGES = [(64512, 65534), (4200000000, 4294967294)]
-
-# Matches best/valid-path lines from "show ip bgp":
-# >  10.0.0.0/24   192.0.2.1   0  0  0  65001 65002 i
-_ROUTE_RE = re.compile(
-    r"^[*si ]{0,2}[>]\s+(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+)\s+\S+\s+"
-    r"(?:\d+\s+){3}(?P<aspath>[\d ]*)[ie?]",
-    re.MULTILINE,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class RouteEntry:
-    device: str
+class PrefixViolation:
     prefix: str
-    as_path: List[int]
+    expected_origin_asn: int
+    actual_origin_asn: int
+    as_path: str
 
-    @property
-    def path_len(self) -> int:
-        return len(self.as_path)
 
-    @property
-    def has_loop(self) -> bool:
-        return len(self.as_path) != len(set(self.as_path))
+@dataclass
+class HostResult:
+    host: str
+    prefixes_checked: int = 0
+    prefixes_missing: list = field(default_factory=list)
+    violations: list = field(default_factory=list)
+    error: Optional[str] = None
 
-    @property
-    def private_asns(self) -> List[int]:
-        found = []
-        for asn in self.as_path:
-            for lo, hi in PRIVATE_ASN_RANGES:
-                if lo <= asn <= hi:
-                    found.append(asn)
+
+def parse_bgp_table(raw: str) -> dict:
+    """
+    Parse 'show ip bgp' text into {prefix: {origin_asn, as_path}}.
+    Handles Cisco IOS/IOS-XE table format with status-code prefix lines.
+    """
+    routes = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("Network", "BGP", "Total")):
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 5:
+            continue
+
+        prefix = None
+        prefix_idx = None
+        for i, token in enumerate(parts):
+            if "/" in token and not token.startswith(("*", ">", "i", "s", "r", "S")):
+                prefix = token
+                prefix_idx = i
+                break
+
+        if prefix is None or prefix_idx is None:
+            continue
+
+        try:
+            # After prefix: next-hop, metric, locpref, weight, AS-path..., origin-code
+            tail = parts[prefix_idx + 1:]
+            # Skip next-hop, metric, locpref, weight (up to 4 numeric fields)
+            skip = 0
+            for t in tail[:4]:
+                try:
+                    int(t)
+                    skip += 1
+                except ValueError:
                     break
-        return found
+            path_tokens = tail[skip:]
+            origin_code = path_tokens[-1] if path_tokens else "?"
+            as_path_tokens = path_tokens[:-1] if len(path_tokens) > 1 else []
+            origin_asn = int(as_path_tokens[-1]) if as_path_tokens else 0
+            routes[prefix] = {
+                "origin_asn": origin_asn,
+                "as_path": " ".join(as_path_tokens),
+                "origin_code": origin_code,
+            }
+        except (ValueError, IndexError):
+            continue
+
+    return routes
 
 
-def collect_bgp_routes(task: Task) -> Result:
-    raw = task.run(
-        task=netmiko_send_command,
-        command_string="show ip bgp",
-        name="show_ip_bgp",
-    ).result
+def validate_origins(task: Task, policy: dict) -> Result:
+    """Nornir task: collect BGP table and check prefixes against policy."""
+    result = HostResult(host=task.host.name)
 
-    routes: List[RouteEntry] = []
-    for m in _ROUTE_RE.finditer(raw):
-        path_str = m.group("aspath").strip()
-        as_path = [int(a) for a in path_str.split()] if path_str else []
-        routes.append(RouteEntry(
-            device=task.host.name,
-            prefix=m.group("prefix"),
-            as_path=as_path,
-        ))
-
-    logger.info("%s: parsed %d best-path BGP routes", task.host, len(routes))
-    return Result(host=task.host, result=routes)
-
-
-def print_report(
-    all_routes: List[RouteEntry],
-    max_path_len: int,
-    check_private: bool,
-    fh: TextIO,
-) -> int:
-    by_device: dict = {}
-    for r in all_routes:
-        by_device.setdefault(r.device, []).append(r)
-
-    fh.write("\n=== BGP AS-Path Analysis ===\n")
-    for device, routes in sorted(by_device.items()):
-        lengths = [r.path_len for r in routes]
-        avg = sum(lengths) / len(lengths) if lengths else 0
-        loops = sum(1 for r in routes if r.has_loop)
-        privates = sum(1 for r in routes if r.private_asns)
-        fh.write(
-            f"\n{device}: {len(routes)} routes | "
-            f"avg path {avg:.1f} | max path {max(lengths, default=0)} | "
-            f"{loops} loop(s) | {privates} private-ASN route(s)\n"
+    try:
+        cmd_result = task.run(
+            task=netmiko_send_command,
+            command_string="show ip bgp",
+            use_textfsm=False,
         )
+        routes = parse_bgp_table(cmd_result.result)
+    except Exception as exc:
+        result.error = str(exc)
+        logger.error("%s: collection failed — %s", task.host.name, exc)
+        return Result(host=task.host, result=asdict(result))
 
-    flagged = [
-        r for r in all_routes
-        if r.has_loop
-        or r.path_len > max_path_len
-        or (check_private and r.private_asns)
-    ]
+    logger.debug("%s: parsed %d prefixes from BGP table", task.host.name, len(routes))
 
-    if not flagged:
-        fh.write("\nNo flagged routes.\n")
-        return 0
+    for prefix, expected_asn in policy.items():
+        result.prefixes_checked += 1
 
-    col = "{:<20} {:<22} {:>7}  {}"
-    fh.write(f"\n{col.format('Device', 'Prefix', 'PathLen', 'Flags')}\n")
-    fh.write("-" * 68 + "\n")
-    for r in sorted(flagged, key=lambda x: (x.device, -x.path_len, x.prefix)):
-        flags = []
-        if r.has_loop:
-            flags.append("LOOP")
-        if r.path_len > max_path_len:
-            flags.append(f"LONG>{max_path_len}")
-        if check_private and r.private_asns:
-            flags.append(f"PRIVATE({','.join(str(a) for a in r.private_asns)})")
-        fh.write(col.format(r.device, r.prefix, r.path_len, " ".join(flags)) + "\n")
+        if prefix not in routes:
+            result.prefixes_missing.append(prefix)
+            logger.warning("%s: expected prefix %s not in BGP table", task.host.name, prefix)
+            continue
 
-    fh.write(f"\n{len(flagged)} flagged route(s).\n")
-    return len(flagged)
+        actual_asn = routes[prefix]["origin_asn"]
+        if actual_asn != expected_asn:
+            v = PrefixViolation(
+                prefix=prefix,
+                expected_origin_asn=expected_asn,
+                actual_origin_asn=actual_asn,
+                as_path=routes[prefix]["as_path"],
+            )
+            result.violations.append(asdict(v))
+            logger.warning(
+                "%s: ORIGIN MISMATCH %s — expected AS%d got AS%d (path: %s)",
+                task.host.name, prefix, expected_asn, actual_asn, routes[prefix]["as_path"],
+            )
 
-
-def write_csv(routes: List[RouteEntry], path: str) -> None:
-    with open(path, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["device", "prefix", "path_len", "has_loop", "private_asns", "as_path"])
-        for r in sorted(routes, key=lambda x: (x.device, x.prefix)):
-            w.writerow([
-                r.device, r.prefix, r.path_len, r.has_loop,
-                ";".join(str(a) for a in r.private_asns),
-                " ".join(str(a) for a in r.as_path),
-            ])
-    logger.info("CSV written to %s", path)
+    return Result(host=task.host, result=asdict(result))
 
 
-def _build_single_host_nr(host: str, username: str, password: str, platform: str):
-    conn_opts = ConnectionOptions(extras={"device_type": platform})
-    hosts = Hosts({
-        host: Host(
-            name=host, hostname=host,
-            username=username, password=password,
-            connection_options={"netmiko": conn_opts},
+def load_policy(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        logger.error("Policy file not found: %s", path)
+        sys.exit(1)
+    with p.open() as fh:
+        data = yaml.safe_load(fh)
+    return data.get("prefixes", data)
+
+
+def print_summary(results: list) -> int:
+    total_violations = sum(len(r.get("violations", [])) for r in results)
+    total_missing = sum(len(r.get("prefixes_missing", [])) for r in results)
+    total_errors = sum(1 for r in results if r.get("error"))
+
+    print("\n" + "=" * 65)
+    print("BGP Route Origin Validation Results")
+    print("=" * 65)
+
+    for r in results:
+        if r.get("error"):
+            status = "ERROR"
+        elif r.get("violations") or r.get("prefixes_missing"):
+            status = "FAIL"
+        else:
+            status = "PASS"
+
+        print(
+            f"  {r['host']:<22} [{status:<5}]  "
+            f"checked={r['prefixes_checked']}  "
+            f"violations={len(r.get('violations', []))}  "
+            f"missing={len(r.get('prefixes_missing', []))}"
         )
-    })
-    return InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": 1}},
-        logging={"enabled": False},
-        inventory={"plugin": "SimpleInventory"},
-        _hosts=hosts, _groups=Groups(), _defaults=Defaults(),
+        if r.get("error"):
+            print(f"    ! {r['error']}")
+        for v in r.get("violations", []):
+            print(
+                f"    VIOLATION  {v['prefix']:<22} "
+                f"expected=AS{v['expected_origin_asn']}  "
+                f"actual=AS{v['actual_origin_asn']}  "
+                f"path=[{v['as_path']}]"
+            )
+        for prefix in r.get("prefixes_missing", []):
+            print(f"    MISSING    {prefix}")
+
+    print(
+        f"\nSummary: {len(results)} hosts | "
+        f"{total_violations} origin violations | "
+        f"{total_missing} missing prefixes | "
+        f"{total_errors} collection errors"
     )
+    return 1 if (total_violations or total_missing or total_errors) else 0
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(
-        description="BGP routing table AS-path analyzer — loops, private ASNs, long paths"
-    )
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--host", help="Single device hostname or IP")
-    src.add_argument("--inventory", metavar="FILE", help="Nornir SimpleInventory hosts.yaml")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument(
-        "--platform", default="cisco_ios", metavar="TYPE",
-        help="Netmiko device type (default: cisco_ios)",
+        description="Validate BGP route origins against a declarative ASN policy"
     )
     parser.add_argument(
-        "--max-path-len", type=int, default=8, metavar="N",
-        help="Flag routes with AS-path longer than N hops (default: 8)",
+        "-i", "--inventory", default="inventory.yaml",
+        help="Nornir config file pointing to hosts/groups/defaults YAML",
     )
     parser.add_argument(
-        "--no-private-asn", action="store_true",
-        help="Disable private ASN leak detection",
+        "-p", "--policy", required=True,
+        help="YAML policy file: {prefixes: {prefix: origin_asn}}",
     )
-    parser.add_argument("--csv", metavar="FILE", help="Write full route table to CSV")
-    parser.add_argument("--output", metavar="FILE", help="Write report to file (default: stdout)")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--hosts", metavar="H1,H2",
+        help="Comma-separated subset of inventory hosts to target",
+    )
+    parser.add_argument(
+        "--json-out", metavar="FILE",
+        help="Write full results as JSON to FILE",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.host:
-        nr = _build_single_host_nr(args.host, args.username, args.password, args.platform)
-    else:
-        nr = InitNornir(
-            config_file=args.inventory,
-            runner={"plugin": "threaded", "options": {"num_workers": 10}},
-            logging={"enabled": False},
-        )
-        nr.inventory.defaults.username = args.username
-        nr.inventory.defaults.password = args.password
+    policy = load_policy(args.policy)
+    if not policy:
+        logger.error("Policy file loaded but contains no prefix rules")
+        sys.exit(1)
+    logger.info("Loaded %d prefix rules from policy", len(policy))
 
-    agg_results = nr.run(task=collect_bgp_routes, name="bgp_route_analysis")
+    nr = InitNornir(config_file=args.inventory)
 
-    all_routes: List[RouteEntry] = []
-    for host_name, multi in agg_results.items():
-        if multi.failed:
-            print(f"ERROR  {host_name}: {multi[0].exception}", file=sys.stderr)
-        else:
-            all_routes.extend(multi[0].result)
+    if args.hosts:
+        target = {h.strip() for h in args.hosts.split(",")}
+        nr = nr.filter(lambda host: host.name in target)
 
-    if not all_routes:
-        print("No routes collected.", file=sys.stderr)
-        return 1
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched — check inventory or --hosts filter")
+        sys.exit(1)
 
-    if args.csv:
-        write_csv(all_routes, args.csv)
+    logger.info("Targeting %d host(s)", len(nr.inventory.hosts))
+    run_results = nr.run(task=validate_origins, policy=policy)
+    all_results = [r[0].result for r in run_results.values() if r]
 
-    fh: Optional[TextIO] = None
-    try:
-        fh = open(args.output, "w") if args.output else sys.stdout
-        flagged = print_report(all_routes, args.max_path_len, not args.no_private_asn, fh)
-    finally:
-        if fh and args.output:
-            fh.close()
+    if args.json_out:
+        out = Path(args.json_out)
+        out.write_text(json.dumps(all_results, indent=2))
+        logger.info("Results written to %s", out)
 
-    return 1 if flagged else 0
+    sys.exit(print_summary(all_results))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
