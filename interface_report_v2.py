@@ -1,234 +1,174 @@
 ```python
 """
-Interface Redundancy Checker - Nornir Network Automation Script
+Device Facts Report - Gathers and reports device facts across the network.
 
 Purpose:
-    Verify interface redundancy configurations including port-channels, LAGs,
-    and failover links. Identifies single points of failure and redundancy gaps
-    in network infrastructure.
-
-Usage:
-    python interface_redundancy_check.py --inventory hosts.yaml
-    python interface_redundancy_check.py --device "router1" --output json
-    python interface_redundancy_check.py --output-file report.json --verbose
+    Collects device facts (model, OS version, serial number, uptime) from
+    network devices and generates a formatted report. Useful for inventory
+    management, compliance auditing, and device tracking.
 
 Prerequisites:
-    - nornir with napalm or netmiko
-    - SSH access to network devices
-    - Inventory file with device definitions
-    - Credentials configured via environment or inventory
+    - nornir installed with netmiko/napalm plugins
+    - hosts.yaml and groups.yaml inventory files
+    - Network connectivity to target devices
+    - Device credentials configured in inventory
+
+Usage:
+    python device_facts_report.py
+    python device_facts_report.py --device router-01
+    python device_facts_report.py --group production --output csv
+    python device_facts_report.py --filter 'device_type=="eos"' --output json
 """
 
-import logging
 import argparse
 import json
+import logging
 import sys
-from typing import Dict, List
-from collections import defaultdict
+from datetime import datetime
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.plugins.tasks.networking import napalm_get
+from nornir.plugins.functions.text import print_result
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def check_redundancy(task):
-    """
-    Check interface redundancy status on device.
-    Analyzes port-channels, LAGs, and single points of failure.
-    """
+def gather_facts(task):
+    """Gather device facts using NAPALM."""
     try:
-        result = task.run(napalm_get, getters=["interfaces"])
-        interfaces = result[0].result.get("interfaces", {})
-        
-        status = {
-            "device": task.host.name,
-            "port_channels": [],
-            "eth_uplinks": [],
-            "single_points_of_failure": [],
-        }
-        
-        # Identify and check port-channels/LAGs
-        for iface_name, iface_data in interfaces.items():
-            name_lower = iface_name.lower()
-            
-            # Port-channel/LAG detection
-            if any(x in name_lower for x in ["port-channel", "lag", "po"]):
-                status["port_channels"].append({
-                    "name": iface_name,
-                    "is_up": iface_data.get("is_up", False),
-                    "mtu": iface_data.get("mtu"),
-                    "speed": iface_data.get("speed"),
-                })
-            
-            # Uplink detection
-            elif any(x in name_lower for x in ["uplink", "wan", "core"]):
-                status["eth_uplinks"].append({
-                    "name": iface_name,
-                    "is_up": iface_data.get("is_up", False),
-                    "speed": iface_data.get("speed"),
-                })
-        
-        # Flag single points of failure
-        if len(status["eth_uplinks"]) == 1:
-            status["single_points_of_failure"].append({
-                "type": "single_uplink",
-                "interface": status["eth_uplinks"][0]["name"],
-                "severity": "critical",
-                "recommendation": "Add redundant uplink",
-            })
-        
-        down_port_channels = [
-            pc for pc in status["port_channels"] if not pc["is_up"]
-        ]
-        if down_port_channels:
-            status["single_points_of_failure"].append({
-                "type": "down_redundancy_link",
-                "count": len(down_port_channels),
-                "severity": "high",
-                "recommendation": "Investigate failed port-channel member links",
-            })
-        
-        task.host["redundancy_status"] = status
-        
+        result = task.run(napalm_get, getters=["facts"])
+        return result
     except Exception as e:
-        logger.warning(f"Error checking {task.host.name}: {e}")
-        task.host["redundancy_status"] = {
-            "device": task.host.name,
-            "error": str(e),
-        }
+        logger.error(f"Failed to gather facts from {task.host.name}: {e}")
+        raise
 
 
-def format_text_report(results: List[Dict]) -> str:
-    """Format results as human-readable text report."""
-    report = "Interface Redundancy Check Report\n"
-    report += "=" * 70 + "\n\n"
+def format_uptime(seconds):
+    """Convert seconds to human-readable uptime."""
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
+
+
+def generate_csv_report(results):
+    """Generate CSV-formatted report."""
+    header = "Device,Vendor,Model,OS Version,Serial Number,Uptime,Hostname"
+    print(header)
     
-    total_devices = len(results)
-    devices_with_issues = sum(1 for r in results if r.get("single_points_of_failure"))
+    for device_name in sorted(results.keys()):
+        result = results[device_name][0].result
+        if result and 'facts' in result:
+            facts = result['facts']
+            uptime = format_uptime(facts.get('uptime', 0))
+            print(f"{device_name},{facts.get('vendor', 'N/A')},{facts.get('model', 'N/A')},"
+                  f"{facts.get('os_version', 'N/A')},{facts.get('serial_number', 'N/A')},"
+                  f"{uptime},{facts.get('hostname', 'N/A')}")
+
+
+def generate_text_report(results):
+    """Generate human-readable text report."""
+    print("\n" + "=" * 80)
+    print("DEVICE FACTS REPORT")
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80 + "\n")
     
-    report += f"Summary:\n"
-    report += f"  Total Devices: {total_devices}\n"
-    report += f"  Devices with Issues: {devices_with_issues}\n\n"
-    
-    for result in results:
-        report += f"Device: {result['device']}\n"
-        report += "-" * 70 + "\n"
-        
-        if "error" in result:
-            report += f"  Error: {result['error']}\n"
-            continue
-        
-        port_channels = result.get("port_channels", [])
-        uplinks = result.get("eth_uplinks", [])
-        spofs = result.get("single_points_of_failure", [])
-        
-        report += f"  Port-Channels: {len(port_channels)}\n"
-        for pc in port_channels:
-            status_str = "UP" if pc["is_up"] else "DOWN"
-            report += f"    {pc['name']:20} [{status_str}]\n"
-        
-        report += f"  Uplinks: {len(uplinks)}\n"
-        for ul in uplinks:
-            status_str = "UP" if ul["is_up"] else "DOWN"
-            report += f"    {ul['name']:20} [{status_str}]\n"
-        
-        if spofs:
-            report += f"  Issues Found: {len(spofs)}\n"
-            for spof in spofs:
-                report += f"    [{spof['severity'].upper()}] {spof['type']}\n"
-                report += f"      → {spof['recommendation']}\n"
-        else:
-            report += f"  Status: No redundancy issues found\n"
-        
-        report += "\n"
-    
-    return report
+    for device_name in sorted(results.keys()):
+        result = results[device_name][0].result
+        if result and 'facts' in result:
+            facts = result['facts']
+            uptime = format_uptime(facts.get('uptime', 0))
+            
+            print(f"Device: {device_name}")
+            print(f"  Hostname:      {facts.get('hostname', 'N/A')}")
+            print(f"  Vendor:        {facts.get('vendor', 'N/A')}")
+            print(f"  Model:         {facts.get('model', 'N/A')}")
+            print(f"  OS Version:    {facts.get('os_version', 'N/A')}")
+            print(f"  Serial Number: {facts.get('serial_number', 'N/A')}")
+            print(f"  Uptime:        {uptime}")
+            print(f"  Interfaces:    {facts.get('interface_count', 'N/A')}")
+            print()
+
+
+def generate_json_report(results):
+    """Generate JSON-formatted report."""
+    report = {}
+    for device_name in results.keys():
+        result = results[device_name][0].result
+        if result and 'facts' in result:
+            facts = result['facts']
+            report[device_name] = {
+                'hostname': facts.get('hostname', 'N/A'),
+                'vendor': facts.get('vendor', 'N/A'),
+                'model': facts.get('model', 'N/A'),
+                'os_version': facts.get('os_version', 'N/A'),
+                'serial_number': facts.get('serial_number', 'N/A'),
+                'uptime_seconds': facts.get('uptime', 0),
+                'interface_count': facts.get('interface_count', 0)
+            }
+    print(json.dumps(report, indent=2))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Check interface redundancy and identify single points of failure"
+        description='Gather and report device facts from network inventory'
     )
-    parser.add_argument(
-        "--inventory",
-        default="hosts.yaml",
-        help="Nornir inventory file path"
-    )
-    parser.add_argument(
-        "--device",
-        help="Filter results to specific device"
-    )
-    parser.add_argument(
-        "--output",
-        choices=["text", "json"],
-        default="text",
-        help="Output format"
-    )
-    parser.add_argument(
-        "--output-file",
-        help="Write report to file"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging"
-    )
-    
+    parser.add_argument('--device', help='Target specific device by name')
+    parser.add_argument('--group', help='Filter devices by group')
+    parser.add_argument('--filter', help='Advanced filter expression (e.g., vendor=="cisco")')
+    parser.add_argument('--output', choices=['text', 'csv', 'json'], default='text',
+                        help='Output format (default: text)')
+    parser.add_argument('--log-level', default='WARNING', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='Logging level')
     args = parser.parse_args()
     
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    logger.setLevel(getattr(logging, args.log_level))
     
     try:
-        nr = InitNornir(config_file=args.inventory)
+        nr = InitNornir(config_file="config.yaml")
+        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
         
+        # Apply filters
         if args.device:
-            nr = nr.filter(F(name=args.device))
+            nr = nr.filter(name=args.device)
+        elif args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+        elif args.filter:
+            try:
+                nr = nr.filter(F(eval(args.filter)))
+            except Exception as e:
+                logger.error(f"Invalid filter expression: {e}")
+                return 1
         
-        if not nr.inventory.hosts:
-            logger.error("No devices found matching filter criteria")
+        if len(nr.inventory.hosts) == 0:
+            logger.error("No devices matched the specified criteria")
             return 1
         
-        logger.info(f"Starting redundancy check on {len(nr.inventory.hosts)} device(s)")
+        logger.info(f"Gathering facts from {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=gather_facts)
         
-        nr.run(task=check_redundancy)
+        # Check for failures
+        failed_count = sum(1 for r in results.values() if r.failed)
+        if failed_count > 0:
+            logger.warning(f"{failed_count} device(s) failed to report facts")
         
-        results = [
-            host.get("redundancy_status", {})
-            for host in nr.inventory.hosts.values()
-        ]
-        
-        if args.output == "json":
-            output = json.dumps(results, indent=2)
+        # Generate report
+        if args.output == 'csv':
+            generate_csv_report(results)
+        elif args.output == 'json':
+            generate_json_report(results)
         else:
-            output = format_text_report(results)
+            generate_text_report(results)
         
-        print(output)
-        
-        if args.output_file:
-            with open(args.output_file, "w") as f:
-                f.write(output)
-            logger.info(f"Report written to {args.output_file}")
-        
-        issues_count = sum(
-            len(r.get("single_points_of_failure", []))
-            for r in results
-            if "error" not in r
-        )
-        logger.info(f"Redundancy check complete. Found {issues_count} issue(s)")
-        
-        return 0 if issues_count == 0 else 1
+        return 0
     
-    except FileNotFoundError as e:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        return 1
     except Exception as e:
-        logger.error(f"Redundancy check failed: {e}", exc_info=args.verbose)
+        logger.error(f"Fatal error: {e}")
         return 1
 
 
