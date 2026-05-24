@@ -1,262 +1,215 @@
 ```python
 """
-SSH Connectivity Validator for Network Devices using Nornir
+Network Configuration Change Validator
 
-Purpose:
-    Validates SSH connectivity and credential configuration across network
-    inventory. Useful as a pre-flight check before running automation tasks
-    or for troubleshooting device accessibility issues.
+Validates configuration changes by capturing baseline configs, applying changes,
+and verifying correctness. Supports automatic rollback on validation failure.
 
 Usage:
-    python ssh_connectivity_validator.py --inventory inventory \
-        --group spine --timeout 15 --retries 2 --output json
+    python config_validator.py --devices router1,router2 --username admin \\
+        --password secret --commands "interface ge-0/0/1" "mtu 1500" \\
+        --verify-pattern "mtu 1500"
 
 Prerequisites:
-    - Nornir >= 3.0
-    - paramiko or netmiko installed
-    - Valid inventory.yaml with device credentials configured
-    - Network connectivity to target devices
+    - Nornir installed with netmiko/napalm plugins
+    - Network devices accessible and configured for remote access
+    - Proper credentials with privilege level for config changes
 
-Features:
-    - Tests SSH connectivity to each device
-    - Validates device type and platform detection
-    - Generates detailed connectivity reports
-    - Supports device/group filtering
-    - Multiple output formats (text, json)
-    - Detailed error reporting for troubleshooting
+Returns:
+    - 0 on successful validation
+    - 1 if validation fails (config may be rolled back)
+    - 2 if connection/execution error occurs
 """
 
 import argparse
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import Optional
 
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir.core.filter import F
+from nornir.plugins.tasks.networking import netmiko_send_command, netmiko_send_config
+from nornir.plugins.functions.text import print_result
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
-def test_ssh_connectivity(task: Task) -> Result:
-    """Test SSH connectivity by executing a simple command."""
+def validate_change(task, commands: list[str], verify_pattern: str, rollback: bool = True):
+    """
+    Execute config change and validate against expected pattern.
+
+    Args:
+        task: Nornir task object
+        commands: List of configuration commands to apply
+        verify_pattern: String pattern to search for in validation check
+        rollback: Rollback config if validation fails
+    """
+    device = task.host
+    timestamp = datetime.now().isoformat()
+
     try:
-        result = task.run(
+        # Capture baseline
+        baseline = task.run(
             netmiko_send_command,
-            command_string="show version",
-            name="SSH Connectivity Test",
+            command_string="show running-config",
+            name=f"baseline_{device.name}"
         )
-        return result
-    except Exception as exc:
-        return Result(host=task.host, failed=True, exception=exc)
+        logger.info(f"{device.name}: Baseline config captured ({len(baseline[1].result)} bytes)")
 
+        # Apply configuration
+        task.run(
+            netmiko_send_config,
+            config_commands=commands,
+            exit_config_mode=True,
+            name=f"deploy_{device.name}"
+        )
+        logger.info(f"{device.name}: Configuration deployed: {commands}")
 
-def validate_devices(nr, timeout: int) -> Dict[str, Dict[str, Any]]:
-    """Execute connectivity validation across all devices in inventory."""
-    validation_results = {}
-    total_devices = len(nr.inventory.hosts)
-    
-    logger.info(f"Starting connectivity validation for {total_devices} devices")
-    
-    for idx, (device_name, device) in enumerate(nr.inventory.hosts.items(), 1):
-        logger.debug(f"[{idx}/{total_devices}] Testing {device_name} ({device.host})")
-        
-        device_info = {
-            "hostname": device_name,
-            "ip_address": device.host,
-            "port": device.port or 22,
-            "username": device.username or "unknown",
-            "platform": device.platform or "unknown",
-            "groups": list(device.groups.keys()) if device.groups else [],
-            "ssh_reachable": False,
-            "timestamp": datetime.now().isoformat(),
-            "error_message": None,
-            "device_type": "unknown",
+        # Verify change
+        verify_output = task.run(
+            netmiko_send_command,
+            command_string="show running-config",
+            name=f"verify_{device.name}"
+        )
+
+        if verify_pattern.lower() in verify_output[2].result.lower():
+            logger.info(f"{device.name}: ✓ Verification passed (pattern found)")
+            return {
+                "status": "success",
+                "device": device.name,
+                "timestamp": timestamp,
+                "commands_applied": commands,
+                "validation": "pattern_found"
+            }
+        else:
+            logger.warning(f"{device.name}: ✗ Verification failed (pattern not found)")
+
+            if rollback:
+                logger.info(f"{device.name}: Initiating rollback...")
+                rollback_commands = [
+                    f"no {cmd}" if not cmd.startswith("no ") else cmd.replace("no ", "")
+                    for cmd in commands
+                ]
+                task.run(
+                    netmiko_send_config,
+                    config_commands=rollback_commands,
+                    exit_config_mode=True,
+                    name=f"rollback_{device.name}"
+                )
+                logger.info(f"{device.name}: Rollback completed")
+
+            return {
+                "status": "failed",
+                "device": device.name,
+                "timestamp": timestamp,
+                "commands_applied": commands,
+                "validation": "pattern_not_found",
+                "rollback_executed": rollback
+            }
+
+    except Exception as e:
+        logger.error(f"{device.name}: Execution error: {str(e)}")
+        return {
+            "status": "error",
+            "device": device.name,
+            "timestamp": timestamp,
+            "error": str(e)
         }
-        
-        try:
-            task_result = nr.run(
-                task=test_ssh_connectivity,
-                name=f"validate_{device_name}",
-                on_failed=True,
-            )
-            
-            host_result = task_result[device_name]
-            
-            if not host_result.failed:
-                device_info["ssh_reachable"] = True
-                output_lines = str(host_result[0].result).split("\n")
-                if output_lines:
-                    device_info["device_type"] = _extract_device_type(output_lines)
-                logger.info(f"✓ {device_name}: SSH accessible")
-            else:
-                device_info["error_message"] = str(host_result[0].exception)
-                logger.warning(f"✗ {device_name}: {device_info['error_message']}")
-        
-        except Exception as e:
-            device_info["error_message"] = str(e)
-            logger.error(f"✗ {device_name}: Unexpected error: {e}")
-        
-        validation_results[device_name] = device_info
-    
-    return validation_results
-
-
-def _extract_device_type(output_lines: list) -> str:
-    """Extract device type from show version output."""
-    for line in output_lines[:10]:
-        line_lower = line.lower()
-        if "cisco" in line_lower:
-            return "Cisco"
-        elif "juniper" in line_lower or "junos" in line_lower:
-            return "Juniper"
-        elif "arista" in line_lower:
-            return "Arista"
-        elif "nokia" in line_lower or "srl" in line_lower:
-            return "Nokia"
-    return "Unknown"
-
-
-def format_text_report(results: Dict[str, Dict[str, Any]]) -> str:
-    """Generate human-readable text report."""
-    accessible = sum(1 for r in results.values() if r["ssh_reachable"])
-    total = len(results)
-    
-    report = [
-        "=" * 85,
-        "SSH CONNECTIVITY VALIDATION REPORT",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 85,
-        f"Summary: {accessible}/{total} devices SSH accessible ({100*accessible//total}%)",
-        "",
-        f"{'Device':<20} {'IP Address':<18} {'Platform':<12} {'Status':<10}",
-        "-" * 85,
-    ]
-    
-    for device_name, data in sorted(results.items()):
-        status = "✓ REACHABLE" if data["ssh_reachable"] else "✗ UNREACHABLE"
-        report.append(
-            f"{device_name:<20} {data['ip_address']:<18} "
-            f"{data['platform']:<12} {status:<10}"
-        )
-        
-        if data["error_message"]:
-            report.append(f"  └─ Error: {data['error_message'][:60]}")
-    
-    report.append("")
-    report.append("=" * 85)
-    
-    return "\n".join(report)
-
-
-def format_json_report(results: Dict[str, Dict[str, Any]]) -> str:
-    """Generate JSON report."""
-    report = {
-        "timestamp": datetime.now().isoformat(),
-        "summary": {
-            "total_devices": len(results),
-            "reachable": sum(1 for r in results.values() if r["ssh_reachable"]),
-            "unreachable": sum(1 for r in results.values() if not r["ssh_reachable"]),
-        },
-        "devices": results,
-    }
-    return json.dumps(report, indent=2, default=str)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate SSH connectivity to network devices"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--devices",
+        required=True,
+        help="Comma-separated device names (e.g., router1,router2)"
+    )
+    parser.add_argument(
+        "--username",
+        required=True,
+        help="Username for device authentication"
+    )
+    parser.add_argument(
+        "--password",
+        required=True,
+        help="Password for device authentication"
+    )
+    parser.add_argument(
+        "--commands",
+        nargs="+",
+        required=True,
+        help="Configuration commands to apply (space-separated list)"
+    )
+    parser.add_argument(
+        "--verify-pattern",
+        required=True,
+        help="String pattern to verify in post-change config"
+    )
+    parser.add_argument(
+        "--no-rollback",
+        action="store_true",
+        help="Disable automatic rollback on validation failure"
     )
     parser.add_argument(
         "--inventory",
-        type=str,
-        default="inventory",
-        help="Path to Nornir inventory (default: inventory)",
+        default="inventory.yml",
+        help="Path to Nornir inventory file (default: inventory.yml)"
     )
-    parser.add_argument(
-        "--device",
-        type=str,
-        help="Target specific device by name",
-    )
-    parser.add_argument(
-        "--group",
-        type=str,
-        help="Target specific device group",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=15,
-        help="SSH connection timeout in seconds (default: 15)",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=1,
-        help="Number of connection retry attempts (default: 1)",
-    )
-    parser.add_argument(
-        "--output",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (default: text)",
-    )
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        help="Write report to file (optional)",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging verbosity (default: INFO)",
-    )
-    
+
     args = parser.parse_args()
-    
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    
+
     try:
-        logger.info(f"Loading inventory from {args.inventory}")
-        nr = InitNornir(config_file=None)
-        
-        if args.device:
-            nr = nr.filter(name=args.device)
-            logger.info(f"Filtered to device: {args.device}")
-        elif args.group:
-            nr = nr.filter(group_name=args.group)
-            logger.info(f"Filtered to group: {args.group}")
-        
+        nr = InitNornir(config_file=args.inventory)
+        devices = [d.strip() for d in args.devices.split(",")]
+        nr = nr.filter(F(name__in=devices))
+
         if not nr.inventory.hosts:
-            logger.error("No devices matched specified criteria")
-            return 1
-        
-        results = validate_devices(nr, timeout=args.timeout)
-        
-        if args.output == "json":
-            output = format_json_report(results)
+            logger.error(f"No devices found matching: {devices}")
+            return 2
+
+        for host in nr.inventory.hosts.values():
+            host.username = args.username
+            host.password = args.password
+
+        logger.info(f"Starting validation on {len(nr.inventory.hosts)} device(s)")
+
+        results = nr.run(
+            task=validate_change,
+            commands=args.commands,
+            verify_pattern=args.verify_pattern,
+            rollback=not args.no_rollback
+        )
+
+        print_result(results)
+
+        success_count = sum(
+            1 for r in results.values()
+            if isinstance(r, dict) and r.get("status") == "success"
+        )
+        total_count = len(results)
+
+        logger.info(f"\nSummary: {success_count}/{total_count} devices validated successfully")
+
+        if success_count == total_count:
+            return 0
         else:
-            output = format_text_report(results)
-        
-        print(output)
-        
-        if args.output_file:
-            with open(args.output_file, "w") as f:
-                f.write(output)
-            logger.info(f"Report saved to {args.output_file}")
-        
-        accessible_count = sum(1 for r in results.values() if r["ssh_reachable"])
-        return 0 if accessible_count == len(results) else 1
-    
+            return 1
+
+    except FileNotFoundError:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        return 2
     except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        return 1
+        logger.error(f"Fatal error: {str(e)}")
+        return 2
 
 
 if __name__ == "__main__":
