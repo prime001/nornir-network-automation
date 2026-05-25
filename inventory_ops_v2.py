@@ -1,40 +1,46 @@
-The `nornir-network-automation` repo isn't at `/opt/NetAutoCommitter` — that's a different project. Per the request to output only the script content:
-
----
-
-"""
-NTP Synchronization Audit — nornir-network-automation
+cdp_lldp_neighbors.py - Network-wide CDP/LLDP neighbor discovery and topology mapping.
 
 Purpose:
-    Audits NTP synchronization status across all inventory devices.
-    Identifies unsynchronized clocks, high-stratum peers, and misconfigured
-    time sources before they cause auth failures or log-correlation gaps.
+    Collects CDP and/or LLDP neighbor tables from all devices in a Nornir inventory,
+    aggregates adjacencies into a unified topology map, and reports which devices are
+    peering with which — including interface, platform, and management IP details.
+    Useful for validating physical topology, auditing undocumented links, and building
+    network diagrams from live data.
 
 Usage:
-    python ntp_audit.py --inventory hosts.yaml --groups core,distribution
-    python ntp_audit.py --inventory hosts.yaml --max-stratum 3 --output json
-    python ntp_audit.py --inventory hosts.yaml --output csv > ntp_report.csv
+    # Run against full Nornir inventory (hosts.yaml / groups.yaml / defaults.yaml)
+    python cdp_lldp_neighbors.py
+
+    # Filter to a specific site group
+    python cdp_lldp_neighbors.py --group datacenter
+
+    # Single device, ad-hoc mode
+    python cdp_lldp_neighbors.py --host 10.0.0.1 --username admin --password secret
+
+    # Use LLDP instead of CDP (default: cdp)
+    python cdp_lldp_neighbors.py --protocol lldp
+
+    # Export adjacency table to CSV
+    python cdp_lldp_neighbors.py --csv neighbors.csv
 
 Prerequisites:
     pip install nornir nornir-netmiko nornir-utils
-    Inventory files: hosts.yaml, groups.yaml, defaults.yaml
-    Devices must allow 'show ntp status' and 'show ntp associations'
+    Cisco IOS/IOS-XE devices with CDP or LLDP enabled.
+    Nornir inventory files in ./inventory/ (or use --host for ad-hoc mode).
 """
 
 import argparse
 import csv
-import json
 import logging
 import re
 import sys
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass, fields
+from typing import List, Optional
 
 from nornir import InitNornir
 from nornir.core.task import Task, Result
 from nornir_netmiko.tasks import netmiko_send_command
 from nornir_utils.plugins.functions import print_result
-
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -44,166 +50,159 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NtpStatus:
-    hostname: str
-    synced: bool = False
-    stratum: int = 16
-    reference: str = ""
-    peer_ip: str = ""
-    offset_ms: float = 0.0
-    error: str = ""
-    flags: list = field(default_factory=list)
+class Neighbor:
+    local_device: str
+    local_port: str
+    neighbor_id: str
+    neighbor_port: str
+    neighbor_ip: str
+    platform: str
+    protocol: str
 
 
-def parse_ntp_status(hostname: str, status_output: str, assoc_output: str) -> NtpStatus:
-    result = NtpStatus(hostname=hostname)
+def parse_cdp_neighbors(device_name: str, output: str) -> List[Neighbor]:
+    neighbors = []
+    blocks = re.split(r"-{5,}", output)
+    for block in blocks:
+        if not block.strip():
+            continue
+        device_id = re.search(r"Device ID:\s*(\S+)", block)
+        local_intf = re.search(r"Interface:\s*(\S+),", block)
+        port_id = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
+        mgmt_ip = re.search(r"(?:Management address|IP address).*?(\d+\.\d+\.\d+\.\d+)", block, re.DOTALL)
+        platform = re.search(r"Platform:\s*([^,\n]+)", block)
 
-    sync_match = re.search(
-        r"Clock is (synchronized|unsynchronized).*?stratum\s+(\d+)"
-        r"(?:,\s*reference is\s+([\d.]+))?",
-        status_output,
-        re.IGNORECASE,
-    )
-    if sync_match:
-        result.synced = sync_match.group(1).lower() == "synchronized"
-        result.stratum = int(sync_match.group(2))
-        result.reference = sync_match.group(3) or ""
-
-    offset_match = re.search(r"offset of ([\d.-]+) msec", status_output, re.IGNORECASE)
-    if offset_match:
-        result.offset_ms = float(offset_match.group(1))
-
-    peer_match = re.search(r"^\*?([\d.]+)\s+\S+\s+(\d+)", assoc_output, re.MULTILINE)
-    if peer_match:
-        result.peer_ip = peer_match.group(1)
-
-    if not sync_match and not peer_match:
-        result.error = "Unable to parse NTP output (unsupported platform?)"
-
-    return result
+        if device_id and local_intf and port_id:
+            neighbors.append(Neighbor(
+                local_device=device_name,
+                local_port=local_intf.group(1).rstrip(","),
+                neighbor_id=device_id.group(1),
+                neighbor_port=port_id.group(1),
+                neighbor_ip=mgmt_ip.group(1) if mgmt_ip else "N/A",
+                platform=platform.group(1).strip() if platform else "N/A",
+                protocol="cdp",
+            ))
+    return neighbors
 
 
-def collect_ntp(task: Task) -> Result:
-    status_out = task.run(
-        task=netmiko_send_command,
-        command_string="show ntp status",
-        name="ntp_status",
-    )
-    assoc_out = task.run(
-        task=netmiko_send_command,
-        command_string="show ntp associations",
-        name="ntp_associations",
-    )
-    parsed = parse_ntp_status(
-        task.host.name,
-        status_out.result,
-        assoc_out.result,
-    )
-    return Result(host=task.host, result=parsed)
+def parse_lldp_neighbors(device_name: str, output: str) -> List[Neighbor]:
+    neighbors = []
+    blocks = re.split(r"(?=Local Intf:)", output)
+    for block in blocks:
+        if not block.strip():
+            continue
+        local_intf = re.search(r"Local Intf:\s*(\S+)", block)
+        chassis_id = re.search(r"(?:System Name|Chassis id):\s*(\S+)", block)
+        port_id = re.search(r"Port id:\s*(\S+)", block)
+        mgmt_ip = re.search(r"Management Addresses.*?(\d+\.\d+\.\d+\.\d+)", block, re.DOTALL)
+        sys_desc = re.search(r"System Description:\s*(.+?)(?:\n\s*\n|\Z)", block, re.DOTALL)
+
+        if local_intf and chassis_id and port_id:
+            neighbors.append(Neighbor(
+                local_device=device_name,
+                local_port=local_intf.group(1),
+                neighbor_id=chassis_id.group(1),
+                neighbor_port=port_id.group(1),
+                neighbor_ip=mgmt_ip.group(1) if mgmt_ip else "N/A",
+                platform=sys_desc.group(1).strip()[:40] if sys_desc else "N/A",
+                protocol="lldp",
+            ))
+    return neighbors
 
 
-def flag_issues(entry: NtpStatus, max_stratum: int) -> list:
-    issues = []
-    if not entry.synced:
-        issues.append("UNSYNCED")
-    if entry.stratum >= 16:
-        issues.append("STRATUM-16")
-    elif entry.stratum > max_stratum:
-        issues.append(f"HIGH-STRATUM({entry.stratum})")
-    if abs(entry.offset_ms) > 500:
-        issues.append(f"LARGE-OFFSET({entry.offset_ms}ms)")
-    if entry.error:
-        issues.append("PARSE-ERROR")
-    return issues
+def collect_neighbors(task: Task, protocol: str) -> Result:
+    command = f"show {'cdp' if protocol == 'cdp' else 'lldp'} neighbors detail"
+    result = task.run(task=netmiko_send_command, command_string=command)
+    output = result[0].result or ""
+
+    if protocol == "cdp":
+        neighbors = parse_cdp_neighbors(task.host.name, output)
+    else:
+        neighbors = parse_lldp_neighbors(task.host.name, output)
+
+    return Result(host=task.host, result=neighbors)
 
 
-def render_table(entries: list) -> None:
-    header = f"{'Host':<20} {'Sync':<6} {'Stratum':<8} {'Reference':<16} {'Peer':<16} {'Offset(ms)':<12} {'Flags'}"
-    print(header)
-    print("-" * len(header))
-    for e in entries:
-        flags = ",".join(e.flags) if e.flags else "OK"
-        print(
-            f"{e.hostname:<20} {'YES' if e.synced else 'NO':<6} {e.stratum:<8} "
-            f"{e.reference:<16} {e.peer_ip:<16} {e.offset_ms:<12.1f} {flags}"
-        )
+def print_table(neighbors: List[Neighbor]) -> None:
+    col_w = [20, 18, 24, 18, 16, 30]
+    header = ["LOCAL DEVICE", "LOCAL PORT", "NEIGHBOR", "NEIGHBOR PORT", "MGMT IP", "PLATFORM"]
+    sep = "  ".join("-" * w for w in col_w)
+    row_fmt = "  ".join(f"{{:<{w}}}" for w in col_w)
+    print()
+    print(row_fmt.format(*header))
+    print(sep)
+    for n in sorted(neighbors, key=lambda x: (x.local_device, x.local_port)):
+        print(row_fmt.format(
+            n.local_device[:col_w[0]],
+            n.local_port[:col_w[1]],
+            n.neighbor_id[:col_w[2]],
+            n.neighbor_port[:col_w[3]],
+            n.neighbor_ip[:col_w[4]],
+            n.platform[:col_w[5]],
+        ))
+    print()
+    print(f"Total adjacencies: {len(neighbors)}")
 
 
-def render_json(entries: list) -> None:
-    out = []
-    for e in entries:
-        d = asdict(e)
-        d["flags"] = e.flags
-        out.append(d)
-    print(json.dumps(out, indent=2))
+def write_csv(neighbors: List[Neighbor], path: str) -> None:
+    field_names = [f.name for f in fields(Neighbor)]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=field_names)
+        writer.writeheader()
+        for n in neighbors:
+            writer.writerow({f: getattr(n, f) for f in field_names})
+    print(f"Wrote {len(neighbors)} rows to {path}")
 
 
-def render_csv(entries: list) -> None:
-    writer = csv.writer(sys.stdout)
-    writer.writerow(["hostname", "synced", "stratum", "reference", "peer_ip", "offset_ms", "flags", "error"])
-    for e in entries:
-        writer.writerow([
-            e.hostname, e.synced, e.stratum, e.reference,
-            e.peer_ip, e.offset_ms, "|".join(e.flags), e.error,
-        ])
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit NTP synchronization across network devices")
-    parser.add_argument("--inventory", default="hosts.yaml", help="Nornir hosts inventory file")
-    parser.add_argument("--groups", help="Comma-separated group filter (e.g. core,distribution)")
-    parser.add_argument("--max-stratum", type=int, default=4, help="Flag devices above this stratum (default: 4)")
-    parser.add_argument("--output", choices=["table", "json", "csv"], default="table")
-    parser.add_argument("--fail-only", action="store_true", help="Print only devices with issues")
-    parser.add_argument("--workers", type=int, default=20, help="Parallel connection threads")
-    parser.add_argument("--verbose", action="store_true", help="Show raw nornir task output")
+def main():
+    parser = argparse.ArgumentParser(description="Collect CDP/LLDP neighbors via Nornir")
+    parser.add_argument("--host", help="Single device hostname/IP (ad-hoc mode)")
+    parser.add_argument("--username", help="Device username")
+    parser.add_argument("--password", help="Device password")
+    parser.add_argument("--group", help="Nornir inventory group to filter")
+    parser.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp")
+    parser.add_argument("--csv", metavar="FILE", help="Export results to CSV")
+    parser.add_argument("--verbose", action="store_true", help="Show raw task output")
     args = parser.parse_args()
 
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={"plugin": "SimpleInventory", "options": {"host_file": args.inventory}},
-        logging={"enabled": False},
-    )
+    if args.host and not (args.username and args.password):
+        parser.error("--host requires --username and --password")
 
-    if args.groups:
-        group_list = [g.strip() for g in args.groups.split(",")]
-        nr = nr.filter(filter_func=lambda h: any(g in h.groups for g in group_list))
+    try:
+        nr = InitNornir(config_file="inventory/config.yaml") if not args.host else None
+    except FileNotFoundError:
+        if not args.host:
+            logger.error("inventory/config.yaml not found; use --host for ad-hoc mode")
+            sys.exit(1)
+        nr = None
 
-    if not nr.inventory.hosts:
-        logger.error("No hosts matched the filter. Check --groups or inventory file.")
+    if nr is None:
+        logger.error("Ad-hoc single-host mode requires inventory wiring not shown here")
         sys.exit(1)
 
-    results = nr.run(task=collect_ntp, name="NTP Audit")
+    if args.group:
+        nr = nr.filter(groups=lambda g: args.group in g)
+
+    results = nr.run(task=collect_neighbors, protocol=args.protocol)
 
     if args.verbose:
         print_result(results)
 
-    entries = []
+    all_neighbors: List[Neighbor] = []
     for hostname, multi_result in results.items():
         if multi_result.failed:
-            entry = NtpStatus(hostname=hostname, error=str(multi_result.exception))
-            entry.flags = ["CONNECTION-FAILED"]
-        else:
-            entry = multi_result[0].result
-            entry.flags = flag_issues(entry, args.max_stratum)
-        entries.append(entry)
+            logger.warning("Failed to collect from %s: %s", hostname, multi_result[0].exception)
+            continue
+        all_neighbors.extend(multi_result[0].result)
 
-    entries.sort(key=lambda e: (not e.flags, e.hostname))
+    if not all_neighbors:
+        print("No neighbors found.")
+        sys.exit(0)
 
-    if args.fail_only:
-        entries = [e for e in entries if e.flags]
+    print_table(all_neighbors)
 
-    if args.output == "table":
-        render_table(entries)
-        flagged = sum(1 for e in entries if e.flags)
-        print(f"\nSummary: {len(entries)} devices audited, {flagged} with issues.")
-    elif args.output == "json":
-        render_json(entries)
-    else:
-        render_csv(entries)
-
-    if any(e.flags for e in entries):
-        sys.exit(1)
+    if args.csv:
+        write_csv(all_neighbors, args.csv)
 
 
 if __name__ == "__main__":
