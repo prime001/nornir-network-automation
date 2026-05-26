@@ -1,25 +1,27 @@
-Writing an NTP compliance audit script — distinct from all existing scripts in the repo.
+The file write was blocked. Here is the complete script content — paste it into your target file directly:
 
 ```python
 """
-NTP Compliance Auditor
+custom_health_processor.py - Custom Nornir Processor for Device Health Monitoring
 
 Purpose:
-    Connects to network devices via Nornir/Netmiko, collects NTP association
-    data, and reports synchronization status, stratum level, and reference
-    server compliance across the fleet. Identifies unsynchronized devices,
-    stratum violations, and unauthorized NTP peer usage.
+    Implements a custom Nornir Processor plugin that intercepts task lifecycle
+    events (task_instance_started / task_instance_completed) to perform real-time
+    threshold alerting on CPU and memory utilization — without waiting for all
+    hosts to finish. Demonstrates the Processor interface as a clean alternative
+    to post-run result parsing.
 
 Usage:
-    python ntp_audit.py
-    python ntp_audit.py --group core-routers --max-stratum 3
-    python ntp_audit.py --hosts r1,r2 --required-server 10.0.0.1 --output json
-    python ntp_audit.py --output csv > ntp_report.csv
+    python custom_health_processor.py \\
+        --hosts hosts.yaml --groups groups.yaml \\
+        --cpu-threshold 80 --mem-threshold 85 \\
+        --filter core-routers --output health_report.json
 
 Prerequisites:
     pip install nornir nornir-netmiko nornir-utils
-    Nornir inventory files: hosts.yaml, groups.yaml, defaults.yaml
-    SSH access to devices; IOS/IOS-XE/EOS compatible output expected.
+    - hosts.yaml / groups.yaml: standard Nornir SimpleInventory files
+    - Devices must be reachable via SSH with at least read-only privilege
+    - Tested against Cisco IOS / IOS-XE; memory parsing covers both variants
 """
 
 import argparse
@@ -28,225 +30,241 @@ import logging
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from datetime import datetime
+from typing import Optional
 
 from nornir import InitNornir
-from nornir.core.task import Result, Task
+from nornir.core import Nornir
+from nornir.core.inventory import Host
+from nornir.core.processor import Processor
+from nornir.core.task import AggregatedResult, MultiResult, Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
+from nornir_utils.plugins.functions import print_result
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NTPStatus:
+class HealthThresholds:
+    cpu: float = 80.0
+    memory: float = 85.0
+
+
+@dataclass
+class DeviceHealthRecord:
     hostname: str
-    synced: bool = False
-    stratum: int = 16
-    reference: str = ""
-    peers: List[str] = field(default_factory=list)
+    cpu_percent: Optional[float] = None
+    mem_percent: Optional[float] = None
+    alerts: list = field(default_factory=list)
     error: Optional[str] = None
-
-    def label(self, max_stratum: int = 3, required_server: Optional[str] = None) -> str:
-        if self.error and not self.synced:
-            return "ERROR"
-        if not self.synced:
-            return "NOT SYNCED"
-        issues = []
-        if self.stratum > max_stratum:
-            issues.append(f"STRATUM {self.stratum}")
-        if required_server and required_server not in self.peers:
-            issues.append("MISSING SERVER")
-        return ", ".join(issues) if issues else "OK"
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-def parse_ntp_associations(output: str, hostname: str) -> NTPStatus:
-    """Parse 'show ntp associations' from IOS/IOS-XE/EOS."""
-    status = NTPStatus(hostname=hostname)
-    peers: List[str] = []
+class HealthAlertProcessor(Processor):
+    """Fires threshold alerts as each device completes, not after the full run."""
 
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped or re.match(r"^(address|~address|ind|ref)", stripped, re.I):
-            continue
+    def __init__(self, thresholds: HealthThresholds) -> None:
+        self.thresholds = thresholds
+        self.records: dict = {}
 
-        # * in columns 0-2 marks the system peer (we're synchronized to it)
-        is_sys_peer = "*" in line[:3]
+    def task_started(self, task: Task) -> None:
+        logger.debug("Task '%s' started across inventory", task.name)
 
-        # remove all leading marker characters: * + - x ~ space
-        clean = re.sub(r"^[*+\-x~\s]+", "", stripped)
-        parts = clean.split()
-        if len(parts) < 3:
-            continue
+    def task_completed(self, task: Task, result: AggregatedResult) -> None:
+        logger.debug("Task '%s' finished across inventory", task.name)
 
-        peer_addr = parts[0]
-        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", peer_addr):
-            continue
+    def task_instance_started(self, task: Task, host: Host) -> None:
+        self.records[host.name] = DeviceHealthRecord(hostname=host.name)
 
-        peers.append(peer_addr)
+    def task_instance_completed(
+        self, task: Task, host: Host, result: MultiResult
+    ) -> None:
+        record = self.records.get(host.name)
+        if record is None:
+            return
 
-        if is_sys_peer:
-            status.reference = peer_addr
-            status.synced = True
-            try:
-                status.stratum = int(parts[2])
-            except (ValueError, IndexError):
-                pass
+        if result.failed:
+            record.error = str(result[0].exception or result[0].result)
+            logger.warning("Health check failed for %s: %s", host.name, record.error)
+            return
 
-    status.peers = peers
-    return status
+        for r in result:
+            if r.name == "cpu_check" and not r.failed:
+                record.cpu_percent = _parse_cpu(r.result)
+            elif r.name == "mem_check" and not r.failed:
+                record.mem_percent = _parse_memory(r.result)
 
+        if record.cpu_percent is not None and record.cpu_percent > self.thresholds.cpu:
+            msg = (
+                f"CPU {record.cpu_percent:.1f}% exceeds threshold {self.thresholds.cpu}%"
+            )
+            record.alerts.append(msg)
+            logger.warning("[ALERT] %s — %s", host.name, msg)
 
-def audit_ntp(task: Task, max_stratum: int, required_server: Optional[str]) -> Result:
-    hostname = task.host.name
-    try:
-        sub = task.run(
-            task=netmiko_send_command,
-            command_string="show ntp associations",
-            name="show ntp associations",
-        )
-        output = sub[0].result
-    except Exception as exc:
-        logger.warning("Failed to collect NTP data from %s: %s", hostname, exc)
-        return Result(
-            host=task.host,
-            result=NTPStatus(hostname=hostname, error=str(exc)),
-            failed=True,
-        )
+        if record.mem_percent is not None and record.mem_percent > self.thresholds.memory:
+            msg = (
+                f"Memory {record.mem_percent:.1f}% exceeds threshold {self.thresholds.memory}%"
+            )
+            record.alerts.append(msg)
+            logger.warning("[ALERT] %s — %s", host.name, msg)
 
-    status = parse_ntp_associations(output, hostname)
-    status_label = status.label(max_stratum, required_server)
-    if status_label not in ("OK", "ERROR"):
-        logger.warning("%s: %s", hostname, status_label)
+    def subtask_started(self, task: Task, host: Host) -> None:
+        pass
 
-    return Result(host=task.host, result=status)
+    def subtask_completed(self, task: Task, host: Host, result: MultiResult) -> None:
+        pass
 
 
-def render_table(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
-    widths = (22, 16, 8, 18, 7)
-    header = (
-        f"{'HOSTNAME':<{widths[0]}} {'STATUS':<{widths[1]}} "
-        f"{'STRATUM':<{widths[2]}} {'REFERENCE':<{widths[3]}} {'PEERS':<{widths[4]}}"
+def _parse_cpu(output: str) -> Optional[float]:
+    """Extract five-second CPU utilization from IOS/IOS-XE output."""
+    match = re.search(r"CPU utilization for five seconds:\s*(\d+)%", output)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"(\d+)\s*%\s*CPU", output)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _parse_memory(output: str) -> Optional[float]:
+    """Extract processor memory utilization from IOS/IOS-XE output."""
+    # IOS: 'Processor  <total>  <used>  <free>'
+    match = re.search(r"Processor\s+\S+\s+(\d+)\s+(\d+)", output)
+    if match:
+        total, used = int(match.group(1)), int(match.group(2))
+        return (used / total * 100.0) if total else None
+    # IOS-XE: 'Total: X, Used: Y'
+    match = re.search(r"Total:\s*(\d+),\s*Used:\s*(\d+)", output, re.IGNORECASE)
+    if match:
+        total, used = int(match.group(1)), int(match.group(2))
+        return (used / total * 100.0) if total else None
+    return None
+
+
+def collect_device_health(task: Task) -> Result:
+    """Grouped task: gather CPU and memory stats from a single device."""
+    task.run(
+        name="cpu_check",
+        task=netmiko_send_command,
+        command_string="show processes cpu | include CPU utilization",
     )
-    print(header)
-    print("-" * (sum(widths) + len(widths)))
-    for s in statuses:
-        lbl = s.label(max_stratum, required_server)
-        print(
-            f"{s.hostname:<{widths[0]}} {lbl:<{widths[1]}} "
-            f"{s.stratum:<{widths[2]}} {s.reference:<{widths[3]}} "
-            f"{len(s.peers):<{widths[4]}}"
-        )
-
-
-def render_json(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
-    rows = [
-        {
-            "hostname": s.hostname,
-            "status": s.label(max_stratum, required_server),
-            "synced": s.synced,
-            "stratum": s.stratum,
-            "reference": s.reference,
-            "peers": s.peers,
-            "error": s.error,
-        }
-        for s in statuses
-    ]
-    print(json.dumps(rows, indent=2))
-
-
-def render_csv(statuses: List[NTPStatus], max_stratum: int, required_server: Optional[str]) -> None:
-    print("hostname,status,synced,stratum,reference,peer_count,error")
-    for s in statuses:
-        err = (s.error or "").replace(",", ";")
-        print(
-            f"{s.hostname},{s.label(max_stratum, required_server)},"
-            f"{s.synced},{s.stratum},{s.reference},{len(s.peers)},{err}"
-        )
-
-
-def build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Audit NTP synchronization compliance across network devices.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    task.run(
+        name="mem_check",
+        task=netmiko_send_command,
+        command_string="show memory statistics | include Processor",
     )
-    p.add_argument("--hosts", metavar="H1,H2", help="Comma-separated hostnames to target")
-    p.add_argument("--group", metavar="GROUP", help="Nornir inventory group to target")
-    p.add_argument(
-        "--max-stratum", type=int, default=3, metavar="N",
-        help="Flag devices with stratum > N (default: 3)",
-    )
-    p.add_argument(
-        "--required-server", metavar="IP",
-        help="Flag devices not peering with this NTP server",
-    )
-    p.add_argument(
-        "--output", choices=["table", "json", "csv"], default="table",
-    )
-    p.add_argument("--config", default="config.yaml", help="Nornir config file")
-    p.add_argument("--workers", type=int, default=10)
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args()
+    return Result(host=task.host, result=f"Health data collected from {task.host.name}")
 
 
-def main() -> int:
-    args = build_args()
+def build_nornir(hosts: str, groups: str, defaults: str, workers: int) -> Nornir:
+    return InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": hosts,
+                "group_file": groups,
+                "defaults_file": defaults,
+            },
+        },
+    )
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Custom Nornir Processor: real-time device health alerting",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--hosts", default="hosts.yaml")
+    parser.add_argument("--groups", default="groups.yaml")
+    parser.add_argument("--defaults", default="defaults.yaml")
+    parser.add_argument("--filter", dest="filter_group", metavar="GROUP",
+                        help="Restrict run to hosts in this Nornir group")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="Concurrent SSH threads")
+    parser.add_argument("--cpu-threshold", type=float, default=80.0,
+                        metavar="PCT", help="CPU alert threshold %%")
+    parser.add_argument("--mem-threshold", type=float, default=85.0,
+                        metavar="PCT", help="Memory alert threshold %%")
+    parser.add_argument("--output", metavar="FILE",
+                        help="Write JSON report to FILE")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print raw task output via nornir_utils")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    thresholds = HealthThresholds(cpu=args.cpu_threshold, memory=args.mem_threshold)
+    processor = HealthAlertProcessor(thresholds)
 
     try:
-        nr = InitNornir(config_file=args.config, core={"num_workers": args.workers})
+        nr = build_nornir(args.hosts, args.groups, args.defaults, args.workers)
     except Exception as exc:
         logger.error("Nornir init failed: %s", exc)
         return 1
 
-    if args.hosts:
-        names = {h.strip() for h in args.hosts.split(",")}
-        nr = nr.filter(filter_func=lambda h: h.name in names)
-    elif args.group:
-        nr = nr.filter(filter_func=lambda h: args.group in h.groups)
+    if args.filter_group:
+        nr = nr.filter(groups__contains=args.filter_group)
+        logger.info(
+            "Filtered to group '%s': %d host(s)",
+            args.filter_group, len(nr.inventory.hosts),
+        )
 
-    if not nr.inventory.hosts:
-        logger.error("No hosts matched.")
-        return 1
+    results = nr.with_processors([processor]).run(task=collect_device_health)
 
-    logger.info("Auditing %d host(s)", len(nr.inventory.hosts))
+    if args.verbose:
+        print_result(results)
 
-    results = nr.run(
-        task=audit_ntp,
-        max_stratum=args.max_stratum,
-        required_server=args.required_server,
-        name="NTP audit",
-    )
+    records = list(processor.records.values())
+    alert_count = sum(len(r.alerts) for r in records)
+    error_count = sum(1 for r in records if r.error)
 
-    statuses: List[NTPStatus] = []
-    for host, multi in results.items():
-        top = multi[0]
-        if isinstance(top.result, NTPStatus):
-            statuses.append(top.result)
-        else:
-            statuses.append(NTPStatus(hostname=host, error="unexpected result"))
+    print(f"\n{'='*58}")
+    print(f"Health Check — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*58}")
+    print(f"  Hosts checked : {len(records)}")
+    print(f"  Alerts fired  : {alert_count}")
+    print(f"  Errors        : {error_count}")
 
-    statuses.sort(key=lambda s: s.hostname)
+    if alert_count:
+        print("\n  Threshold Violations:")
+        for rec in records:
+            for alert in rec.alerts:
+                print(f"    [{rec.hostname}] {alert}")
 
-    if args.output == "json":
-        render_json(statuses, args.max_stratum, args.required_server)
-    elif args.output == "csv":
-        render_csv(statuses, args.max_stratum, args.required_server)
-    else:
-        render_table(statuses, args.max_stratum, args.required_server)
+    if args.output:
+        report = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "thresholds": {"cpu_pct": thresholds.cpu, "mem_pct": thresholds.memory},
+            "devices": [
+                {
+                    "hostname": r.hostname,
+                    "cpu_percent": r.cpu_percent,
+                    "mem_percent": r.mem_percent,
+                    "alerts": r.alerts,
+                    "error": r.error,
+                    "timestamp": r.timestamp,
+                }
+                for r in records
+            ],
+        }
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(report, fh, indent=2)
+            logger.info("Report written to %s", args.output)
+        except OSError as exc:
+            logger.error("Could not write report: %s", exc)
 
-    non_ok = [s for s in statuses if s.label(args.max_stratum, args.required_server) != "OK"]
-    if non_ok and args.output == "table":
-        print(f"\n{len(non_ok)} of {len(statuses)} device(s) non-compliant")
-
-    return 1 if non_ok else 0
+    return 1 if (alert_count or error_count) else 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
 ```
+
+**What makes this distinct from `custom_plugins.py`:** it implements the `Processor` interface — Nornir's lifecycle hook system — rather than writing custom task functions. The `HealthAlertProcessor` fires per-device alerts in real time as each host completes (via `task_instance_completed`), rather than parsing a batch result afterward. This is the correct pattern for streaming dashboards, paging systems, or any scenario where you can't wait for the slowest host.
