@@ -1,27 +1,29 @@
-config_drift.py — Configuration drift detection using Nornir
+The script goes to the portfolio repo (nornir-network-automation), not this local repo. Writing a config drift detection script now:
 
-Purpose:
-    Compares live device running configurations against stored baseline snapshots,
-    producing unified diffs that highlight unauthorized or unexpected changes.
-    Designed for change auditing, incident response triage, and post-maintenance
-    verification across multi-vendor environments.
+```python
+"""
+config_diff.py - Configuration drift detection using Nornir.
+
+Connects to network devices, retrieves running configurations, and
+compares them against stored baseline snapshots. Reports any lines added,
+removed, or changed since the baseline was captured.  Useful for detecting
+unauthorized changes, validating change windows, and maintaining audit trails.
 
 Usage:
-    # Check all hosts for drift against stored baselines
-    python config_drift.py --baseline-dir ./baselines
+    # First run — create baselines (no drift check yet):
+    python config_diff.py --update-baseline
 
-    # Target specific hosts
-    python config_drift.py --hosts router1,router2 --baseline-dir ./baselines
+    # Check for drift against saved baselines:
+    python config_diff.py
 
-    # Target a Nornir group and update baselines after checking
-    python config_drift.py --group core_routers --baseline-dir ./baselines --update
-
-    # Create initial baselines (no existing baseline required)
-    python config_drift.py --baseline-dir ./baselines --update
+    # Limit to specific hosts or groups, write report to file:
+    python config_diff.py --hosts router1 router2 --output drift.txt
+    python config_diff.py --groups core --update-baseline
 
 Prerequisites:
-    pip install nornir nornir-netmiko
-    Inventory files: ./inventory/hosts.yaml, ./inventory/groups.yaml, ./inventory/defaults.yaml
+    pip install nornir nornir-netmiko nornir-utils
+    Nornir inventory: hosts.yaml, groups.yaml, defaults.yaml (or config.yaml)
+    Python 3.10+
 """
 
 import argparse
@@ -36,143 +38,181 @@ from nornir.core.filter import F
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("config_diff")
 
 
-def fetch_running_config(task: Task) -> Result:
-    result = task.run(
-        task=netmiko_send_command,
-        command_string="show running-config",
-        use_textfsm=False,
-    )
-    return Result(host=task.host, result=result.result)
+def _load_baseline(baseline_dir: Path, hostname: str) -> str | None:
+    path = baseline_dir / f"{hostname}.cfg"
+    return path.read_text(encoding="utf-8") if path.exists() else None
 
 
-def load_baseline(baseline_dir: Path, hostname: str) -> str | None:
-    path = baseline_dir / f"{hostname}.txt"
-    if not path.exists():
-        return None
-    return path.read_text(encoding="utf-8")
-
-
-def save_baseline(baseline_dir: Path, hostname: str, config: str) -> None:
+def _save_baseline(baseline_dir: Path, hostname: str, config: str) -> None:
     baseline_dir.mkdir(parents=True, exist_ok=True)
-    (baseline_dir / f"{hostname}.txt").write_text(config, encoding="utf-8")
-    logger.info("[%s] Baseline saved to %s/%s.txt", hostname, baseline_dir, hostname)
+    (baseline_dir / f"{hostname}.cfg").write_text(config, encoding="utf-8")
+    logger.info("[%s] Baseline saved.", hostname)
 
 
-def compute_diff(baseline: str, current: str, hostname: str) -> list[str]:
+def _unified_diff(baseline: str, running: str, hostname: str) -> list[str]:
     return list(
         difflib.unified_diff(
             baseline.splitlines(keepends=True),
-            current.splitlines(keepends=True),
-            fromfile=f"{hostname} (baseline)",
-            tofile=f"{hostname} (current {datetime.now().strftime('%Y-%m-%d %H:%M')})",
+            running.splitlines(keepends=True),
+            fromfile=f"{hostname}/baseline",
+            tofile=f"{hostname}/running",
             lineterm="",
         )
     )
 
 
-def run(args: argparse.Namespace) -> int:
-    baseline_dir = Path(args.baseline_dir)
-    nr = InitNornir(config_file=args.config)
+def detect_drift(task: Task, baseline_dir: Path, update_baseline: bool) -> Result:
+    hostname = task.host.name
 
-    if args.hosts:
-        target = nr.filter(F(name__in=args.hosts.split(",")))
-    elif args.group:
-        target = nr.filter(F(groups__contains=args.group))
-    else:
-        target = nr
+    cmd_result = task.run(
+        task=netmiko_send_command,
+        command_string="show running-config",
+        use_textfsm=False,
+    )
+    running = cmd_result.result.strip()
 
-    host_count = len(target.inventory.hosts)
-    if host_count == 0:
-        logger.error("No hosts matched the filter.")
-        return 1
+    baseline = _load_baseline(baseline_dir, hostname)
 
-    logger.info("Fetching running configs from %d host(s)...", host_count)
-    results = target.run(task=fetch_running_config)
+    if baseline is None:
+        if update_baseline:
+            _save_baseline(baseline_dir, hostname, running)
+            return Result(host=task.host, result="NO_BASELINE_CREATED")
+        return Result(
+            host=task.host,
+            result="NO_BASELINE",
+            failed=True,
+        )
 
-    drifted: list[str] = []
-    no_baseline: list[str] = []
+    diff_lines = _unified_diff(baseline.strip(), running, hostname)
 
-    for hostname, multi_result in results.items():
-        if multi_result.failed:
-            exc = multi_result[0].exception
-            logger.error("[%s] Connection failed: %s", hostname, exc)
-            continue
+    if diff_lines and update_baseline:
+        _save_baseline(baseline_dir, hostname, running)
 
-        current_config: str = multi_result[0].result
-        baseline = load_baseline(baseline_dir, hostname)
-
-        if baseline is None:
-            no_baseline.append(hostname)
-            if args.update:
-                save_baseline(baseline_dir, hostname, current_config)
-            else:
-                logger.warning(
-                    "[%s] No baseline found. Run with --update to create one.", hostname
-                )
-            continue
-
-        diff = compute_diff(baseline, current_config, hostname)
-
-        if not diff:
-            logger.info("[%s] Clean — no drift detected.", hostname)
-        else:
-            drifted.append(hostname)
-            separator = "=" * 64
-            print(f"\n{separator}")
-            print(f"  DRIFT DETECTED: {hostname}")
-            print(separator)
-            for line in diff:
-                print(line)
-
-        if args.update:
-            save_baseline(baseline_dir, hostname, current_config)
-
-    print()
-    if drifted:
-        logger.warning("Drift found on %d host(s): %s", len(drifted), ", ".join(drifted))
-    if no_baseline:
-        logger.info("No baseline on file for: %s", ", ".join(no_baseline))
-
-    return 1 if drifted else 0
+    return Result(
+        host=task.host,
+        result={"diff": diff_lines, "running": running},
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Detect configuration drift between stored baselines and live device configs."
+    p = argparse.ArgumentParser(
+        description="Detect configuration drift between running and baseline configs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Nornir config file (default: config.yaml)",
+    p.add_argument("--config", default="config.yaml", help="Nornir config file")
+    p.add_argument("--hosts", nargs="+", metavar="HOST", help="Filter by hostname")
+    p.add_argument("--groups", nargs="+", metavar="GROUP", help="Filter by group")
+    p.add_argument(
+        "--baseline-dir", default="./baselines", metavar="DIR",
+        help="Directory for baseline config files",
     )
-    parser.add_argument(
-        "--hosts",
-        help="Comma-separated list of hostnames to target",
+    p.add_argument(
+        "--update-baseline", action="store_true",
+        help="Write running config as new baseline (creates on first run, updates on drift)",
     )
-    parser.add_argument(
-        "--group",
-        help="Nornir group name to target",
+    p.add_argument("--output", metavar="FILE", help="Write report to file")
+    p.add_argument("--username", help="Override inventory username")
+    p.add_argument("--password", help="Override inventory password")
+    p.add_argument("--workers", type=int, default=10, help="Parallel worker count")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    baseline_dir = Path(args.baseline_dir)
+
+    try:
+        nr = InitNornir(config_file=args.config)
+    except FileNotFoundError:
+        logger.error("Nornir config not found: %s", args.config)
+        return 1
+
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
+
+    nr.runner.num_workers = args.workers
+
+    if args.hosts:
+        nr = nr.filter(F(name__any=args.hosts))
+    if args.groups:
+        nr = nr.filter(F(groups__any=args.groups))
+
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched filters.")
+        return 1
+
+    logger.info(
+        "Checking %d host(s) against baselines in %s",
+        len(nr.inventory.hosts),
+        baseline_dir,
     )
-    parser.add_argument(
-        "--baseline-dir",
-        default="./baselines",
-        help="Directory containing <hostname>.txt baseline files (default: ./baselines)",
+
+    results = nr.run(
+        task=detect_drift,
+        baseline_dir=baseline_dir,
+        update_baseline=args.update_baseline,
     )
-    parser.add_argument(
-        "--update",
-        action="store_true",
-        help="Overwrite baselines with current config after each comparison (or create if missing)",
+
+    drifted, clean, failed, created = [], [], [], []
+    lines = [
+        f"Config Drift Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 60,
+    ]
+
+    for hostname, multi in results.items():
+        r = multi[0]
+        if r.failed:
+            if r.result == "NO_BASELINE":
+                lines.append(
+                    f"\n[SKIP] {hostname}: no baseline — run with --update-baseline"
+                )
+                failed.append(hostname)
+            else:
+                lines.append(f"\n[ERROR] {hostname}: {r.exception or r.result}")
+                failed.append(hostname)
+        elif r.result == "NO_BASELINE_CREATED":
+            lines.append(f"\n[INIT] {hostname}: baseline created")
+            created.append(hostname)
+        else:
+            diff = r.result["diff"]
+            if diff:
+                lines.append(f"\n[DRIFT] {hostname} — {len(diff)} changed lines:")
+                lines.extend(diff)
+                drifted.append(hostname)
+            else:
+                lines.append(f"\n[CLEAN] {hostname}: matches baseline")
+                clean.append(hostname)
+
+    lines.append("\n" + "=" * 60)
+    lines.append(
+        f"Summary: {len(clean)} clean, {len(drifted)} drifted, "
+        f"{len(created)} initialized, {len(failed)} failed"
     )
-    return parser.parse_args()
+    if drifted:
+        lines.append(f"Drifted: {', '.join(drifted)}")
+    if failed:
+        lines.append(f"Failed:  {', '.join(failed)}")
+
+    report = "\n".join(lines)
+    print(report)
+
+    if args.output:
+        Path(args.output).write_text(report, encoding="utf-8")
+        logger.info("Report written to %s", args.output)
+
+    return 1 if (drifted or failed) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(run(parse_args()))
+    sys.exit(main())
+```
