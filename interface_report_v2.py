@@ -1,177 +1,224 @@
-```python
-"""
-Device Facts Report - Gathers and reports device facts across the network.
+interface_error_report.py - Interface error counter and utilization report.
 
-Purpose:
-    Collects device facts (model, OS version, serial number, uptime) from
-    network devices and generates a formatted report. Useful for inventory
-    management, compliance auditing, and device tracking.
+Collects per-interface error counters (RX/TX errors, input/output discards)
+from network devices via NAPALM/Nornir, flags interfaces that exceed a
+configurable threshold, and produces a tabular report or CSV export.
 
-Prerequisites:
-    - nornir installed with netmiko/napalm plugins
-    - hosts.yaml and groups.yaml inventory files
-    - Network connectivity to target devices
-    - Device credentials configured in inventory
+Useful for:
+  - Detecting duplex mismatches, CRC errors, and oversubscribed uplinks
+  - Scheduled health checks before/after maintenance windows
+  - Baselining error rates for capacity planning
 
 Usage:
-    python device_facts_report.py
-    python device_facts_report.py --device router-01
-    python device_facts_report.py --group production --output csv
-    python device_facts_report.py --filter 'device_type=="eos"' --output json
+    python interface_error_report.py --hosts rtr1,rtr2 --user admin --password s3cr3t
+    python interface_error_report.py --hosts rtr1 --user admin --password s3cr3t \
+        --platform eos --threshold 500 --flagged-only --output errors.csv
+
+Prerequisites:
+    pip install nornir nornir-napalm napalm tabulate
 """
 
 import argparse
-import json
+import csv
 import logging
 import sys
-from datetime import datetime
-from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.plugins.tasks.networking import napalm_get
-from nornir.plugins.functions.text import print_result
+from dataclasses import dataclass
+from typing import List
+
+from nornir.core import Nornir
+from nornir.core.inventory import (
+    ConnectionOptions,
+    Defaults,
+    Groups,
+    Host,
+    Hosts,
+    Inventory,
+)
+from nornir.core.plugins.runners import ThreadedRunner
+from nornir.core.state import GlobalState
+from nornir.core.task import Result, Task
+from nornir_napalm.plugins.tasks import napalm_get
+from tabulate import tabulate
 
 logging.basicConfig(
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("if_error_report")
 
 
-def gather_facts(task):
-    """Gather device facts using NAPALM."""
-    try:
-        result = task.run(napalm_get, getters=["facts"])
-        return result
-    except Exception as e:
-        logger.error(f"Failed to gather facts from {task.host.name}: {e}")
-        raise
+@dataclass
+class IfCounter:
+    host: str
+    interface: str
+    rx_errors: int
+    tx_errors: int
+    rx_discards: int
+    tx_discards: int
+
+    @property
+    def total(self) -> int:
+        return self.rx_errors + self.tx_errors + self.rx_discards + self.tx_discards
 
 
-def format_uptime(seconds):
-    """Convert seconds to human-readable uptime."""
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
+def _build_inventory(
+    hostnames: List[str], username: str, password: str, platform: str
+) -> Inventory:
+    hosts = {}
+    for name in hostnames:
+        hosts[name] = Host(
+            name=name,
+            hostname=name,
+            username=username,
+            password=password,
+            platform=platform,
+            connection_options={
+                "napalm": ConnectionOptions(
+                    username=username,
+                    password=password,
+                    extras={"optional_args": {"timeout": 30}},
+                )
+            },
+        )
+    return Inventory(hosts=Hosts(hosts), groups=Groups(), defaults=Defaults())
 
 
-def generate_csv_report(results):
-    """Generate CSV-formatted report."""
-    header = "Device,Vendor,Model,OS Version,Serial Number,Uptime,Hostname"
-    print(header)
-    
-    for device_name in sorted(results.keys()):
-        result = results[device_name][0].result
-        if result and 'facts' in result:
-            facts = result['facts']
-            uptime = format_uptime(facts.get('uptime', 0))
-            print(f"{device_name},{facts.get('vendor', 'N/A')},{facts.get('model', 'N/A')},"
-                  f"{facts.get('os_version', 'N/A')},{facts.get('serial_number', 'N/A')},"
-                  f"{uptime},{facts.get('hostname', 'N/A')}")
+def _collect(task: Task) -> Result:
+    r = task.run(task=napalm_get, getters=["interfaces_counters"])
+    counters = r[0].result.get("interfaces_counters", {})
+    records = []
+    for iface, s in counters.items():
+        records.append(
+            IfCounter(
+                host=task.host.name,
+                interface=iface,
+                rx_errors=s.get("rx_errors") or 0,
+                tx_errors=s.get("tx_errors") or 0,
+                rx_discards=s.get("rx_discards") or 0,
+                tx_discards=s.get("tx_discards") or 0,
+            )
+        )
+    return Result(host=task.host, result=records)
 
 
-def generate_text_report(results):
-    """Generate human-readable text report."""
-    print("\n" + "=" * 80)
-    print("DEVICE FACTS REPORT")
-    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 80 + "\n")
-    
-    for device_name in sorted(results.keys()):
-        result = results[device_name][0].result
-        if result and 'facts' in result:
-            facts = result['facts']
-            uptime = format_uptime(facts.get('uptime', 0))
-            
-            print(f"Device: {device_name}")
-            print(f"  Hostname:      {facts.get('hostname', 'N/A')}")
-            print(f"  Vendor:        {facts.get('vendor', 'N/A')}")
-            print(f"  Model:         {facts.get('model', 'N/A')}")
-            print(f"  OS Version:    {facts.get('os_version', 'N/A')}")
-            print(f"  Serial Number: {facts.get('serial_number', 'N/A')}")
-            print(f"  Uptime:        {uptime}")
-            print(f"  Interfaces:    {facts.get('interface_count', 'N/A')}")
-            print()
+def _render(records: List[IfCounter], threshold: int, flagged_only: bool) -> str:
+    rows = sorted(records, key=lambda r: (r.host, r.interface))
+    if flagged_only:
+        rows = [r for r in rows if r.total >= threshold]
+    table = [
+        [
+            r.host,
+            r.interface,
+            r.rx_errors,
+            r.tx_errors,
+            r.rx_discards,
+            r.tx_discards,
+            r.total,
+            "!" if r.total >= threshold else "",
+        ]
+        for r in rows
+    ]
+    headers = ["Host", "Interface", "RX Err", "TX Err", "RX Drop", "TX Drop", "Total", "Flag"]
+    return tabulate(table, headers=headers, tablefmt="grid")
 
 
-def generate_json_report(results):
-    """Generate JSON-formatted report."""
-    report = {}
-    for device_name in results.keys():
-        result = results[device_name][0].result
-        if result and 'facts' in result:
-            facts = result['facts']
-            report[device_name] = {
-                'hostname': facts.get('hostname', 'N/A'),
-                'vendor': facts.get('vendor', 'N/A'),
-                'model': facts.get('model', 'N/A'),
-                'os_version': facts.get('os_version', 'N/A'),
-                'serial_number': facts.get('serial_number', 'N/A'),
-                'uptime_seconds': facts.get('uptime', 0),
-                'interface_count': facts.get('interface_count', 0)
-            }
-    print(json.dumps(report, indent=2))
+def _write_csv(records: List[IfCounter], path: str) -> None:
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["host", "interface", "rx_errors", "tx_errors", "rx_discards", "tx_discards", "total"])
+        for r in records:
+            w.writerow([r.host, r.interface, r.rx_errors, r.tx_errors, r.rx_discards, r.tx_discards, r.total])
+    logger.info("CSV written to %s", path)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Gather and report device facts from network inventory'
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Report interface error counters and flag threshold violations."
     )
-    parser.add_argument('--device', help='Target specific device by name')
-    parser.add_argument('--group', help='Filter devices by group')
-    parser.add_argument('--filter', help='Advanced filter expression (e.g., vendor=="cisco")')
-    parser.add_argument('--output', choices=['text', 'csv', 'json'], default='text',
-                        help='Output format (default: text)')
-    parser.add_argument('--log-level', default='WARNING', 
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                        help='Logging level')
-    args = parser.parse_args()
-    
-    logger.setLevel(getattr(logging, args.log_level))
-    
-    try:
-        nr = InitNornir(config_file="config.yaml")
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-        
-        # Apply filters
-        if args.device:
-            nr = nr.filter(name=args.device)
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-        elif args.filter:
-            try:
-                nr = nr.filter(F(eval(args.filter)))
-            except Exception as e:
-                logger.error(f"Invalid filter expression: {e}")
-                return 1
-        
-        if len(nr.inventory.hosts) == 0:
-            logger.error("No devices matched the specified criteria")
-            return 1
-        
-        logger.info(f"Gathering facts from {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=gather_facts)
-        
-        # Check for failures
-        failed_count = sum(1 for r in results.values() if r.failed)
-        if failed_count > 0:
-            logger.warning(f"{failed_count} device(s) failed to report facts")
-        
-        # Generate report
-        if args.output == 'csv':
-            generate_csv_report(results)
-        elif args.output == 'json':
-            generate_json_report(results)
-        else:
-            generate_text_report(results)
-        
-        return 0
-    
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+    p.add_argument("--hosts", required=True, help="Comma-separated hostnames or IPs")
+    p.add_argument("--user", required=True, help="SSH/API username")
+    p.add_argument("--password", required=True, help="SSH/API password")
+    p.add_argument(
+        "--platform",
+        default="ios",
+        help="NAPALM driver: ios, eos, junos, nxos_ssh (default: ios)",
+    )
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=1,
+        help="Flag interfaces where total errors+discards >= N (default: 1)",
+    )
+    p.add_argument(
+        "--flagged-only",
+        action="store_true",
+        help="Print only interfaces that breach the threshold",
+    )
+    p.add_argument("--output", metavar="FILE", help="Write full results to CSV file")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Concurrent worker threads (default: 10)",
+    )
+    p.add_argument("--verbose", action="store_true", help="Debug logging")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    host_list = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    if not host_list:
+        logger.error("No valid hosts provided via --hosts")
         return 1
+
+    nr = Nornir(
+        inventory=_build_inventory(host_list, args.user, args.password, args.platform),
+        runner=ThreadedRunner(num_workers=args.workers),
+        data=GlobalState(),
+    )
+
+    logger.info("Querying %d host(s): %s", len(host_list), ", ".join(host_list))
+    results = nr.run(task=_collect)
+
+    all_records: List[IfCounter] = []
+    failed: List[str] = []
+
+    for hostname, multi in results.items():
+        if multi.failed:
+            logger.warning("Failed on %s: %s", hostname, multi[0].exception)
+            failed.append(hostname)
+            continue
+        records = multi[0].result
+        if isinstance(records, list):
+            all_records.extend(records)
+
+    if not all_records:
+        logger.error("No interface data collected — check connectivity and credentials.")
+        return 1
+
+    print(_render(all_records, args.threshold, args.flagged_only))
+
+    flagged_count = sum(1 for r in all_records if r.total >= args.threshold)
+    logger.info(
+        "Done — %d interface(s) on %d host(s) | %d flagged (threshold=%d) | %d failed",
+        len(all_records),
+        len(host_list) - len(failed),
+        flagged_count,
+        args.threshold,
+        len(failed),
+    )
+
+    if args.output:
+        _write_csv(all_records, args.output)
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-```
