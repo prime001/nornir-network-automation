@@ -1,216 +1,222 @@
-The write was blocked — outputting the script content directly as requested:
+ntp_audit.py - Fleet-wide NTP compliance audit using Nornir threaded execution.
 
-"""
-device_health.py — Parallel device health and resource utilization monitor.
-
-Collects CPU load, memory utilization, uptime, and hardware environment status
-(fans, temperature, power supplies) from network devices using NAPALM via
-Nornir's threaded runner. Raises configurable alerts when thresholds are exceeded.
+Purpose:
+    Connects to all devices in the Nornir inventory concurrently, collects NTP
+    synchronization status and configured server list, then flags devices that
+    are unsynced, exceed a stratum threshold, or are missing required NTP peers.
+    Optionally writes a CSV report for change-management evidence.
 
 Usage:
-    python device_health.py --inventory hosts.yaml
-    python device_health.py --inventory hosts.yaml --filter-group core_routers
-    python device_health.py --inventory hosts.yaml --threshold-cpu 80 --threshold-mem 85
-    python device_health.py --inventory hosts.yaml --alerts-only --workers 20
+    python ntp_audit.py [options]
+
+    python ntp_audit.py --expected-servers 10.0.1.10 10.0.1.11 --max-stratum 4
+    python ntp_audit.py --filter-group datacenter --output ntp_report.csv
+    python ntp_audit.py --username admin --password secret --workers 20
 
 Prerequisites:
-    pip install nornir nornir-napalm nornir-utils napalm
-    Nornir inventory files (hosts.yaml, groups.yaml, defaults.yaml) with
-    platform set to a NAPALM-supported driver (ios, eos, junos, nxos_ssh, etc.)
+    pip install nornir nornir-netmiko nornir-utils
+    hosts.yaml / groups.yaml / defaults.yaml in cwd (or pass --inventory <dir>)
+    Devices must support IOS-style 'show ntp status' and 'show ntp associations'.
 """
 
 import argparse
+import csv
 import logging
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import List, Optional
 
 from nornir import InitNornir
-from nornir.core.filter import F
 from nornir.core.task import Result, Task
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir_netmiko.tasks import netmiko_send_command
+from nornir_utils.plugins.functions import print_result
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ntp_audit")
 
 
 @dataclass
-class DeviceHealth:
+class NTPStatus:
     hostname: str
-    vendor: str = ""
-    model: str = ""
-    os_version: str = ""
-    uptime_hours: float = 0.0
-    cpu_load: float = 0.0
-    memory_used_pct: float = 0.0
-    fans_ok: bool = True
-    temperature_ok: bool = True
-    psu_ok: bool = True
-    alerts: List[str] = field(default_factory=list)
+    synced: bool = False
+    stratum: int = 16
+    configured_servers: List[str] = field(default_factory=list)
+    active_peer: str = ""
+    offset_ms: float = 0.0
+    error: Optional[str] = None
 
 
-def collect_health(task: Task, cpu_threshold: float, mem_threshold: float) -> Result:
-    result = task.run(task=napalm_get, getters=["facts", "environment"])
-    facts = result[0].result.get("facts", {})
-    env = result[0].result.get("environment", {})
+def _parse_associations(output: str) -> dict:
+    """Return {ip: {active: bool}} from 'show ntp associations' output."""
+    peers = {}
+    for line in output.splitlines():
+        active = line.lstrip().startswith("*")
+        candidate = line.strip().lstrip("*+~x# ")
+        parts = candidate.split()
+        if parts and parts[0].count(".") == 3:
+            peers[parts[0]] = {"active": active}
+    return peers
 
-    health = DeviceHealth(hostname=task.host.name)
-    health.vendor = facts.get("vendor", "unknown")
-    health.model = facts.get("model", "unknown")
-    health.os_version = facts.get("os_version", "unknown")
-    uptime_secs = facts.get("uptime", 0)
-    health.uptime_hours = round(uptime_secs / 3600, 1) if uptime_secs else 0.0
 
-    cpu_info = env.get("cpu", {})
-    if cpu_info:
-        loads = [v.get("%usage", 0) for v in cpu_info.values() if isinstance(v, dict)]
-        health.cpu_load = max(loads) if loads else 0.0
+def _parse_status(output: str) -> tuple:
+    """Return (synced: bool, stratum: int, offset_ms: float) from 'show ntp status'."""
+    lower = output.lower()
+    synced = "synchronized" in lower and "unsynchronized" not in lower
+    stratum, offset = 16, 0.0
+    for line in output.splitlines():
+        lline = line.lower()
+        if "stratum" in lline:
+            for token in line.split(","):
+                if "stratum" in token.lower():
+                    try:
+                        stratum = int(token.strip().split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+        if "offset" in lline:
+            for token in line.split(","):
+                if "offset" in token.lower():
+                    try:
+                        offset = float(token.strip().split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+    return synced, stratum, offset
 
-    mem_info = env.get("memory", {})
-    if mem_info:
-        used = mem_info.get("used_ram", 0)
-        avail = mem_info.get("available_ram", 0)
-        total = used + avail
-        health.memory_used_pct = round((used / total) * 100, 1) if total else 0.0
 
-    fans = env.get("fans", {})
-    if fans:
-        health.fans_ok = all(v.get("status", True) for v in fans.values())
-
-    temps = env.get("temperature", {})
-    if temps:
-        health.temperature_ok = all(
-            not v.get("is_alert", False) and not v.get("is_critical", False)
-            for v in temps.values()
-            if isinstance(v, dict)
+def audit_ntp(task: Task) -> Result:
+    """Nornir task: gather NTP state from one device and return NTPStatus."""
+    status = NTPStatus(hostname=task.host.name)
+    try:
+        assoc = task.run(
+            task=netmiko_send_command,
+            command_string="show ntp associations",
+            use_textfsm=False,
         )
-
-    psus = env.get("power", {})
-    if psus:
-        health.psu_ok = all(v.get("status", True) for v in psus.values())
-
-    if health.cpu_load > cpu_threshold:
-        health.alerts.append(f"CPU {health.cpu_load:.1f}% exceeds {cpu_threshold}%")
-    if health.memory_used_pct > mem_threshold:
-        health.alerts.append(f"Memory {health.memory_used_pct:.1f}% exceeds {mem_threshold}%")
-    if not health.fans_ok:
-        health.alerts.append("Fan failure detected")
-    if not health.temperature_ok:
-        health.alerts.append("Temperature alert or critical")
-    if not health.psu_ok:
-        health.alerts.append("PSU failure detected")
-
-    return Result(host=task.host, result=health)
-
-
-def print_health_table(results: Dict[str, DeviceHealth]) -> None:
-    col = f"{'Device':<22} {'Vendor':<10} {'Model':<18} {'Uptime(h)':<11} {'CPU%':<7} {'Mem%':<7} Status"
-    divider = "-" * len(col)
-    print(f"\n{divider}\n{col}\n{divider}")
-
-    alert_lines: List[str] = []
-    for hostname, h in sorted(results.items()):
-        status = "OK" if not h.alerts else f"ALERT x{len(h.alerts)}"
-        print(
-            f"{hostname:<22} {h.vendor:<10} {h.model:<18} "
-            f"{h.uptime_hours:<11} {h.cpu_load:<7.1f} {h.memory_used_pct:<7.1f} {status}"
+        stat = task.run(
+            task=netmiko_send_command,
+            command_string="show ntp status",
+            use_textfsm=False,
         )
-        for alert in h.alerts:
-            alert_lines.append(f"  [{hostname}] {alert}")
+        peers = _parse_associations(assoc.result)
+        status.configured_servers = list(peers)
+        active = [ip for ip, v in peers.items() if v["active"]]
+        status.active_peer = active[0] if active else ""
+        status.synced, status.stratum, status.offset_ms = _parse_status(stat.result)
+    except Exception as exc:
+        status.error = str(exc)
+        logger.error("%s: %s", task.host.name, exc)
+    return Result(host=task.host, result=status)
 
-    print(divider)
-    if alert_lines:
-        print("\nAlerts:")
-        print("\n".join(alert_lines))
+
+def _violations(status: NTPStatus, expected: List[str], max_stratum: int) -> List[str]:
+    if status.error:
+        return [f"connection error: {status.error}"]
+    issues = []
+    if not status.synced:
+        issues.append("NTP not synchronized")
+    if status.stratum > max_stratum:
+        issues.append(f"stratum {status.stratum} exceeds max {max_stratum}")
+    missing = set(expected) - set(status.configured_servers)
+    if missing:
+        issues.append(f"missing required servers: {', '.join(sorted(missing))}")
+    return issues
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Collect device health metrics across a Nornir inventory via NAPALM"
+def _write_csv(rows: list, path: str) -> None:
+    fieldnames = ["hostname", "synced", "stratum", "active_peer",
+                  "offset_ms", "configured_servers", "violations"]
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Report written to {path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="NTP compliance audit across Nornir inventory (threaded)"
     )
-    p.add_argument("--inventory", default="hosts.yaml", help="Hosts inventory file")
-    p.add_argument("--groups-file", default="groups.yaml", help="Groups file")
-    p.add_argument("--defaults-file", default="defaults.yaml", help="Defaults file")
-    p.add_argument("--filter-group", help="Restrict to devices in this Nornir group")
-    p.add_argument("--filter-host", help="Run against a single host by name")
-    p.add_argument("--username", help="Override inventory username")
-    p.add_argument("--password", help="Override inventory password")
-    p.add_argument("--workers", type=int, default=10, help="Concurrent threads (default: 10)")
-    p.add_argument("--threshold-cpu", type=float, default=75.0,
-                   help="CPU%% alert threshold (default: 75)")
-    p.add_argument("--threshold-mem", type=float, default=80.0,
-                   help="Memory%% alert threshold (default: 80)")
-    p.add_argument("--alerts-only", action="store_true",
-                   help="Print only devices with active alerts")
-    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    return p
-
-
-if __name__ == "__main__":
-    args = build_parser().parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    parser.add_argument("--inventory", default=".",
+                        help="Directory containing hosts/groups/defaults YAML (default: .)")
+    parser.add_argument("--expected-servers", nargs="*", default=[], metavar="IP",
+                        help="NTP server IPs required on every device")
+    parser.add_argument("--max-stratum", type=int, default=5,
+                        help="Maximum acceptable stratum (default: 5)")
+    parser.add_argument("--username", help="Override inventory username")
+    parser.add_argument("--password", help="Override inventory password")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="Thread pool size (default: 10)")
+    parser.add_argument("--filter-group", dest="group",
+                        help="Limit audit to a specific Nornir host group")
+    parser.add_argument("--output", metavar="FILE",
+                        help="Write CSV report to FILE")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print raw Nornir task output")
+    args = parser.parse_args()
 
     nr = InitNornir(
         runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
         inventory={
             "plugin": "SimpleInventory",
             "options": {
-                "host_file": args.inventory,
-                "group_file": args.groups_file,
-                "defaults_file": args.defaults_file,
+                "host_file": f"{args.inventory}/hosts.yaml",
+                "group_file": f"{args.inventory}/groups.yaml",
+                "defaults_file": f"{args.inventory}/defaults.yaml",
             },
         },
     )
-
     if args.username:
         nr.inventory.defaults.username = args.username
     if args.password:
         nr.inventory.defaults.password = args.password
+    if args.group:
+        nr = nr.filter(groups=args.group)
 
-    if args.filter_group:
-        nr = nr.filter(F(groups__contains=args.filter_group))
-    if args.filter_host:
-        nr = nr.filter(name=args.filter_host)
+    device_count = len(nr.inventory.hosts)
+    print(f"Auditing NTP on {device_count} device(s) with {args.workers} workers...\n")
 
-    if not nr.inventory.hosts:
-        print("No hosts matched the given filters.", file=sys.stderr)
-        sys.exit(1)
+    results = nr.run(task=audit_ntp, name="NTP Audit")
 
-    print(
-        f"Collecting health data from {len(nr.inventory.hosts)} device(s) "
-        f"with {args.workers} worker(s)..."
-    )
+    if args.verbose:
+        print_result(results)
 
-    results = nr.run(
-        task=collect_health,
-        cpu_threshold=args.threshold_cpu,
-        mem_threshold=args.threshold_mem,
-    )
+    rows, passed, failed = [], 0, 0
+    for hostname, multi in results.items():
+        status: NTPStatus = multi[0].result
+        issues = _violations(status, args.expected_servers, args.max_stratum)
+        ok = not issues
+        passed += ok
+        failed += not ok
+        label = "PASS" if ok else "FAIL"
 
-    health_data: Dict[str, DeviceHealth] = {}
-    failed: List[str] = []
-    for hostname, multi_result in results.items():
-        if multi_result.failed:
-            failed.append(hostname)
-            logger.error("Failed to collect from %s: %s", hostname, multi_result[0].exception)
-        else:
-            health_data[hostname] = multi_result[0].result
+        print(f"[{label}] {hostname}")
+        print(f"       synced={status.synced}  stratum={status.stratum}"
+              f"  active_peer={status.active_peer or 'none'}"
+              f"  offset={status.offset_ms} ms")
+        for issue in issues:
+            print(f"       ! {issue}")
+        if status.configured_servers:
+            print(f"       servers: {', '.join(status.configured_servers)}")
+        print()
 
-    if args.alerts_only:
-        health_data = {h: d for h, d in health_data.items() if d.alerts}
+        rows.append({
+            "hostname": hostname,
+            "synced": status.synced,
+            "stratum": status.stratum,
+            "active_peer": status.active_peer,
+            "offset_ms": status.offset_ms,
+            "configured_servers": "|".join(status.configured_servers),
+            "violations": "; ".join(issues),
+        })
 
-    if health_data:
-        print_health_table(health_data)
+    print(f"Summary: {passed} passed, {failed} failed out of {passed + failed} devices.")
+    if args.output:
+        _write_csv(rows, args.output)
 
-    if failed:
-        print(f"\nFailed ({len(failed)}): {', '.join(failed)}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
 
-    alert_count = sum(1 for d in health_data.values() if d.alerts)
-    print(f"\nSummary: {len(health_data)} collected, {alert_count} with alerts, {len(failed)} failed")
 
-    sys.exit(1 if failed or alert_count else 0)
+if __name__ == "__main__":
+    main()
