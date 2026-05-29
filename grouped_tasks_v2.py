@@ -1,217 +1,246 @@
 ```python
+#!/usr/bin/env python3
 """
-Network Configuration Change Validator
+Device Configuration Line Analyzer
 
-Validates configuration changes by capturing baseline configs, applying changes,
-and verifying correctness. Supports automatic rollback on validation failure.
-
-Usage:
-    python config_validator.py --devices router1,router2 --username admin \\
-        --password secret --commands "interface ge-0/0/1" "mtu 1500" \\
-        --verify-pattern "mtu 1500"
+Analyzes network device configurations to measure complexity, identify enabled
+features, and track configuration baselines. Useful for capacity planning,
+change impact analysis, and configuration governance.
 
 Prerequisites:
-    - Nornir installed with netmiko/napalm plugins
-    - Network devices accessible and configured for remote access
-    - Proper credentials with privilege level for config changes
+    - Nornir with netmiko transport
+    - Network device SSH access
+    - hosts.yml and groups.yml in inventory/
 
-Returns:
-    - 0 on successful validation
-    - 1 if validation fails (config may be rolled back)
-    - 2 if connection/execution error occurs
+Usage:
+    python config_line_analyzer.py --group core-routers
+    python config_line_analyzer.py --group switches --format json -o analysis.json
+    python config_line_analyzer.py --host router1 --search "bgp" --format table
 """
 
 import argparse
 import json
 import logging
-from datetime import datetime
-from typing import Optional
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.networking import netmiko_send_command, netmiko_send_config
-from nornir.plugins.functions.text import print_result
+from nornir.core.task import Result, Task
+from nornir.plugins.tasks.networking import netmiko_send_command
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-
-def validate_change(task, commands: list[str], verify_pattern: str, rollback: bool = True):
+def analyze_configuration(task: Task, search_terms: List[str] = None) -> Result:
     """
-    Execute config change and validate against expected pattern.
-
-    Args:
-        task: Nornir task object
-        commands: List of configuration commands to apply
-        verify_pattern: String pattern to search for in validation check
-        rollback: Rollback config if validation fails
+    Retrieve and analyze device configuration.
+    
+    Counts configuration lines, identifies features, searches for keywords.
     """
-    device = task.host
-    timestamp = datetime.now().isoformat()
-
     try:
-        # Capture baseline
-        baseline = task.run(
+        config_result = task.run(
             netmiko_send_command,
             command_string="show running-config",
-            name=f"baseline_{device.name}"
+            use_textfsm=False,
+            name="Retrieve Configuration"
         )
-        logger.info(f"{device.name}: Baseline config captured ({len(baseline[1].result)} bytes)")
-
-        # Apply configuration
-        task.run(
-            netmiko_send_config,
-            config_commands=commands,
-            exit_config_mode=True,
-            name=f"deploy_{device.name}"
-        )
-        logger.info(f"{device.name}: Configuration deployed: {commands}")
-
-        # Verify change
-        verify_output = task.run(
-            netmiko_send_command,
-            command_string="show running-config",
-            name=f"verify_{device.name}"
-        )
-
-        if verify_pattern.lower() in verify_output[2].result.lower():
-            logger.info(f"{device.name}: ✓ Verification passed (pattern found)")
-            return {
-                "status": "success",
-                "device": device.name,
-                "timestamp": timestamp,
-                "commands_applied": commands,
-                "validation": "pattern_found"
-            }
-        else:
-            logger.warning(f"{device.name}: ✗ Verification failed (pattern not found)")
-
-            if rollback:
-                logger.info(f"{device.name}: Initiating rollback...")
-                rollback_commands = [
-                    f"no {cmd}" if not cmd.startswith("no ") else cmd.replace("no ", "")
-                    for cmd in commands
-                ]
-                task.run(
-                    netmiko_send_config,
-                    config_commands=rollback_commands,
-                    exit_config_mode=True,
-                    name=f"rollback_{device.name}"
-                )
-                logger.info(f"{device.name}: Rollback completed")
-
-            return {
-                "status": "failed",
-                "device": device.name,
-                "timestamp": timestamp,
-                "commands_applied": commands,
-                "validation": "pattern_not_found",
-                "rollback_executed": rollback
-            }
-
-    except Exception as e:
-        logger.error(f"{device.name}: Execution error: {str(e)}")
-        return {
-            "status": "error",
-            "device": device.name,
-            "timestamp": timestamp,
-            "error": str(e)
+        
+        config = config_result.result
+        lines = [line.strip() for line in config.split('\n') if line.strip()]
+        
+        # Count non-comment lines
+        non_comment_lines = [
+            line for line in lines
+            if not line.startswith('!')
+        ]
+        
+        # Extract key features
+        features = {
+            'bgp': any('bgp' in line.lower() for line in lines),
+            'ospf': any('ospf' in line.lower() for line in lines),
+            'eigrp': any('eigrp' in line.lower() for line in lines),
+            'vlan': any('vlan' in line.lower() for line in lines),
+            'acl': any('access-list' in line.lower() for line in lines),
+            'nat': any('nat' in line.lower() for line in lines),
+            'ipsec': any('ipsec' in line.lower() or 'crypto' in line.lower() for line in lines),
+            'qos': any('qos' in line.lower() or 'policy-map' in line.lower() for line in lines),
         }
+        
+        # Search for custom terms
+        search_results = {}
+        if search_terms:
+            for term in search_terms:
+                matches = [
+                    line for line in lines
+                    if term.lower() in line.lower()
+                ]
+                search_results[term] = len(matches)
+        
+        result = {
+            'device': task.host.name,
+            'total_lines': len(lines),
+            'config_lines': len(non_comment_lines),
+            'comment_lines': len(lines) - len(non_comment_lines),
+            'features_enabled': {k: v for k, v in features.items() if v},
+            'features_count': sum(1 for v in features.values() if v),
+        }
+        
+        if search_results:
+            result['search_matches'] = search_results
+        
+        return Result(host=task.host, result=result)
+        
+    except Exception as e:
+        logging.error(f"Configuration analysis failed for {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={'device': task.host.name, 'error': str(e)},
+            failed=True
+        )
+
+
+def print_table(data: List[Dict[str, Any]]) -> None:
+    """Print analysis results as formatted table."""
+    print("\n" + "=" * 100)
+    print(
+        f"{'Device':<20} {'Total Lines':<15} {'Config Lines':<15} "
+        f"{'Features':<15} {'BGP':<8} {'OSPF':<8} {'VLAN':<8}"
+    )
+    print("=" * 100)
+    
+    for item in data:
+        if 'error' in item:
+            print(f"{item['device']:<20} ERROR: {item['error']:<70}")
+            continue
+        
+        features = item.get('features_enabled', {})
+        bgp = '✓' if features.get('bgp') else '-'
+        ospf = '✓' if features.get('ospf') else '-'
+        vlan = '✓' if features.get('vlan') else '-'
+        
+        print(
+            f"{item['device']:<20} {item['total_lines']:<15} "
+            f"{item['config_lines']:<15} {item['features_count']:<15} "
+            f"{bgp:<8} {ospf:<8} {vlan:<8}"
+        )
+    
+    print("=" * 100)
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Analyze network device configurations"
     )
     parser.add_argument(
-        "--devices",
-        required=True,
-        help="Comma-separated device names (e.g., router1,router2)"
+        "--group",
+        help="Filter devices by group"
     )
     parser.add_argument(
-        "--username",
-        required=True,
-        help="Username for device authentication"
+        "--host",
+        help="Analyze single host only"
     )
     parser.add_argument(
-        "--password",
-        required=True,
-        help="Password for device authentication"
+        "--search",
+        nargs='+',
+        help="Search for specific keywords in configuration"
     )
     parser.add_argument(
-        "--commands",
-        nargs="+",
-        required=True,
-        help="Configuration commands to apply (space-separated list)"
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)"
     )
     parser.add_argument(
-        "--verify-pattern",
-        required=True,
-        help="String pattern to verify in post-change config"
-    )
-    parser.add_argument(
-        "--no-rollback",
-        action="store_true",
-        help="Disable automatic rollback on validation failure"
+        "-o", "--output",
+        help="Write results to file"
     )
     parser.add_argument(
         "--inventory",
-        default="inventory.yml",
-        help="Path to Nornir inventory file (default: inventory.yml)"
+        default="inventory",
+        help="Nornir inventory path (default: inventory)"
     )
-
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
+    
     args = parser.parse_args()
-
+    
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger(__name__)
+    
     try:
-        nr = InitNornir(config_file=args.inventory)
-        devices = [d.strip() for d in args.devices.split(",")]
-        nr = nr.filter(F(name__in=devices))
-
+        # Initialize Nornir
+        inventory_path = Path(args.inventory) / "config.yaml"
+        if not inventory_path.exists():
+            logger.error(f"Inventory config not found: {inventory_path}")
+            sys.exit(1)
+        
+        nr = InitNornir(config_file=str(inventory_path))
+        logger.info(f"Loaded {len(nr.inventory.hosts)} hosts")
+        
+        # Apply filters
+        if args.host:
+            nr = nr.filter(F(name=args.host))
+        elif args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+        
         if not nr.inventory.hosts:
-            logger.error(f"No devices found matching: {devices}")
-            return 2
-
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            host.password = args.password
-
-        logger.info(f"Starting validation on {len(nr.inventory.hosts)} device(s)")
-
+            logger.error("No devices matched filter criteria")
+            sys.exit(1)
+        
+        logger.info(f"Analyzing {len(nr.inventory.hosts)} device(s)")
+        
+        # Run analysis
         results = nr.run(
-            task=validate_change,
-            commands=args.commands,
-            verify_pattern=args.verify_pattern,
-            rollback=not args.no_rollback
+            task=analyze_configuration,
+            search_terms=args.search or []
         )
-
-        print_result(results)
-
-        success_count = sum(
-            1 for r in results.values()
-            if isinstance(r, dict) and r.get("status") == "success"
-        )
-        total_count = len(results)
-
-        logger.info(f"\nSummary: {success_count}/{total_count} devices validated successfully")
-
-        if success_count == total_count:
-            return 0
+        
+        # Collect results
+        output_data = []
+        failed_count = 0
+        
+        for hostname in results:
+            task_result = results[hostname][0]
+            output_data.append(task_result.result)
+            if task_result.failed:
+                failed_count += 1
+        
+        logger.info(f"Analysis complete: {len(output_data) - failed_count} successful, {failed_count} failed")
+        
+        # Format and display output
+        if args.format == "json":
+            output_text = json.dumps(output_data, indent=2)
         else:
-            return 1
-
-    except FileNotFoundError:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        return 2
+            output_text = None
+            print_table(output_data)
+        
+        # Write to file if specified
+        if args.output:
+            with open(args.output, 'w') as f:
+                if output_text:
+                    f.write(output_text)
+                else:
+                    f.write('\n'.join(str(item) for item in output_data))
+            logger.info(f"Results saved to {args.output}")
+        elif output_text:
+            print(output_text)
+        
+        sys.exit(0 if failed_count == 0 else 1)
+        
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        return 2
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
