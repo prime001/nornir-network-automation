@@ -1,222 +1,225 @@
-ntp_audit.py - Fleet-wide NTP compliance audit using Nornir threaded execution.
+```python
+"""
+Device Uptime and Facts Report
 
-Purpose:
-    Connects to all devices in the Nornir inventory concurrently, collects NTP
-    synchronization status and configured server list, then flags devices that
-    are unsynced, exceed a stratum threshold, or are missing required NTP peers.
-    Optionally writes a CSV report for change-management evidence.
+Collects device facts including uptime, software version, model, and serial number.
+Generates a report for network inventory and compliance tracking.
 
 Usage:
-    python ntp_audit.py [options]
-
-    python ntp_audit.py --expected-servers 10.0.1.10 10.0.1.11 --max-stratum 4
-    python ntp_audit.py --filter-group datacenter --output ntp_report.csv
-    python ntp_audit.py --username admin --password secret --workers 20
+    python device_facts_report.py --config-file nornir_config.yaml --output report.csv
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    hosts.yaml / groups.yaml / defaults.yaml in cwd (or pass --inventory <dir>)
-    Devices must support IOS-style 'show ntp status' and 'show ntp associations'.
+    - Nornir installed (pip install nornir nornir-napalm)
+    - Nornir inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
+    - Devices accessible via SSH with appropriate credentials
+    - NAPALM driver support for device types
+
+Output:
+    CSV or JSON report with device facts including:
+    - Device name, hostname, vendor, model
+    - Serial number, uptime
+    - OS version, configuration status
 """
 
 import argparse
 import csv
+import json
 import logging
 import sys
-from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List
 
 from nornir import InitNornir
 from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
-from nornir_utils.plugins.functions import print_result
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("ntp_audit")
+from nornir_napalm.plugins.tasks import napalm_get
 
 
-@dataclass
-class NTPStatus:
-    hostname: str
-    synced: bool = False
-    stratum: int = 16
-    configured_servers: List[str] = field(default_factory=list)
-    active_peer: str = ""
-    offset_ms: float = 0.0
-    error: Optional[str] = None
+def setup_logging(level: str = "INFO") -> None:
+    """Configure logging to console and file."""
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=getattr(logging, level.upper()),
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("device_facts.log"),
+        ],
+    )
 
 
-def _parse_associations(output: str) -> dict:
-    """Return {ip: {active: bool}} from 'show ntp associations' output."""
-    peers = {}
-    for line in output.splitlines():
-        active = line.lstrip().startswith("*")
-        candidate = line.strip().lstrip("*+~x# ")
-        parts = candidate.split()
-        if parts and parts[0].count(".") == 3:
-            peers[parts[0]] = {"active": active}
-    return peers
-
-
-def _parse_status(output: str) -> tuple:
-    """Return (synced: bool, stratum: int, offset_ms: float) from 'show ntp status'."""
-    lower = output.lower()
-    synced = "synchronized" in lower and "unsynchronized" not in lower
-    stratum, offset = 16, 0.0
-    for line in output.splitlines():
-        lline = line.lower()
-        if "stratum" in lline:
-            for token in line.split(","):
-                if "stratum" in token.lower():
-                    try:
-                        stratum = int(token.strip().split()[-1])
-                    except (ValueError, IndexError):
-                        pass
-        if "offset" in lline:
-            for token in line.split(","):
-                if "offset" in token.lower():
-                    try:
-                        offset = float(token.strip().split()[-1])
-                    except (ValueError, IndexError):
-                        pass
-    return synced, stratum, offset
-
-
-def audit_ntp(task: Task) -> Result:
-    """Nornir task: gather NTP state from one device and return NTPStatus."""
-    status = NTPStatus(hostname=task.host.name)
+def collect_device_facts(task: Task) -> Result:
+    """Collect device facts using NAPALM get_facts."""
     try:
-        assoc = task.run(
-            task=netmiko_send_command,
-            command_string="show ntp associations",
-            use_textfsm=False,
+        result = task.run(napalm_get, getters=["get_facts"])
+        return result
+    except Exception as e:
+        logging.error(f"Error collecting facts from {task.host.name}: {e}")
+        return Result(host=task.host, result={}, failed=True)
+
+
+def parse_facts(task: Task) -> Result:
+    """Parse and format device facts from NAPALM output."""
+    try:
+        facts_result = task.run(napalm_get, getters=["get_facts"])
+
+        if facts_result.failed:
+            return Result(
+                host=task.host,
+                result={"device": task.host.name, "error": "Failed to get facts"},
+                failed=True,
+            )
+
+        facts = facts_result[0].result.get("get_facts", {})
+        uptime_seconds = facts.get("uptime_seconds", 0)
+        uptime_days = uptime_seconds // 86400
+
+        parsed = {
+            "device": task.host.name,
+            "hostname": facts.get("hostname", "N/A"),
+            "vendor": facts.get("vendor", "N/A"),
+            "model": facts.get("model", "N/A"),
+            "serial_number": facts.get("serial_number", "N/A"),
+            "uptime_seconds": uptime_seconds,
+            "uptime_days": uptime_days,
+            "os_version": facts.get("os_version", "N/A"),
+            "fqdn": facts.get("fqdn", "N/A"),
+            "interface_count": facts.get("interface_count", "N/A"),
+        }
+
+        return Result(host=task.host, result=parsed)
+
+    except Exception as e:
+        logging.error(f"Error parsing facts from {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={"device": task.host.name, "error": str(e)},
+            failed=True,
         )
-        stat = task.run(
-            task=netmiko_send_command,
-            command_string="show ntp status",
-            use_textfsm=False,
-        )
-        peers = _parse_associations(assoc.result)
-        status.configured_servers = list(peers)
-        active = [ip for ip, v in peers.items() if v["active"]]
-        status.active_peer = active[0] if active else ""
-        status.synced, status.stratum, status.offset_ms = _parse_status(stat.result)
-    except Exception as exc:
-        status.error = str(exc)
-        logger.error("%s: %s", task.host.name, exc)
-    return Result(host=task.host, result=status)
 
 
-def _violations(status: NTPStatus, expected: List[str], max_stratum: int) -> List[str]:
-    if status.error:
-        return [f"connection error: {status.error}"]
-    issues = []
-    if not status.synced:
-        issues.append("NTP not synchronized")
-    if status.stratum > max_stratum:
-        issues.append(f"stratum {status.stratum} exceeds max {max_stratum}")
-    missing = set(expected) - set(status.configured_servers)
-    if missing:
-        issues.append(f"missing required servers: {', '.join(sorted(missing))}")
-    return issues
+def write_csv_report(data: List[Dict[str, Any]], output_path: Path) -> None:
+    """Write facts to CSV file."""
+    if not data:
+        logging.warning("No data to write")
+        return
+
+    fieldnames = list(data[0].keys())
+
+    try:
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+        logging.info(f"CSV report written to {output_path}")
+    except IOError as e:
+        logging.error(f"Failed to write CSV file: {e}")
+        raise
 
 
-def _write_csv(rows: list, path: str) -> None:
-    fieldnames = ["hostname", "synced", "stratum", "active_peer",
-                  "offset_ms", "configured_servers", "violations"]
-    with open(path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"Report written to {path}")
+def write_json_report(data: List[Dict[str, Any]], output_path: Path) -> None:
+    """Write facts to JSON file."""
+    try:
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2)
+        logging.info(f"JSON report written to {output_path}")
+    except IOError as e:
+        logging.error(f"Failed to write JSON file: {e}")
+        raise
 
 
-def main() -> None:
+def display_summary(data: List[Dict[str, Any]]) -> None:
+    """Display summary statistics to console."""
+    if not data:
+        print("No data collected")
+        return
+
+    print("\n" + "=" * 90)
+    print("DEVICE FACTS SUMMARY")
+    print("=" * 90)
+    print(f"{'Device':<20} {'Vendor':<10} {'Model':<20} {'Version':<15} {'Days Up':<10}")
+    print("-" * 90)
+
+    for record in data:
+        if "error" not in record:
+            device = record.get("device", "N/A")
+            vendor = record.get("vendor", "N/A")
+            model = record.get("model", "N/A")
+            version = record.get("os_version", "N/A")
+            uptime = record.get("uptime_days", 0)
+            print(f"{device:<20} {vendor:<10} {model:<20} {version:<15} {uptime:<10}")
+
+    print("=" * 90 + "\n")
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description="NTP compliance audit across Nornir inventory (threaded)"
+        description="Collect and report device facts across network"
     )
-    parser.add_argument("--inventory", default=".",
-                        help="Directory containing hosts/groups/defaults YAML (default: .)")
-    parser.add_argument("--expected-servers", nargs="*", default=[], metavar="IP",
-                        help="NTP server IPs required on every device")
-    parser.add_argument("--max-stratum", type=int, default=5,
-                        help="Maximum acceptable stratum (default: 5)")
-    parser.add_argument("--username", help="Override inventory username")
-    parser.add_argument("--password", help="Override inventory password")
-    parser.add_argument("--workers", type=int, default=10,
-                        help="Thread pool size (default: 10)")
-    parser.add_argument("--filter-group", dest="group",
-                        help="Limit audit to a specific Nornir host group")
-    parser.add_argument("--output", metavar="FILE",
-                        help="Write CSV report to FILE")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print raw Nornir task output")
+    parser.add_argument(
+        "--config-file",
+        default="nornir_config.yaml",
+        help="Nornir configuration file path",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output file path (CSV or JSON based on extension)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help="Output format (overridden by file extension if --output used)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity level",
+    )
+
     args = parser.parse_args()
+    setup_logging(args.log_level)
 
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": f"{args.inventory}/hosts.yaml",
-                "group_file": f"{args.inventory}/groups.yaml",
-                "defaults_file": f"{args.inventory}/defaults.yaml",
-            },
-        },
-    )
-    if args.username:
-        nr.inventory.defaults.username = args.username
-    if args.password:
-        nr.inventory.defaults.password = args.password
-    if args.group:
-        nr = nr.filter(groups=args.group)
+    logger = logging.getLogger(__name__)
+    logger.info("Starting device facts collection")
 
-    device_count = len(nr.inventory.hosts)
-    print(f"Auditing NTP on {device_count} device(s) with {args.workers} workers...\n")
+    try:
+        nr = InitNornir(config_file=args.config_file)
+        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
 
-    results = nr.run(task=audit_ntp, name="NTP Audit")
+        results = nr.run(task=parse_facts, name="Get Device Facts")
 
-    if args.verbose:
-        print_result(results)
+        all_facts = []
+        failed_count = 0
 
-    rows, passed, failed = [], 0, 0
-    for hostname, multi in results.items():
-        status: NTPStatus = multi[0].result
-        issues = _violations(status, args.expected_servers, args.max_stratum)
-        ok = not issues
-        passed += ok
-        failed += not ok
-        label = "PASS" if ok else "FAIL"
+        for task_result in results.values():
+            if not task_result.failed:
+                all_facts.append(task_result[0].result)
+            else:
+                failed_count += 1
+                logger.warning(f"Failed to collect facts from device")
 
-        print(f"[{label}] {hostname}")
-        print(f"       synced={status.synced}  stratum={status.stratum}"
-              f"  active_peer={status.active_peer or 'none'}"
-              f"  offset={status.offset_ms} ms")
-        for issue in issues:
-            print(f"       ! {issue}")
-        if status.configured_servers:
-            print(f"       servers: {', '.join(status.configured_servers)}")
-        print()
+        if args.output:
+            output_path = Path(args.output)
+            if args.format == "json" or output_path.suffix == ".json":
+                write_json_report(all_facts, output_path)
+            else:
+                write_csv_report(all_facts, output_path)
+        else:
+            display_summary(all_facts)
 
-        rows.append({
-            "hostname": hostname,
-            "synced": status.synced,
-            "stratum": status.stratum,
-            "active_peer": status.active_peer,
-            "offset_ms": status.offset_ms,
-            "configured_servers": "|".join(status.configured_servers),
-            "violations": "; ".join(issues),
-        })
+        logger.info(
+            f"Collection complete: {len(all_facts)} successful, {failed_count} failed"
+        )
 
-    print(f"Summary: {passed} passed, {failed} failed out of {passed + failed} devices.")
-    if args.output:
-        _write_csv(rows, args.output)
-
-    sys.exit(1 if failed else 0)
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {args.config_file}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+```
