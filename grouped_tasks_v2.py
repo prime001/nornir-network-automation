@@ -1,246 +1,217 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Configuration Line Analyzer
+Device Health Monitoring Script
 
-Analyzes network device configurations to measure complexity, identify enabled
-features, and track configuration baselines. Useful for capacity planning,
-change impact analysis, and configuration governance.
-
-Prerequisites:
-    - Nornir with netmiko transport
-    - Network device SSH access
-    - hosts.yml and groups.yml in inventory/
+Monitor network device health metrics including uptime, system info, and
+resource utilization. Uses NAPALM to retrieve device facts and environment
+data, evaluates against configurable thresholds, and generates health reports.
 
 Usage:
-    python config_line_analyzer.py --group core-routers
-    python config_line_analyzer.py --group switches --format json -o analysis.json
-    python config_line_analyzer.py --host router1 --search "bgp" --format table
+    python device_health_monitor.py --devices ios1,ios2
+    python device_health_monitor.py --threshold 85 --verbose
+
+Prerequisites:
+    - nornir >= 3.0
+    - napalm
+    - SSH access to network devices
+    - hosts.yaml with device inventory configured
 """
 
-import argparse
-import json
 import logging
-import sys
-from pathlib import Path
-from typing import Any, Dict, List
-
+import argparse
+from typing import Dict
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir.plugins.tasks.napalm import napalm_get
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def analyze_configuration(task: Task, search_terms: List[str] = None) -> Result:
+def get_device_health(task, threshold: int = 80) -> Dict:
     """
-    Retrieve and analyze device configuration.
+    Retrieve device health metrics via NAPALM.
     
-    Counts configuration lines, identifies features, searches for keywords.
+    Collects device facts and environment data, checks CPU/memory utilization
+    against threshold, and identifies potential issues.
+    
+    Args:
+        task: Nornir task object
+        threshold: Warning threshold for utilization percentage
+    
+    Returns:
+        Dictionary with health status and metrics
     """
+    result = {
+        "device": task.host.name,
+        "status": "ok",
+        "alerts": [],
+        "metrics": {}
+    }
+    
     try:
-        config_result = task.run(
-            netmiko_send_command,
-            command_string="show running-config",
-            use_textfsm=False,
-            name="Retrieve Configuration"
-        )
+        # Retrieve device facts
+        facts_task = task.run(task=napalm_get, getters=["get_facts"])
+        facts = facts_task[0].result.get("get_facts", {})
         
-        config = config_result.result
-        lines = [line.strip() for line in config.split('\n') if line.strip()]
+        # Store basic device information
+        result["metrics"].update({
+            "uptime_days": facts.get("uptime", 0) // 86400,
+            "model": facts.get("model", "Unknown"),
+            "os_version": facts.get("os_version", "Unknown"),
+            "serial": facts.get("serial_number", "N/A")
+        })
         
-        # Count non-comment lines
-        non_comment_lines = [
-            line for line in lines
-            if not line.startswith('!')
-        ]
+        # Retrieve environment data (CPU, memory, temperature)
+        try:
+            env_task = task.run(task=napalm_get, getters=["get_environment"])
+            env = env_task[0].result.get("get_environment", {})
+            
+            # Evaluate CPU usage
+            if "cpu" in env and env["cpu"]:
+                cpu_key = list(env["cpu"].keys())[0]
+                cpu_usage = env["cpu"][cpu_key].get("%usage", 0)
+                result["metrics"]["cpu_usage"] = cpu_usage
+                
+                if cpu_usage > threshold:
+                    result["status"] = "warning"
+                    result["alerts"].append(
+                        f"CPU usage {cpu_usage}% exceeds {threshold}%"
+                    )
+            
+            # Evaluate memory usage
+            if "memory" in env:
+                mem_data = env["memory"]
+                if "used_ram" in mem_data:
+                    result["metrics"]["memory_mb"] = mem_data["used_ram"]
+            
+            # Check temperature
+            if "temperature" in env:
+                temps = env["temperature"]
+                for sensor, data in temps.items():
+                    if data.get("is_alert"):
+                        result["status"] = "warning"
+                        result["alerts"].append(f"Temperature alert: {sensor}")
         
-        # Extract key features
-        features = {
-            'bgp': any('bgp' in line.lower() for line in lines),
-            'ospf': any('ospf' in line.lower() for line in lines),
-            'eigrp': any('eigrp' in line.lower() for line in lines),
-            'vlan': any('vlan' in line.lower() for line in lines),
-            'acl': any('access-list' in line.lower() for line in lines),
-            'nat': any('nat' in line.lower() for line in lines),
-            'ipsec': any('ipsec' in line.lower() or 'crypto' in line.lower() for line in lines),
-            'qos': any('qos' in line.lower() or 'policy-map' in line.lower() for line in lines),
-        }
-        
-        # Search for custom terms
-        search_results = {}
-        if search_terms:
-            for term in search_terms:
-                matches = [
-                    line for line in lines
-                    if term.lower() in line.lower()
-                ]
-                search_results[term] = len(matches)
-        
-        result = {
-            'device': task.host.name,
-            'total_lines': len(lines),
-            'config_lines': len(non_comment_lines),
-            'comment_lines': len(lines) - len(non_comment_lines),
-            'features_enabled': {k: v for k, v in features.items() if v},
-            'features_count': sum(1 for v in features.values() if v),
-        }
-        
-        if search_results:
-            result['search_matches'] = search_results
-        
-        return Result(host=task.host, result=result)
-        
-    except Exception as e:
-        logging.error(f"Configuration analysis failed for {task.host.name}: {e}")
-        return Result(
-            host=task.host,
-            result={'device': task.host.name, 'error': str(e)},
-            failed=True
-        )
-
-
-def print_table(data: List[Dict[str, Any]]) -> None:
-    """Print analysis results as formatted table."""
-    print("\n" + "=" * 100)
-    print(
-        f"{'Device':<20} {'Total Lines':<15} {'Config Lines':<15} "
-        f"{'Features':<15} {'BGP':<8} {'OSPF':<8} {'VLAN':<8}"
-    )
-    print("=" * 100)
+        except Exception as e:
+            logger.debug(f"Environment data unavailable for {task.host.name}: {e}")
     
-    for item in data:
-        if 'error' in item:
-            print(f"{item['device']:<20} ERROR: {item['error']:<70}")
+    except Exception as e:
+        logger.error(f"Error retrieving health data for {task.host.name}: {e}")
+        result["status"] = "error"
+        result["alerts"] = [str(e)]
+    
+    return result
+
+
+def format_report(results: Dict) -> int:
+    """
+    Print formatted health report.
+    
+    Args:
+        results: Results from nornir task execution
+    
+    Returns:
+        Exit code (0 for success, 1 if warnings/errors found)
+    """
+    print("\n" + "=" * 80)
+    print("DEVICE HEALTH REPORT")
+    print("=" * 80)
+    
+    stats = {"ok": 0, "warning": 0, "error": 0}
+    
+    for host, task_results in results.items():
+        if not isinstance(task_results, list) or not task_results:
             continue
         
-        features = item.get('features_enabled', {})
-        bgp = '✓' if features.get('bgp') else '-'
-        ospf = '✓' if features.get('ospf') else '-'
-        vlan = '✓' if features.get('vlan') else '-'
+        health = task_results[0]
+        status = health.get("status", "unknown")
+        stats[status] = stats.get(status, 0) + 1
         
-        print(
-            f"{item['device']:<20} {item['total_lines']:<15} "
-            f"{item['config_lines']:<15} {item['features_count']:<15} "
-            f"{bgp:<8} {ospf:<8} {vlan:<8}"
-        )
+        # Status icon
+        icons = {"ok": "✓", "warning": "⚠", "error": "✗"}
+        icon = icons.get(status, "?")
+        
+        print(f"\n{icon} {health['device']} [{status.upper()}]")
+        
+        # Print metrics
+        if health.get("metrics"):
+            print("  Metrics:")
+            for key, value in health["metrics"].items():
+                print(f"    {key}: {value}")
+        
+        # Print alerts
+        if health.get("alerts"):
+            print("  Alerts:")
+            for alert in health["alerts"]:
+                print(f"    ! {alert}")
     
-    print("=" * 100)
+    print("\n" + "=" * 80)
+    print(f"Summary: {stats['ok']} ok, {stats['warning']} warning, {stats['error']} error")
+    print("=" * 80 + "\n")
+    
+    return 0 if (stats["warning"] + stats["error"]) == 0 else 1
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Analyze network device configurations"
+        description="Monitor network device health and resource utilization"
     )
     parser.add_argument(
-        "--group",
-        help="Filter devices by group"
+        "--devices",
+        default="all",
+        help="Comma-separated device names or 'all' (default: all)"
     )
     parser.add_argument(
-        "--host",
-        help="Analyze single host only"
+        "--threshold",
+        type=int,
+        default=80,
+        help="CPU/memory warning threshold in percent (default: 80)"
     )
     parser.add_argument(
-        "--search",
-        nargs='+',
-        help="Search for specific keywords in configuration"
-    )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format (default: table)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        help="Write results to file"
-    )
-    parser.add_argument(
-        "--inventory",
-        default="inventory",
-        help="Nornir inventory path (default: inventory)"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
+        "--verbose",
         action="store_true",
         help="Enable debug logging"
     )
     
     args = parser.parse_args()
     
-    # Configure logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    logger = logging.getLogger(__name__)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        # Initialize Nornir
-        inventory_path = Path(args.inventory) / "config.yaml"
-        if not inventory_path.exists():
-            logger.error(f"Inventory config not found: {inventory_path}")
-            sys.exit(1)
+        # Initialize Nornir with config file
+        nr = InitNornir(config_file="config.yaml")
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices from inventory")
         
-        nr = InitNornir(config_file=str(inventory_path))
-        logger.info(f"Loaded {len(nr.inventory.hosts)} hosts")
-        
-        # Apply filters
-        if args.host:
-            nr = nr.filter(F(name=args.host))
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
+        # Filter devices if specified
+        if args.devices != "all":
+            device_list = [d.strip() for d in args.devices.split(",")]
+            nr = nr.filter(F(name__in=device_list))
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices")
         
         if not nr.inventory.hosts:
-            logger.error("No devices matched filter criteria")
-            sys.exit(1)
+            logger.error("No devices matched the filter criteria")
+            return 1
         
-        logger.info(f"Analyzing {len(nr.inventory.hosts)} device(s)")
+        # Execute health checks
+        logger.info(f"Starting health checks on {len(nr.inventory.hosts)} devices...")
+        results = nr.run(task=get_device_health, threshold=args.threshold)
         
-        # Run analysis
-        results = nr.run(
-            task=analyze_configuration,
-            search_terms=args.search or []
-        )
-        
-        # Collect results
-        output_data = []
-        failed_count = 0
-        
-        for hostname in results:
-            task_result = results[hostname][0]
-            output_data.append(task_result.result)
-            if task_result.failed:
-                failed_count += 1
-        
-        logger.info(f"Analysis complete: {len(output_data) - failed_count} successful, {failed_count} failed")
-        
-        # Format and display output
-        if args.format == "json":
-            output_text = json.dumps(output_data, indent=2)
-        else:
-            output_text = None
-            print_table(output_data)
-        
-        # Write to file if specified
-        if args.output:
-            with open(args.output, 'w') as f:
-                if output_text:
-                    f.write(output_text)
-                else:
-                    f.write('\n'.join(str(item) for item in output_data))
-            logger.info(f"Results saved to {args.output}")
-        elif output_text:
-            print(output_text)
-        
-        sys.exit(0 if failed_count == 0 else 1)
-        
+        # Generate report and return appropriate exit code
+        return format_report(results)
+    
+    except FileNotFoundError:
+        logger.error("config.yaml not found. Create one with Nornir inventory configuration.")
+        return 1
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
