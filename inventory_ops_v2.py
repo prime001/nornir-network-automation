@@ -1,251 +1,192 @@
-Now I have enough context. The existing scripts cover: BGP summary, interface reports, config backup, result filtering, compliance/health audit, VLAN reporting, threaded execution, inventory ops, and custom plugins. I'll write a CDP/LLDP neighbor discovery script — practical, portfolio-worthy, and not covered.
-
 ```python
+#!/usr/bin/env python3
 """
-CDP/LLDP Neighbor Discovery Script
+Network Device Health Monitor - Gathers and reports health metrics from network devices.
 
-Purpose:
-    Discovers and maps network neighbors across the inventory using
-    CDP (Cisco Discovery Protocol) or LLDP (Link Layer Discovery Protocol).
-    Builds a topology table showing device adjacencies, interface connections,
-    remote device capabilities, and management addresses — useful for
-    verifying cabling, auditing topology changes, and bootstrapping CMDB data.
+Purpose: Monitor CPU, memory, uptime, and disk usage across network devices. Useful for
+capacity planning, troubleshooting, and anomaly detection.
 
 Usage:
-    python neighbor_discovery.py
-    python neighbor_discovery.py --protocol lldp --group access-switches
-    python neighbor_discovery.py --device core-sw1 --output neighbors.json
-    python neighbor_discovery.py --protocol cdp --config /etc/nornir/config.yaml
+    python device_health_monitor.py --inventory inventory.yaml --device-group core
+    python device_health_monitor.py --device 192.168.1.1 --username admin
+    python device_health_monitor.py --inventory inventory.yaml --warn-cpu 75 --warn-mem 80
 
 Prerequisites:
-    - pip install nornir nornir-netmiko
-    - Inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
-    - CDP or LLDP enabled on target devices
-    - Devices reachable via SSH
+    - nornir[netmiko,napalm] installed
+    - inventory.yaml with device definitions
+    - Network device credentials via --username/--password or SSH keys
+    - Devices support NAPALM facts and environment getters
 """
 
 import argparse
-import json
 import logging
-import re
 import sys
-from datetime import datetime
-from typing import Any
-
 from nornir import InitNornir
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import napalm_get
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-CDP_COMMAND = "show cdp neighbors detail"
-LLDP_COMMAND = "show lldp neighbors detail"
 
-
-def parse_cdp_neighbors(output: str) -> list[dict]:
-    """Parse 'show cdp neighbors detail' into structured records."""
-    neighbors = []
-    for block in re.split(r"-{10,}", output):
-        block = block.strip()
-        if not block:
-            continue
-
-        entry: dict[str, Any] = {}
-
-        m = re.search(r"Device ID:\s*(.+)", block)
-        if m:
-            entry["remote_device"] = m.group(1).strip()
-
-        m = re.search(r"Interface:\s*(\S+),\s*Port ID.*?:\s*(\S+)", block)
-        if m:
-            entry["local_intf"] = m.group(1)
-            entry["remote_intf"] = m.group(2)
-
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            entry["mgmt_address"] = m.group(1)
-
-        m = re.search(r"Platform:\s*([^,]+)", block)
-        if m:
-            entry["platform"] = m.group(1).strip()
-
-        m = re.search(r"Capabilities:\s*(.+)", block)
-        if m:
-            entry["capabilities"] = m.group(1).strip()
-
-        if entry.get("remote_device"):
-            neighbors.append(entry)
-
-    return neighbors
-
-
-def parse_lldp_neighbors(output: str) -> list[dict]:
-    """Parse 'show lldp neighbors detail' into structured records."""
-    neighbors = []
-    for block in re.split(r"-{10,}|(?=Local Intf:)", output):
-        block = block.strip()
-        if not block or "Total entries" in block:
-            continue
-
-        entry: dict[str, Any] = {}
-
-        m = re.search(r"System Name:\s*(.+)", block)
-        if m:
-            entry["remote_device"] = m.group(1).strip()
-
-        m = re.search(r"Local Intf:\s*(\S+)", block)
-        if m:
-            entry["local_intf"] = m.group(1)
-
-        m = re.search(r"Port id:\s*(\S+)", block)
-        if m:
-            entry["remote_intf"] = m.group(1)
-
-        m = re.search(r"Management Addresses.*?IP:\s*(\S+)", block, re.DOTALL)
-        if m:
-            entry["mgmt_address"] = m.group(1)
-
-        m = re.search(r"System Capabilities:\s*(.+)", block)
-        if m:
-            entry["capabilities"] = m.group(1).strip()
-
-        m = re.search(r"System Description.*?:\s*(.+?)(?:\n\s*\n|$)", block, re.DOTALL)
-        if m:
-            entry["platform"] = m.group(1).strip().replace("\n", " ")[:60]
-
-        if entry.get("remote_device"):
-            neighbors.append(entry)
-
-    return neighbors
-
-
-def collect_neighbors(task: Task, protocol: str) -> Result:
-    """Nornir task: gather CDP/LLDP neighbor data from a single device."""
-    command = CDP_COMMAND if protocol == "cdp" else LLDP_COMMAND
-    result = task.run(
-        task=netmiko_send_command,
-        command_string=command,
-        use_textfsm=False,
+def setup_logging(level: str) -> None:
+    """Configure logging for the application."""
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    raw = result.result
-    neighbors = parse_cdp_neighbors(raw) if protocol == "cdp" else parse_lldp_neighbors(raw)
-    return Result(host=task.host, result=neighbors)
 
 
-def print_table(all_neighbors: dict[str, list[dict]]) -> None:
-    """Render neighbor adjacency data as an aligned console table."""
-    w = {"host": 18, "local": 18, "remote_dev": 28, "remote_intf": 20, "mgmt": 16, "caps": 22}
-    header = (
-        f"{'Local Device':<{w['host']}} "
-        f"{'Local Intf':<{w['local']}} "
-        f"{'Remote Device':<{w['remote_dev']}} "
-        f"{'Remote Intf':<{w['remote_intf']}} "
-        f"{'Mgmt IP':<{w['mgmt']}} "
-        f"{'Capabilities':<{w['caps']}}"
-    )
-    sep = "-" * len(header)
-    print(f"\n{sep}\n{header}\n{sep}")
-
-    total = 0
-    for host, neighbors in sorted(all_neighbors.items()):
-        if not neighbors:
-            print(f"{host:<{w['host']}} (no neighbors found)")
-            continue
-        for n in neighbors:
-            print(
-                f"{host:<{w['host']}} "
-                f"{n.get('local_intf', 'N/A'):<{w['local']}} "
-                f"{n.get('remote_device', 'N/A'):<{w['remote_dev']}} "
-                f"{n.get('remote_intf', 'N/A'):<{w['remote_intf']}} "
-                f"{n.get('mgmt_address', 'N/A'):<{w['mgmt']}} "
-                f"{n.get('capabilities', 'N/A'):<{w['caps']}}"
-            )
-            total += 1
-
-    print(f"{sep}\nTotal adjacencies: {total}\n")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Discover CDP/LLDP neighbors across a Nornir inventory"
-    )
-    parser.add_argument(
-        "--protocol",
-        choices=["cdp", "lldp"],
-        default="cdp",
-        help="Discovery protocol (default: cdp)",
-    )
-    parser.add_argument("--group", help="Filter inventory to a specific group")
-    parser.add_argument("--device", help="Target a single device by hostname")
-    parser.add_argument("--output", metavar="FILE", help="Write results to a JSON file")
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to Nornir config file (default: config.yaml)",
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+def get_device_health(task: Task) -> Result:
+    """Gather health metrics from device using NAPALM getters."""
     try:
-        nr = InitNornir(config_file=args.config)
-    except FileNotFoundError:
-        logger.error("Nornir config file '%s' not found", args.config)
-        sys.exit(1)
-
-    if args.group:
-        nr = nr.filter(F(groups__contains=args.group))
-    if args.device:
-        nr = nr.filter(F(name=args.device))
-
-    if not nr.inventory.hosts:
-        logger.error("No devices matched the specified filters")
-        sys.exit(1)
-
-    logger.info(
-        "Running %s neighbor discovery on %d device(s)",
-        args.protocol.upper(),
-        len(nr.inventory.hosts),
-    )
-
-    results = nr.run(task=collect_neighbors, protocol=args.protocol)
-
-    all_neighbors: dict[str, list[dict]] = {}
-    failed: list[str] = []
-
-    for host_name, result in results.items():
-        if result.failed:
-            logger.error("%s: task failed — %s", host_name, result.exception)
-            failed.append(host_name)
-            all_neighbors[host_name] = []
-        else:
-            # index 1 is the inner task result when using aggregate tasks
-            inner = result[1] if len(result) > 1 else result[0]
-            all_neighbors[host_name] = inner.result if isinstance(inner.result, list) else []
-
-    print_table(all_neighbors)
-
-    if failed:
-        logger.warning("Failed on %d device(s): %s", len(failed), ", ".join(failed))
-
-    if args.output:
-        payload = {
-            "generated": datetime.now().isoformat(),
-            "protocol": args.protocol,
-            "neighbors": all_neighbors,
+        result = task.run(napalm_get, getters=['facts', 'environment'])
+        facts = result[0].result.get('facts', {})
+        environment = result[0].result.get('environment', {})
+        
+        metrics = {
+            'uptime': facts.get('uptime_seconds', 'N/A'),
+            'hostname': facts.get('hostname', 'N/A'),
+            'os_version': facts.get('os_version', 'N/A'),
         }
-        with open(args.output, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        logger.info("Results written to %s", args.output)
+        
+        cpu_data = environment.get('cpu', {})
+        mem_data = environment.get('memory', {})
+        
+        if isinstance(cpu_data, dict):
+            metrics['cpu_load'] = cpu_data.get('cpu%', 'N/A')
+        if isinstance(mem_data, dict):
+            metrics['memory'] = mem_data.get('usage', 'N/A')
+        
+        return Result(host=task.host, result=metrics)
+    
+    except Exception as e:
+        logger.error(f"Failed to retrieve health metrics for {task.host.name}: {e}")
+        return Result(host=task.host, result={'error': str(e)}, failed=True)
+
+
+def check_health_thresholds(task: Task, warn_cpu: int, warn_mem: int) -> Result:
+    """Check device health metrics against warning thresholds."""
+    health = task.run(get_device_health)
+    
+    if health[0].failed:
+        return health[0]
+    
+    metrics = health[0].result
+    warnings = []
+    
+    cpu = metrics.get('cpu_load')
+    if isinstance(cpu, (int, float)) and cpu > warn_cpu:
+        warnings.append(f"High CPU: {cpu}%")
+    
+    mem = metrics.get('memory')
+    if isinstance(mem, (int, float)) and mem > warn_mem:
+        warnings.append(f"High Memory: {mem}%")
+    
+    metrics['warnings'] = warnings
+    return Result(host=task.host, result=metrics)
+
+
+def format_uptime(seconds: int) -> str:
+    """Convert uptime in seconds to human-readable format."""
+    if not isinstance(seconds, int):
+        return "N/A"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
+
+
+def print_health_report(results: dict) -> None:
+    """Print formatted health status report."""
+    print("\n" + "="*85)
+    print(f"{'Device':<20} {'Status':<10} {'Uptime':<15} {'CPU':<8} {'Memory':<8}")
+    print("="*85)
+    
+    for device_name, result in results.items():
+        if result.failed:
+            error_msg = result.result.get('error', 'Unknown error')
+            print(f"{device_name:<20} {'FAILED':<10} {error_msg}")
+            continue
+        
+        metrics = result.result
+        uptime = format_uptime(metrics.get('uptime'))
+        cpu = f"{metrics.get('cpu_load')}%" if isinstance(metrics.get('cpu_load'), (int, float)) else "N/A"
+        mem = f"{metrics.get('memory')}%" if isinstance(metrics.get('memory'), (int, float)) else "N/A"
+        status = "WARNING" if metrics.get('warnings') else "OK"
+        
+        print(f"{device_name:<20} {status:<10} {uptime:<15} {cpu:<8} {mem:<8}")
+        for warning in metrics.get('warnings', []):
+            print(f"  └─ {warning}")
+    
+    print("="*85 + "\n")
+
+
+def main() -> int:
+    """Main entry point for device health monitoring."""
+    parser = argparse.ArgumentParser(
+        description='Monitor network device health metrics (CPU, memory, uptime)',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--inventory', default='inventory.yaml',
+                        help='Path to nornir inventory file (default: inventory.yaml)')
+    parser.add_argument('--device', help='Monitor specific device by hostname or IP')
+    parser.add_argument('--device-group', help='Filter devices by inventory group')
+    parser.add_argument('--username', help='SSH username for device authentication')
+    parser.add_argument('--password', help='SSH password for device authentication')
+    parser.add_argument('--warn-cpu', type=int, default=80,
+                        help='CPU usage warning threshold in percent (default: 80)')
+    parser.add_argument('--warn-mem', type=int, default=85,
+                        help='Memory usage warning threshold in percent (default: 85)')
+    parser.add_argument('--log-level', default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='Logging verbosity level (default: INFO)')
+    
+    args = parser.parse_args()
+    setup_logging(args.log_level)
+    
+    try:
+        nr = InitNornir(config_file=args.inventory)
+        
+        if args.username:
+            nr.inventory.defaults.username = args.username
+        if args.password:
+            nr.inventory.defaults.password = args.password
+        
+        if args.device:
+            nr = nr.filter(name=args.device)
+        elif args.device_group:
+            nr = nr.filter(F(groups__contains=args.device_group))
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices matched the specified filter criteria")
+            return 1
+        
+        logger.info(f"Starting health check on {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(
+            task=check_health_thresholds,
+            warn_cpu=args.warn_cpu,
+            warn_mem=args.warn_mem
+        )
+        
+        print_health_report(dict(results))
+        
+        failed_devices = sum(1 for r in results.values() if r.failed)
+        if failed_devices > 0:
+            logger.warning(f"{failed_devices} device(s) failed to report health metrics")
+            return 1
+        
+        return 0
+    
+    except FileNotFoundError:
+        logger.error(f"Inventory file not found: {args.inventory}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error during execution: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
