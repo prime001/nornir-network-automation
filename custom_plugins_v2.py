@@ -1,174 +1,201 @@
 ```python
 """
-Device Health Monitoring Script
+Device Software Version Auditor
 
-Purpose: Collect and analyze device health metrics including CPU, memory, disk usage,
-uptime, and environmental sensors.
+Purpose:
+    Audits network device software versions for compliance.
+    Compares actual device OS versions against a baseline specification.
+    Flags non-compliant devices for remediation.
 
 Usage:
-    python device_health_monitor.py --hosts router1,router2 --username admin --password secret
-    python device_health_monitor.py --device router1 --username admin --password secret
+    python software_version_auditor.py -d all -u admin -p password -b versions.json
+    python software_version_auditor.py -d prod -u admin -p password -b versions.json --report
 
 Prerequisites:
-    - nornir library installed
-    - napalm driver installed for target device types
-    - Network device SSH access
+    - Nornir inventory file (hosts and groups defined in YAML)
+    - Device credentials with read access
+    - Baseline file: JSON with expected versions per device or group
+    - NAPALM driver support for your devices
+    - Python 3.7+, nornir>=2.5, napalm>=2.5
+
+Baseline JSON format:
+    {
+        "device_name": "15.2(4)M10",
+        "group_name": "15.2(4)M*",
+        "vendor": "15.2+"
+    }
 """
 
 import argparse
-import csv
+import json
 import logging
-import sys
-from datetime import datetime
 from pathlib import Path
-
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.plugins.tasks.napalm import napalm_get
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
-def get_device_health(task):
-    """Retrieve device health metrics using NAPALM."""
+def audit_version(task, baseline):
+    """
+    Fetch device version and compare against baseline.
+    
+    Args:
+        task: Nornir task
+        baseline: Dict mapping device/group names to expected versions
+    
+    Returns:
+        Dict with version info and compliance status
+    """
     try:
-        facts_result = task.run(
-            napalm_get,
-            getters=["facts", "environment"]
-        )
+        result = task.run(napalm_get, getters=["facts"])
+        facts = result[0].result["facts"]
         
-        facts = facts_result[0].result
-        env = facts.get("environment", {})
-        dev_facts = facts.get("facts", {})
+        device_name = task.host.name
+        group_name = task.host.groups[0].name if task.host.groups else None
+        expected_version = baseline.get(device_name) or baseline.get(group_name)
+        actual_version = facts.get("os_version", "unknown")
         
         return {
-            "hostname": task.host.name,
-            "vendor": dev_facts.get("vendor", "N/A"),
-            "model": dev_facts.get("model", "N/A"),
-            "os_version": dev_facts.get("os_version", "N/A"),
-            "uptime_seconds": dev_facts.get("uptime_seconds", 0),
-            "cpu_percent": env.get("cpu", [{}])[0].get("%usage", "N/A"),
-            "memory_used": env.get("memory", {}).get("used_ram", "N/A"),
-            "memory_available": env.get("memory", {}).get("available_ram", "N/A"),
-            "timestamp": datetime.now().isoformat()
+            "device": device_name,
+            "group": group_name,
+            "vendor": facts.get("vendor", "unknown"),
+            "model": facts.get("model", "unknown"),
+            "actual_version": actual_version,
+            "expected_version": expected_version,
+            "compliant": actual_version == expected_version
+            if expected_version else None,
+            "uptime": facts.get("uptime_seconds", 0),
         }
     except Exception as e:
-        logger.error(f"Error gathering health data for {task.host.name}: {e}")
-        return {"hostname": task.host.name, "error": str(e)}
-
-
-def format_uptime(seconds):
-    """Convert uptime seconds to human-readable format."""
-    if not isinstance(seconds, int):
-        return "N/A"
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
-
-
-def print_report(results):
-    """Display health metrics in formatted table."""
-    print("\n" + "=" * 110)
-    print(f"{'Device':<20} {'Vendor':<12} {'Model':<20} {'OS Version':<15} {'Uptime':<15} {'CPU %':<10}")
-    print("=" * 110)
-    
-    for host, task_result in results.items():
-        if task_result[0].failed:
-            print(f"{host:<20} ERROR: {task_result[0].exception}")
-        else:
-            health = task_result[0].result
-            if "error" in health:
-                print(f"{health['hostname']:<20} ERROR: {health['error']}")
-            else:
-                uptime = format_uptime(health.get("uptime_seconds", 0))
-                cpu = str(health.get("cpu_percent", "N/A"))
-                print(
-                    f"{health['hostname']:<20} {health.get('vendor', 'N/A'):<12} "
-                    f"{health.get('model', 'N/A'):<20} {health.get('os_version', 'N/A'):<15} "
-                    f"{uptime:<15} {cpu:<10}"
-                )
-    print("=" * 110 + "\n")
-
-
-def export_csv(results, output_file):
-    """Export results to CSV file."""
-    try:
-        with open(output_file, "w", newline="") as csvfile:
-            fieldnames = [
-                "hostname", "vendor", "model", "os_version", "uptime_seconds",
-                "cpu_percent", "memory_used", "memory_available", "timestamp"
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for host, task_result in results.items():
-                if not task_result[0].failed and "error" not in task_result[0].result:
-                    writer.writerow(task_result[0].result)
-        
-        logger.info(f"Results exported to {output_file}")
-    except Exception as e:
-        logger.error(f"Failed to export CSV: {e}")
+        logger.error(f"{task.host.name}: {e}")
+        return {"device": task.host.name, "error": str(e)}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor network device health metrics")
-    parser.add_argument("--hosts", help="Comma-separated device list or 'all'")
-    parser.add_argument("--device", help="Single device hostname")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--inventory", default="hosts.yaml", help="Inventory file path")
-    parser.add_argument("--output", help="CSV output file path")
-    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-d", "--device", default="all",
+                        help="Target device or group")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("-b", "--baseline", required=True,
+                        help="Baseline JSON file")
+    parser.add_argument("-i", "--inventory", default="inventory.yaml",
+                        help="Inventory YAML file")
+    parser.add_argument("--report", action="store_true",
+                        help="Generate detailed report")
+    parser.add_argument("--no-fail", action="store_true",
+                        help="Exit 0 even if non-compliant")
     
     args = parser.parse_args()
     
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    if not args.hosts and not args.device:
-        logger.error("Must specify --hosts or --device")
-        sys.exit(1)
-    
-    if not Path(args.inventory).exists():
-        logger.error(f"Inventory file not found: {args.inventory}")
-        sys.exit(1)
+    try:
+        baseline_path = Path(args.baseline)
+        if not baseline_path.exists():
+            logger.error(f"Baseline file not found: {args.baseline}")
+            return 1
+        
+        with open(baseline_path) as f:
+            baseline = json.load(f)
+        
+        logger.info(f"Loaded {len(baseline)} baseline entries")
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in baseline: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Failed to load baseline: {e}")
+        return 1
     
     try:
-        nr = InitNornir(config_file=args.inventory)
+        nr = InitNornir(
+            inventory={
+                "plugin": "SimpleInventory",
+                "options": {"host_file": args.inventory}
+            }
+        )
         
-        if args.device:
-            nr = nr.filter(F(name=args.device))
-        elif args.hosts and args.hosts != "all":
-            host_list = [h.strip() for h in args.hosts.split(",")]
-            nr = nr.filter(F(name__any=host_list))
+        if args.device != "all":
+            nr = nr.filter(
+                F(groups__contains=args.device) | F(name=args.device)
+            )
         
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            host.password = args.password
-            if "napalm" in host.connection_options:
-                host.connection_options["napalm"].timeout = args.timeout
+        if not nr.inventory.hosts:
+            logger.warning("No matching devices found")
+            return 1
         
-        logger.info(f"Gathering health data from {len(nr.inventory.hosts)} devices...")
-        results = nr.run(task=get_device_health)
+        logger.info(f"Auditing {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=audit_version, baseline=baseline)
         
-        print_report(results)
+        compliant = []
+        non_compliant = []
+        errors = []
+        no_baseline = []
         
-        if args.output:
-            export_csv(results, args.output)
+        for host, multi_result in results.items():
+            if multi_result.failed:
+                errors.append((host, "Task execution failed"))
+                continue
+            
+            data = multi_result[0].result
+            
+            if "error" in data:
+                errors.append((host, data["error"]))
+            elif data["compliant"] is None:
+                no_baseline.append(data)
+            elif data["compliant"]:
+                compliant.append(data)
+            else:
+                non_compliant.append(data)
         
-        logger.info("Health monitoring completed")
+        print("\n" + "="*70)
+        print("VERSION COMPLIANCE AUDIT REPORT")
+        print("="*70 + "\n")
+        
+        if compliant:
+            print(f"✓ COMPLIANT ({len(compliant)}):")
+            for dev in compliant:
+                print(f"  {dev['device']:20s} {dev['actual_version']}")
+        
+        if no_baseline:
+            print(f"\n? NO BASELINE ({len(no_baseline)}):")
+            for dev in no_baseline:
+                print(f"  {dev['device']:20s} {dev['actual_version']}")
+        
+        if non_compliant:
+            print(f"\n✗ NON-COMPLIANT ({len(non_compliant)}):")
+            for dev in non_compliant:
+                print(f"  {dev['device']:20s} {dev['actual_version']}")
+                print(f"    Expected: {dev['expected_version']}")
+        
+        if errors:
+            print(f"\n! ERRORS ({len(errors)}):")
+            for dev, err in errors:
+                print(f"  {dev}: {err}")
+        
+        print("\n" + "="*70)
+        print(f"Summary: {len(compliant)} compliant, "
+              f"{len(non_compliant)} non-compliant, "
+              f"{len(no_baseline)} no baseline, "
+              f"{len(errors)} errors")
+        print("="*70 + "\n")
+        
+        if non_compliant and not args.no_fail:
+            logger.warning("Non-compliant devices detected")
+            return 1
+        
+        return 0
         
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
-        sys.exit(1)
+        logger.error(f"Audit failed: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
