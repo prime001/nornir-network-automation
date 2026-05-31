@@ -1,173 +1,210 @@
-#!/usr/bin/env python3
+```python
 """
-Device Health Metrics Aggregator
+Device Health Check Script
 
-Gathers and reports CPU, memory, and uptime metrics across a network fleet.
-Uses NAPALM facts and environment getters to retrieve device health data,
-aggregates results, and highlights devices exceeding resource thresholds.
+Provides comprehensive health monitoring for network devices using Nornir and NAPALM.
+Collects CPU, memory, uptime, and temperature metrics from devices in parallel.
 
 Usage:
-    python device_health.py -i inventory.yaml -g all
-    python device_health.py -i inventory.yaml --group datacenter --cpu-warn 75
+    python device_health_check.py --inventory hosts.yaml --groups router
+    python device_health_check.py --inventory hosts.yaml --warn-cpu 80
+    python device_health_check.py --inventory hosts.yaml --devices router1,router2
 
 Prerequisites:
-    - nornir with NAPALM plugin
-    - Inventory YAML file with device groups and connection details
-    - Devices supporting NAPALM 'facts' and 'environment' getters
-    - tabulate library for formatted output
+    - Nornir with NAPALM plugin installed
+    - Network devices reachable via SSH/NETCONF
+    - Device credentials configured in inventory
+    - NAPALM drivers available for device platforms
+
+Example inventory (hosts.yaml):
+    devices:
+      router1:
+        host: 10.0.0.1
+        username: admin
+        password: pass123
+        platform: ios
+      router2:
+        host: 10.0.0.2
+        username: admin
+        password: pass123
+        platform: junos
 """
 
 import argparse
 import logging
 import sys
+
 from nornir import InitNornir
+from nornir.core.task import Task, Result
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import napalm_get
-from tabulate import tabulate
+from nornir_napalm.plugins.tasks import napalm_get
 
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbose: bool = False) -> None:
-    """Configure logging."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
-
-def gather_health_metrics(task: Task) -> Result:
-    """Retrieve health metrics from device using NAPALM getters."""
+def gather_health(task: Task, warn_cpu: int, warn_mem: int) -> Result:
+    """Collect device health metrics from NAPALM environment getter."""
     try:
-        facts_result = task.run(napalm_get, getters=["facts"])
-        environment_result = task.run(napalm_get, getters=["environment"])
+        env_r = task.run(napalm_get, getters=['environment'])
+        facts_r = task.run(napalm_get, getters=['facts'])
         
-        facts = facts_result.result.get("facts", {})
-        environment = environment_result.result.get("environment", {})
+        env_get = env_r[task.host.name]
+        facts_get = facts_r[task.host.name]
         
-        uptime_seconds = facts.get("uptime", 0)
-        uptime_days = uptime_seconds // 86400
+        env = env_get[0].result.get('environment', {})
+        facts = facts_get[0].result.get('facts', {})
         
-        cpu_percent = 0.0
-        cpu_info = environment.get("cpu", {})
-        if isinstance(cpu_info, dict) and "" in cpu_info:
-            cpu_list = cpu_info[""]
-            if cpu_list:
-                cpu_percent = float(cpu_list[0].get("%usage", 0))
+        result = {
+            'hostname': task.host.name,
+            'platform': task.host.platform,
+            'cpu_percent': None,
+            'memory_percent': None,
+            'temperatures': [],
+            'uptime_seconds': None,
+            'alerts': []
+        }
         
-        memory_info = environment.get("memory", {})
-        mem_used = memory_info.get("used_ram", 0)
-        mem_avail = memory_info.get("available_ram", 1)
-        memory_percent = (mem_used / mem_avail * 100) if mem_avail > 0 else 0
+        cpu_data = env.get('cpu', {})
+        if '%usage' in cpu_data:
+            cpu_pct = cpu_data['%usage']
+            result['cpu_percent'] = cpu_pct
+            if cpu_pct > warn_cpu:
+                result['alerts'].append(f"High CPU: {cpu_pct}%")
         
+        memory_data = env.get('memory', {})
+        if memory_data:
+            used = memory_data.get('used_ram', 0)
+            available = memory_data.get('available_ram', 1)
+            if used + available > 0:
+                mem_pct = round((used / (used + available)) * 100, 1)
+                result['memory_percent'] = mem_pct
+                if mem_pct > warn_mem:
+                    result['alerts'].append(f"High Memory: {mem_pct}%")
+        
+        for sensor_name, sensor_data in env.get('temperature', {}).items():
+            if 'current_temperature' in sensor_data:
+                result['temperatures'].append({
+                    'sensor': sensor_name,
+                    'celsius': sensor_data['current_temperature']
+                })
+        
+        if 'uptime_seconds' in facts:
+            result['uptime_seconds'] = facts['uptime_seconds']
+        
+        return Result(host=task.host, result=result)
+        
+    except Exception as e:
+        logger.error(f"{task.host.name}: {e}")
         return Result(
             host=task.host,
-            result={
-                "uptime_days": uptime_days,
-                "cpu_percent": round(cpu_percent, 1),
-                "memory_percent": round(memory_percent, 1),
-                "model": facts.get("model", "Unknown"),
-            },
+            result={'hostname': task.host.name, 'error': str(e)},
+            failed=True
         )
-    except Exception as e:
-        logger.warning(f"{task.host.name}: {str(e)}")
-        return Result(host=task.host, result=None, failed=True)
 
 
-def print_report(results: dict, cpu_warn: int, mem_warn: int) -> int:
-    """Print formatted health report. Returns exit code."""
-    table = []
-    alert_count = 0
+def display_report(results):
+    """Print formatted health report to console."""
+    print("\n" + "=" * 80)
+    print("DEVICE HEALTH REPORT".center(80))
+    print("=" * 80)
     
-    for hostname in sorted(results.keys()):
-        task_results = results[hostname]
+    for host, multi_result in results.items():
+        task_result = multi_result[0]
         
-        if task_results[0].failed:
-            table.append([hostname, "ERROR", "—", "—", "—"])
-            alert_count += 1
+        if task_result.failed:
+            res = task_result.result
+            print(f"\n[ERROR] {res['hostname']}: {res['error']}")
             continue
         
-        data = task_results[0].result
-        cpu = data["cpu_percent"]
-        mem = data["memory_percent"]
-        status = "OK"
+        res = task_result.result
+        print(f"\n{res['hostname']} ({res['platform']})")
         
-        if cpu >= cpu_warn or mem >= mem_warn:
-            status = "⚠ ALERT" if (cpu >= 95 or mem >= 95) else "! WARN"
-            alert_count += 1
+        if res['cpu_percent'] is not None:
+            icon = "⚠️" if any('CPU' in a for a in res['alerts']) else "✓"
+            print(f"  {icon} CPU: {res['cpu_percent']}%")
         
-        table.append([
-            hostname,
-            status,
-            f"{data['uptime_days']}d",
-            f"{cpu}%",
-            f"{mem}%",
-        ])
+        if res['memory_percent'] is not None:
+            icon = "⚠️" if any('Memory' in a for a in res['alerts']) else "✓"
+            print(f"  {icon} Memory: {res['memory_percent']}%")
+        
+        for temp in res['temperatures']:
+            print(f"  🌡️  {temp['sensor']}: {temp['celsius']}°C")
+        
+        if res['uptime_seconds']:
+            days = res['uptime_seconds'] // 86400
+            hours = (res['uptime_seconds'] % 86400) // 3600
+            print(f"  ↑ Uptime: {days}d {hours}h")
+        
+        for alert in res['alerts']:
+            print(f"  ⚠️  {alert}")
     
-    headers = ["Device", "Status", "Uptime", "CPU", "Memory"]
-    print("\n" + tabulate(table, headers=headers, tablefmt="grid"))
-    return 1 if alert_count > 0 else 0
+    print("\n" + "=" * 80 + "\n")
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "-i", "--inventory",
-        default="inventory.yaml",
-        help="Nornir inventory file (default: inventory.yaml)",
-    )
-    parser.add_argument(
-        "-g", "--group",
-        default="all",
-        help="Device group to query (default: all)",
-    )
-    parser.add_argument(
-        "--cpu-warn",
-        type=int,
-        default=80,
-        help="CPU threshold %% for warning (default: 80)",
-    )
-    parser.add_argument(
-        "--mem-warn",
-        type=int,
-        default=85,
-        help="Memory threshold %% for warning (default: 85)",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Verbose output",
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s: %(message)s'
     )
     
+    parser = argparse.ArgumentParser(
+        description='Monitor network device health metrics',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: python device_health_check.py --inventory hosts.yaml --groups core'
+    )
+    parser.add_argument('--inventory', required=True, help='Path to Nornir inventory file')
+    parser.add_argument('--groups', help='Filter by groups (comma-separated)')
+    parser.add_argument('--devices', help='Filter by device names (comma-separated)')
+    parser.add_argument('--warn-cpu', type=int, default=85, help='CPU threshold %% (default: 85)')
+    parser.add_argument('--warn-memory', type=int, default=90, help='Memory threshold %% (default: 90)')
+    parser.add_argument('--output', help='Write report to file (default: stdout)')
+    
     args = parser.parse_args()
-    setup_logging(args.verbose)
     
     try:
         nr = InitNornir(config_file=args.inventory)
         
-        if args.group != "all":
-            nr = nr.filter(F(groups__contains=args.group))
+        if args.groups:
+            group_list = [g.strip() for g in args.groups.split(',')]
+            nr = nr.filter(F(groups__any=group_list))
+            logger.info(f"Filtered to groups: {group_list}")
         
-        logger.info(f"Gathering health metrics from {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=gather_health_metrics)
+        if args.devices:
+            device_list = [d.strip() for d in args.devices.split(',')]
+            nr = nr.filter(F(name__any=device_list))
+            logger.info(f"Filtered to devices: {device_list}")
         
-        exit_code = print_report(results, args.cpu_warn, args.mem_warn)
-        sys.exit(exit_code)
+        logger.info(f"Collecting health metrics from {len(nr.inventory.hosts)} devices...")
         
-    except FileNotFoundError:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        sys.exit(1)
+        results = nr.run(
+            task=gather_health,
+            warn_cpu=args.warn_cpu,
+            warn_mem=args.warn_memory
+        )
+        
+        if args.output:
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                display_report(results)
+            with open(args.output, 'w') as f:
+                f.write(buf.getvalue())
+            logger.info(f"Report saved to {args.output}")
+        else:
+            display_report(results)
+        
+        logger.info("Health check completed successfully")
+        
+    except KeyboardInterrupt:
+        print("\n[interrupted by user]")
+        sys.exit(130)
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=args.verbose)
+        logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+```
