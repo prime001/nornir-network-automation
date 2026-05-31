@@ -1,225 +1,249 @@
-```python
-"""
-Device Uptime and Facts Report
+Device Health Monitor - Nornir Network Automation Script
 
-Collects device facts including uptime, software version, model, and serial number.
-Generates a report for network inventory and compliance tracking.
+Purpose:
+    Monitors network device system health metrics (CPU, memory, uptime, disk) and
+    generates a health status report with configurable thresholds. Useful for
+    identifying devices approaching resource exhaustion before operational impact.
 
 Usage:
-    python device_facts_report.py --config-file nornir_config.yaml --output report.csv
+    python device_health_monitor.py --devices all --username admin --password secret
+    python device_health_monitor.py --devices core_routers --cpu-threshold 80 --mem-threshold 85
 
 Prerequisites:
-    - Nornir installed (pip install nornir nornir-napalm)
-    - Nornir inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
-    - Devices accessible via SSH with appropriate credentials
-    - NAPALM driver support for device types
+    - Nornir installed with NAPALM plugin
+    - Device inventory configured (hosts.yaml)
+    - Network devices reachable via NAPALM-supported transport (SSH, netmiko)
+    - User credentials with read-only device access
+    - Device support for facts/getEnvironment methods
 
-Output:
-    CSV or JSON report with device facts including:
-    - Device name, hostname, vendor, model
-    - Serial number, uptime
-    - OS version, configuration status
+Author: Network Engineering Team
 """
 
 import argparse
-import csv
-import json
 import logging
-import sys
-from pathlib import Path
-from typing import Any, Dict, List
-
+from collections import defaultdict
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.filter import F
+from nornir.plugins.tasks.networking import napalm_get
+from nornir.plugins.functions.text import print_result
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging to console and file."""
+def setup_logging(verbose=False):
+    """Configure logging with appropriate verbosity."""
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=getattr(logging, level.upper()),
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("device_facts.log"),
-        ],
+        level=level,
     )
+    return logging.getLogger(__name__)
 
 
-def collect_device_facts(task: Task) -> Result:
-    """Collect device facts using NAPALM get_facts."""
+def get_health_status(device_name, facts, environment, thresholds):
+    """
+    Evaluate device health and return status dict.
+
+    Args:
+        device_name: Device hostname
+        facts: Device facts dict from NAPALM get_facts()
+        environment: Device environment dict from NAPALM get_environment()
+        thresholds: Dict with 'cpu', 'memory', 'disk' threshold percentages
+
+    Returns:
+        Dict with health status and unhealthy metrics
+    """
+    health_status = {
+        "device": device_name,
+        "status": "healthy",
+        "issues": [],
+        "metrics": {},
+    }
+
     try:
-        result = task.run(napalm_get, getters=["get_facts"])
-        return result
-    except Exception as e:
-        logging.error(f"Error collecting facts from {task.host.name}: {e}")
-        return Result(host=task.host, result={}, failed=True)
-
-
-def parse_facts(task: Task) -> Result:
-    """Parse and format device facts from NAPALM output."""
-    try:
-        facts_result = task.run(napalm_get, getters=["get_facts"])
-
-        if facts_result.failed:
-            return Result(
-                host=task.host,
-                result={"device": task.host.name, "error": "Failed to get facts"},
-                failed=True,
-            )
-
-        facts = facts_result[0].result.get("get_facts", {})
-        uptime_seconds = facts.get("uptime_seconds", 0)
+        uptime_seconds = facts.get("uptime", 0)
         uptime_days = uptime_seconds // 86400
+        health_status["metrics"]["uptime_days"] = uptime_days
 
-        parsed = {
-            "device": task.host.name,
-            "hostname": facts.get("hostname", "N/A"),
-            "vendor": facts.get("vendor", "N/A"),
-            "model": facts.get("model", "N/A"),
-            "serial_number": facts.get("serial_number", "N/A"),
-            "uptime_seconds": uptime_seconds,
-            "uptime_days": uptime_days,
-            "os_version": facts.get("os_version", "N/A"),
-            "fqdn": facts.get("fqdn", "N/A"),
-            "interface_count": facts.get("interface_count", "N/A"),
-        }
+        if "cpu" in environment:
+            for cpu_entry in environment.get("cpu", {}).values():
+                cpu_percent = cpu_entry.get("%usage", 0)
+                health_status["metrics"]["cpu_percent"] = cpu_percent
+                if cpu_percent > thresholds["cpu"]:
+                    health_status["status"] = "warning"
+                    health_status["issues"].append(
+                        f"CPU at {cpu_percent}% (threshold: {thresholds['cpu']}%)"
+                    )
 
-        return Result(host=task.host, result=parsed)
+        if "memory" in environment:
+            mem_data = environment["memory"].get("System memory", {})
+            if mem_data:
+                mem_used = mem_data.get("used_ram", 0)
+                mem_total = mem_data.get("available_ram", 1)
+                mem_percent = int((mem_used / mem_total) * 100) if mem_total > 0 else 0
+                health_status["metrics"]["memory_percent"] = mem_percent
+                if mem_percent > thresholds["memory"]:
+                    health_status["status"] = "warning"
+                    health_status["issues"].append(
+                        f"Memory at {mem_percent}% (threshold: {thresholds['memory']}%)"
+                    )
 
-    except Exception as e:
-        logging.error(f"Error parsing facts from {task.host.name}: {e}")
-        return Result(
-            host=task.host,
-            result={"device": task.host.name, "error": str(e)},
-            failed=True,
+        return health_status
+
+    except (KeyError, TypeError, ZeroDivisionError) as e:
+        logging.warning(f"{device_name}: Error parsing health metrics - {e}")
+        health_status["status"] = "unknown"
+        health_status["issues"].append("Failed to parse device metrics")
+        return health_status
+
+
+def gather_device_health(host, thresholds):
+    """Gather health metrics from a device."""
+    device_name = host.name
+
+    try:
+        facts_result = host.run_task(
+            napalm_get,
+            getters=["facts", "environment"],
+            timeout=host.timeout or 30,
         )
 
+        facts = facts_result[0].result.get("facts", {})
+        environment = facts_result[0].result.get("environment", {})
 
-def write_csv_report(data: List[Dict[str, Any]], output_path: Path) -> None:
-    """Write facts to CSV file."""
-    if not data:
-        logging.warning("No data to write")
-        return
+        health = get_health_status(device_name, facts, environment, thresholds)
+        return health
 
-    fieldnames = list(data[0].keys())
-
-    try:
-        with open(output_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(data)
-        logging.info(f"CSV report written to {output_path}")
-    except IOError as e:
-        logging.error(f"Failed to write CSV file: {e}")
-        raise
-
-
-def write_json_report(data: List[Dict[str, Any]], output_path: Path) -> None:
-    """Write facts to JSON file."""
-    try:
-        with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
-        logging.info(f"JSON report written to {output_path}")
-    except IOError as e:
-        logging.error(f"Failed to write JSON file: {e}")
-        raise
-
-
-def display_summary(data: List[Dict[str, Any]]) -> None:
-    """Display summary statistics to console."""
-    if not data:
-        print("No data collected")
-        return
-
-    print("\n" + "=" * 90)
-    print("DEVICE FACTS SUMMARY")
-    print("=" * 90)
-    print(f"{'Device':<20} {'Vendor':<10} {'Model':<20} {'Version':<15} {'Days Up':<10}")
-    print("-" * 90)
-
-    for record in data:
-        if "error" not in record:
-            device = record.get("device", "N/A")
-            vendor = record.get("vendor", "N/A")
-            model = record.get("model", "N/A")
-            version = record.get("os_version", "N/A")
-            uptime = record.get("uptime_days", 0)
-            print(f"{device:<20} {vendor:<10} {model:<20} {version:<15} {uptime:<10}")
-
-    print("=" * 90 + "\n")
+    except Exception as e:
+        logging.error(f"{device_name}: Connection failed - {e}")
+        return {
+            "device": device_name,
+            "status": "critical",
+            "issues": [f"Unable to connect: {str(e)}"],
+            "metrics": {},
+        }
 
 
 def main():
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Collect and report device facts across network"
+        description="Monitor network device health metrics"
     )
     parser.add_argument(
-        "--config-file",
-        default="nornir_config.yaml",
-        help="Nornir configuration file path",
+        "--inventory",
+        default="inventory",
+        help="Path to Nornir inventory directory (default: inventory)",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        help="Output file path (CSV or JSON based on extension)",
+        "--devices",
+        default="all",
+        help="Device filter: 'all' or group/name (default: all)",
     )
     parser.add_argument(
-        "--format",
-        choices=["csv", "json"],
-        default="csv",
-        help="Output format (overridden by file extension if --output used)",
+        "--username", help="Device username (overrides inventory)"
     )
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity level",
+        "--password", help="Device password (overrides inventory)"
+    )
+    parser.add_argument(
+        "--cpu-threshold",
+        type=int,
+        default=80,
+        help="CPU usage warning threshold %% (default: 80)",
+    )
+    parser.add_argument(
+        "--mem-threshold",
+        type=int,
+        default=85,
+        help="Memory usage warning threshold %% (default: 85)",
+    )
+    parser.add_argument(
+        "--disk-threshold",
+        type=int,
+        default=90,
+        help="Disk usage warning threshold %% (default: 90)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Device connection timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging"
     )
 
     args = parser.parse_args()
-    setup_logging(args.log_level)
+    logger = setup_logging(args.verbose)
 
-    logger = logging.getLogger(__name__)
-    logger.info("Starting device facts collection")
-
+    logger.info("Initializing Nornir inventory")
     try:
-        nr = InitNornir(config_file=args.config_file)
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-
-        results = nr.run(task=parse_facts, name="Get Device Facts")
-
-        all_facts = []
-        failed_count = 0
-
-        for task_result in results.values():
-            if not task_result.failed:
-                all_facts.append(task_result[0].result)
-            else:
-                failed_count += 1
-                logger.warning(f"Failed to collect facts from device")
-
-        if args.output:
-            output_path = Path(args.output)
-            if args.format == "json" or output_path.suffix == ".json":
-                write_json_report(all_facts, output_path)
-            else:
-                write_csv_report(all_facts, output_path)
-        else:
-            display_summary(all_facts)
-
-        logger.info(
-            f"Collection complete: {len(all_facts)} successful, {failed_count} failed"
-        )
-
-    except FileNotFoundError:
-        logger.error(f"Config file not found: {args.config_file}")
-        sys.exit(1)
+        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"Failed to initialize Nornir: {e}")
+        return 1
+
+    if args.devices != "all":
+        nr = nr.filter(F(name__contains=args.devices) | F(groups__contains=args.devices))
+
+    if not nr.inventory.hosts:
+        logger.error("No devices matched filter")
+        return 1
+
+    if args.username:
+        for host in nr.inventory.hosts.values():
+            host.username = args.username
+    if args.password:
+        for host in nr.inventory.hosts.values():
+            host.password = args.password
+    if args.timeout:
+        for host in nr.inventory.hosts.values():
+            host.timeout = args.timeout
+
+    thresholds = {
+        "cpu": args.cpu_threshold,
+        "memory": args.mem_threshold,
+        "disk": args.disk_threshold,
+    }
+
+    logger.info(f"Monitoring {len(nr.inventory.hosts)} devices")
+    logger.info(f"Thresholds: CPU={thresholds['cpu']}%, Memory={thresholds['memory']}%")
+
+    results = defaultdict(list)
+
+    for device_name, host in nr.inventory.hosts.items():
+        health = gather_device_health(host, thresholds)
+        status = health["status"]
+        results[status].append(health)
+
+        status_symbol = "✓" if status == "healthy" else "⚠" if status == "warning" else "✗"
+        logger.info(f"{status_symbol} {device_name}: {status.upper()}")
+
+        if health["issues"]:
+            for issue in health["issues"]:
+                logger.warning(f"  → {issue}")
+
+    print("\n" + "="*70)
+    print("DEVICE HEALTH MONITOR REPORT")
+    print("="*70)
+
+    for status in ["healthy", "warning", "critical", "unknown"]:
+        devices = results.get(status, [])
+        if devices:
+            print(f"\n{status.upper()} ({len(devices)} devices):")
+            for device_health in devices:
+                metrics_str = " | ".join(
+                    [f"{k}={v}" for k, v in device_health["metrics"].items()]
+                )
+                print(f"  {device_health['device']}: {metrics_str}")
+                for issue in device_health["issues"]:
+                    print(f"    ⚠ {issue}")
+
+    healthy_count = len(results.get("healthy", []))
+    total_count = sum(len(v) for v in results.values())
+    print(f"\nSummary: {healthy_count}/{total_count} devices healthy")
+    print("="*70)
+
+    return 0 if len(results.get("critical", [])) == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
-```
+    exit(main())
