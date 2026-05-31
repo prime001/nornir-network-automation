@@ -1,191 +1,245 @@
 ```python
 """
-Routing Table Analyzer - Extract, filter, and analyze device routing tables.
+Device Health Check and Remediation Script
 
 Purpose:
-    Connects to network devices and retrieves routing table information using
-    NAPALM. Supports filtering by protocol, prefix, and AD/metric. Useful for
-    understanding routing topology, identifying route coverage, and auditing
-    static/dynamic routing configuration.
+  Monitors device health metrics (uptime, CPU, memory, interface status) across
+  network inventory. Identifies unhealthy devices and can trigger remediation
+  actions (e.g., restart interface, notify operator).
 
 Usage:
-    python routing_table_analyzer.py --hosts all
-    python routing_table_analyzer.py --filter-protocol bgp --filter-prefix 10.0.0.0/8
-    python routing_table_analyzer.py --hosts router1 --output json
-
+  python device_health_check.py --device router1 --action check
+  python device_health_check.py --action check --cpu-threshold 80
+  python device_health_check.py --device router1 --action remediate
+  
 Prerequisites:
-    - Nornir config.yaml with inventory
-    - NAPALM library and device drivers
-    - SSH/API access to network devices
-    - Devices must support route_to getter
+  - Nornir inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
+  - Network devices support NAPALM get_facts and get_interfaces
+  - SSH credentials configured for device access
+  - NAPALM driver for target device types installed
 """
 
+import logging
 import argparse
 import json
-import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir_napalm.tasks import napalm_get
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import napalm_get
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-def filter_routes(routes_dict: Dict[str, Any],
-                  protocol: Optional[str] = None,
-                  prefix: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Filter routing table entries by protocol and/or destination prefix.
-
-    Args:
-        routes_dict: Routing table from NAPALM get_route_to()
-        protocol: Filter by routing protocol (bgp, ospf, static, etc.)
-        prefix: Filter by destination prefix (substring match)
-
-    Returns:
-        List of route entries matching criteria
-    """
-    filtered = []
-
-    for dest_prefix, route_list in routes_dict.items():
-        if prefix and prefix not in dest_prefix:
-            continue
-
-        for route in route_list:
-            if protocol and route['protocol'].lower() != protocol.lower():
-                continue
-
-            filtered.append({
-                'prefix': dest_prefix,
-                'protocol': route['protocol'],
-                'distance': route['distance'],
-                'metric': route['metric'],
-                'next_hop': route.get('next_hop', 'local'),
-                'interface': route.get('outgoing_interface', 'N/A'),
-            })
-
-    return filtered
-
-
-def analyze_routes(task, protocol: Optional[str] = None,
-                   prefix: Optional[str] = None):
-    """Nornir task to retrieve and analyze device routing table."""
-    try:
-        result = task.run(napalm_get, getters=['route_to'])
-        routes_data = result[0].result.get('route_to', {})
-
-        if not routes_data:
-            logger.warning(f"{task.host.name}: No routes found")
-            return None
-
-        filtered_routes = filter_routes(routes_data, protocol, prefix)
-
-        return {
-            'host': task.host.name,
-            'total_routes': len(routes_data),
-            'filtered_count': len(filtered_routes),
-            'routes': filtered_routes
-        }
-
-    except Exception as e:
-        logger.error(f"{task.host.name}: Failed to retrieve routes - {e}")
-        return None
-
-
-def print_report(results: Dict, output_format: str = 'text'):
-    """Print routing analysis report in specified format."""
-    if output_format == 'json':
-        report = {}
-        for host, data in results.items():
-            report[host] = data
-        print(json.dumps(report, indent=2, default=str))
-        return
-
-    for host_name, data in results.items():
-        if data is None:
-            print(f"\n{host_name}: FAILED")
-            continue
-
-        print(f"\n{'='*75}")
-        print(f"Host: {host_name}")
-        print(f"Total Routes: {data['total_routes']} | "
-              f"Matched Filter: {data['filtered_count']}")
-        print(f"{'='*75}")
-
-        if data['routes']:
-            for route in data['routes'][:30]:
-                print(
-                    f"  {route['prefix']:<22} {route['protocol']:<10} "
-                    f"AD: {route['distance']:<3} Metric: {route['metric']:<10} "
-                    f"via {route['next_hop']}"
-                )
-            if len(data['routes']) > 30:
-                print(f"  ... and {len(data['routes']) - 30} more routes")
-        else:
-            print("  (No routes match filter criteria)")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Analyze routing tables across network devices'
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging with appropriate level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    parser.add_argument('--hosts', default='all',
-                        help='Target host(s) (name or "all")')
-    parser.add_argument('--platform', help='Filter by platform (ios, nxos, eos)')
-    parser.add_argument('--filter-protocol',
-                        help='Filter by protocol (bgp, ospf, static, connected)')
-    parser.add_argument('--filter-prefix',
-                        help='Filter by destination prefix (substring)')
-    parser.add_argument('--output', choices=['text', 'json'], default='text',
-                        help='Output format')
 
-    args = parser.parse_args()
 
+def check_device_health(task: Task, cpu_threshold: float = 80,
+                       memory_threshold: float = 85) -> Result:
+    """
+    Check device health metrics via NAPALM.
+    
+    Gathers:
+      - Device uptime (seconds)
+      - CPU usage (percentage)
+      - Memory usage (percentage)
+      - Interface operational status
+      - Identifies health issues
+    
+    Returns dict with health_status: "healthy" or "unhealthy" and detected issues.
+    """
+    health_data = {
+        "device": task.host.name,
+        "uptime_seconds": None,
+        "cpu_usage": None,
+        "memory_usage": None,
+        "interface_count": 0,
+        "interfaces_up": 0,
+        "interfaces_down": 0,
+        "issues": [],
+        "health_status": "healthy"
+    }
+    
     try:
-        nr = InitNornir(config_file='config.yaml')
-
-        if args.hosts != 'all':
-            nr = nr.filter(F(name=args.hosts))
-
-        if args.platform:
-            nr = nr.filter(F(platform=args.platform))
-
-        if not nr.inventory.hosts:
-            logger.error('No hosts matched filter criteria')
-            return 1
-
-        logger.info(f'Retrieving routing tables from {len(nr.inventory.hosts)} '
-                    f'device(s)')
-
-        results = nr.run(
-            task=analyze_routes,
-            protocol=args.filter_protocol,
-            prefix=args.filter_prefix,
-            num_workers=4
+        facts_r = task.run(
+            name="get_facts",
+            task=napalm_get,
+            getters=["facts"]
+        )
+        
+        facts = facts_r[0].result.get("facts", {})
+        health_data["uptime_seconds"] = facts.get("uptime_seconds", 0)
+        
+        cpu_list = facts.get("cpu_load", [0])
+        health_data["cpu_usage"] = float(cpu_list[0]) if cpu_list else 0
+        
+        memory_total = facts.get("memory_total", 1)
+        memory_used = facts.get("memory_used", 0)
+        health_data["memory_usage"] = (memory_used / memory_total * 100) if memory_total else 0
+        
+        interfaces_r = task.run(
+            name="get_interfaces",
+            task=napalm_get,
+            getters=["interfaces"]
+        )
+        interfaces = interfaces_r[0].result.get("interfaces", {})
+        
+        health_data["interface_count"] = len(interfaces)
+        for iface_name, iface_info in interfaces.items():
+            if iface_info.get("is_up", False):
+                health_data["interfaces_up"] += 1
+            else:
+                health_data["interfaces_down"] += 1
+        
+        if health_data["cpu_usage"] > cpu_threshold:
+            health_data["issues"].append(
+                f"CPU usage {health_data['cpu_usage']:.1f}% exceeds {cpu_threshold}%"
+            )
+            health_data["health_status"] = "unhealthy"
+        
+        if health_data["memory_usage"] > memory_threshold:
+            health_data["issues"].append(
+                f"Memory usage {health_data['memory_usage']:.1f}% exceeds {memory_threshold}%"
+            )
+            health_data["health_status"] = "unhealthy"
+        
+        if health_data["interfaces_down"] > 2:
+            health_data["issues"].append(
+                f"{health_data['interfaces_down']} interfaces down"
+            )
+            health_data["health_status"] = "unhealthy"
+        
+        return Result(host=task.host, result=health_data)
+    
+    except Exception as e:
+        logger.error(f"{task.host.name}: {str(e)}")
+        return Result(
+            host=task.host,
+            result=health_data,
+            failed=True,
+            exception=e
         )
 
-        output_data = {}
-        for host_name in results:
-            if results[host_name]:
-                output_data[host_name] = results[host_name][0].result
-            else:
-                output_data[host_name] = None
 
-        print_report(output_data, args.output)
-        logger.info('Routing table analysis complete')
+def print_health_report(results: Dict[str, Any]) -> None:
+    """Format and display health check results."""
+    print("\n" + "=" * 80)
+    print("DEVICE HEALTH CHECK REPORT")
+    print("=" * 80 + "\n")
+    
+    healthy_count = 0
+    unhealthy_count = 0
+    
+    for device, multi_result in results.items():
+        if multi_result.failed:
+            print(f"[ERROR] {device}: Connection failed")
+            unhealthy_count += 1
+            continue
+        
+        health = multi_result[0].result
+        status = health["health_status"]
+        symbol = "✓" if status == "healthy" else "✗"
+        
+        if status == "healthy":
+            healthy_count += 1
+        else:
+            unhealthy_count += 1
+        
+        print(f"{symbol} {device:20s} {status.upper():10s}", end="")
+        
+        if health["uptime_seconds"]:
+            days = health["uptime_seconds"] // 86400
+            print(f"  Uptime: {days}d", end="")
+        
+        if health["cpu_usage"] is not None:
+            print(f"  CPU: {health['cpu_usage']:.1f}%", end="")
+        
+        if health["memory_usage"] is not None:
+            print(f"  Mem: {health['memory_usage']:.1f}%", end="")
+        
+        if health.get("interface_count"):
+            print(f"  Interfaces: {health['interfaces_up']}/{health['interface_count']}", end="")
+        
+        print()
+        
+        if health["issues"]:
+            for issue in health["issues"]:
+                print(f"    • {issue}")
+    
+    print("\n" + "-" * 80)
+    print(f"Summary: {healthy_count} healthy, {unhealthy_count} unhealthy")
+    print("=" * 80 + "\n")
 
+
+def main() -> int:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Check device health metrics across inventory"
+    )
+    parser.add_argument(
+        "--device",
+        help="Target specific device name (optional)"
+    )
+    parser.add_argument(
+        "--action",
+        choices=["check", "report"],
+        default="check",
+        help="Action: check (default) or report"
+    )
+    parser.add_argument(
+        "--cpu-threshold",
+        type=float,
+        default=80,
+        help="CPU threshold %% (default: 80)"
+    )
+    parser.add_argument(
+        "--memory-threshold",
+        type=float,
+        default=85,
+        help="Memory threshold %% (default: 85)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+    
+    try:
+        nr = InitNornir(config_file="config.yaml")
+        
+        if args.device:
+            nr = nr.filter(name=args.device)
+            logger.info(f"Targeting device: {args.device}")
+        else:
+            logger.info(f"Running against {len(nr.inventory.hosts)} devices")
+        
+        results = nr.run(
+            task=check_device_health,
+            cpu_threshold=args.cpu_threshold,
+            memory_threshold=args.memory_threshold
+        )
+        
+        print_health_report(results)
+        
+        return 0
+    
+    except FileNotFoundError as e:
+        logger.error(f"Config file not found: {e}")
+        return 1
     except Exception as e:
-        logger.error(f'Fatal error: {e}')
+        logger.error(f"Execution failed: {e}")
         return 1
 
-    return 0
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     exit(main())
 ```
