@@ -1,218 +1,226 @@
 ```python
 """
-Device Connectivity and Credential Auditor
+Device Health and System Metrics Collector
 
-Tests SSH connectivity and credential validity across network devices in inventory.
-Useful for pre-change validation, credential rotation verification, and device
-reachability audits.
+Gathers comprehensive health metrics from network devices including uptime,
+interface status, and system information. Useful for capacity planning,
+monitoring, and health assessments across device fleet.
 
 Usage:
-    python device_auditor.py --group core --username admin
-    python device_auditor.py --hosts router1,router2,switch1 --password secret123
-    python device_auditor.py --all --output audit_report.txt
+    python device_health_check.py -H inventory.yaml -u admin -p password
+    python device_health_check.py -H inventory.yaml -u admin -p password -d router1,router2
+    python device_health_check.py -H inventory.yaml -u admin -p password --format json
 
 Prerequisites:
-    - Nornir installed with netmiko
-    - Device inventory configured in config.yaml
-    - SSH access to target devices
-    - Credentials in inventory or provided via --username/--password
+    - Nornir installed with NAPALM plugin
+    - Network inventory file (YAML format)
+    - Device credentials (username/password or SSH key)
+    - Device SSH/NETCONF access enabled
+
+Output:
+    - Health summary table (default text format)
+    - JSON output (--format json)
+    - Device-specific metrics including uptime, interface count, software version
 """
 
 import argparse
+import json
 import logging
 import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List
+from datetime import datetime, timedelta
+from typing import Dict, Optional
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import netmiko_send_command
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from nornir.core.task import Result, Task
+from nornir.plugins.tasks.networking import napalm_get
 
 
-def test_device_connectivity(task: Task) -> Result:
-    """Test SSH connectivity and execute simple command to validate credentials."""
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    """Configure logging with timestamp and level."""
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=level,
+    )
+    return logging.getLogger(__name__)
+
+
+def collect_device_health(task: Task) -> Result:
+    """Collect health metrics from a device using NAPALM getters."""
     try:
-        result = task.run(
-            netmiko_send_command,
-            command_string='show version',
-            use_textfsm=False
+        facts_result = task.run(napalm_get, getters=["facts"])
+        interfaces_result = task.run(napalm_get, getters=["interfaces"])
+
+        facts_data = facts_result[0].result.get("facts", {})
+        interfaces_data = interfaces_result[0].result.get("interfaces", {})
+
+        up_count = sum(
+            1 for iface in interfaces_data.values()
+            if iface.get("state") == "up"
         )
+
+        health_metrics = {
+            "hostname": facts_data.get("hostname", "unknown"),
+            "vendor": facts_data.get("vendor", "unknown"),
+            "model": facts_data.get("model", "unknown"),
+            "os_version": facts_data.get("os_version", "unknown"),
+            "uptime_seconds": facts_data.get("uptime_seconds", 0),
+            "serial_number": facts_data.get("serial_number", "N/A"),
+            "total_interfaces": len(interfaces_data),
+            "up_interfaces": up_count,
+            "down_interfaces": len(interfaces_data) - up_count,
+            "collected_at": datetime.now().isoformat(),
+        }
+
+        return Result(host=task.host, result=health_metrics)
+
+    except Exception as e:
         return Result(
             host=task.host,
-            result={
-                'status': 'reachable',
-                'platform': task.host.platform,
-                'command_output_lines': len(str(result[0].result).split('\n'))
+            result=None,
+            failed=True,
+            exception=e,
+        )
+
+
+def format_uptime(seconds: int) -> str:
+    """Convert seconds to human-readable uptime format."""
+    if not seconds:
+        return "N/A"
+    uptime = timedelta(seconds=seconds)
+    days = uptime.days
+    hours = uptime.seconds // 3600
+    minutes = (uptime.seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
+
+
+def print_text_report(health_data: Dict) -> None:
+    """Print health metrics as formatted text table."""
+    print("\n" + "=" * 110)
+    print("DEVICE HEALTH REPORT")
+    print("=" * 110)
+    print(
+        f"{'Hostname':<18} {'Vendor':<10} {'Model':<20} "
+        f"{'Uptime':<15} {'Interfaces':<15} {'OS Version':<15}"
+    )
+    print("-" * 110)
+
+    for hostname in sorted(health_data.keys()):
+        metrics = health_data[hostname]
+        uptime_str = format_uptime(metrics["uptime_seconds"])
+        iface_str = (
+            f"{metrics['up_interfaces']}/{metrics['total_interfaces']}"
+        )
+        print(
+            f"{metrics['hostname']:<18} {metrics['vendor']:<10} "
+            f"{metrics['model']:<20} {uptime_str:<15} {iface_str:<15} "
+            f"{metrics['os_version']:<15}"
+        )
+
+    print("=" * 110 + "\n")
+
+
+def main() -> int:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-H",
+        "--hosts",
+        required=True,
+        help="Path to inventory file (YAML)",
+    )
+    parser.add_argument(
+        "-u",
+        "--username",
+        required=True,
+        help="Device username",
+    )
+    parser.add_argument(
+        "-p",
+        "--password",
+        required=True,
+        help="Device password",
+    )
+    parser.add_argument(
+        "-d",
+        "--devices",
+        help="Comma-separated list of device names (optional filter)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
+
+    args = parser.parse_args()
+    logger = setup_logging(args.log_level)
+
+    try:
+        logger.info("Initializing Nornir inventory")
+        nr = InitNornir(
+            inventory={
+                "plugin": "SimpleInventory",
+                "options": {"host_file": args.hosts},
             }
         )
-    except Exception as e:
-        return Result(
-            host=task.host,
-            result={
-                'status': 'unreachable',
-                'platform': task.host.platform,
-                'error': str(e)
-            },
-            failed=True
-        )
 
+        if args.devices:
+            device_list = [d.strip() for d in args.devices.split(",")]
+            nr = nr.filter(name__in=device_list)
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices")
+        else:
+            logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
 
-def generate_audit_report(audit_results: Dict) -> str:
-    """Generate formatted audit report from results."""
-    reachable = [h for h, r in audit_results.items() if r['status'] == 'reachable']
-    unreachable = [h for h, r in audit_results.items() if r['status'] == 'unreachable']
-    
-    report_lines = [
-        f"\n{'=' * 70}",
-        f"Device Connectivity and Credential Audit Report",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"{'=' * 70}",
-        f"\nSummary:",
-        f"  Total devices tested: {len(audit_results)}",
-        f"  Reachable: {len(reachable)} ({100*len(reachable)//len(audit_results) if audit_results else 0}%)",
-        f"  Unreachable: {len(unreachable)}",
-    ]
-    
-    if reachable:
-        report_lines.extend([
-            f"\n{'Reachable Devices:':-<50}",
-        ])
-        for host in sorted(reachable):
-            platform = audit_results[host].get('platform', 'unknown')
-            report_lines.append(f"  ✓ {host:<30} ({platform})")
-    
-    if unreachable:
-        report_lines.extend([
-            f"\n{'Unreachable Devices:':-<50}",
-        ])
-        for host in sorted(unreachable):
-            error = audit_results[host].get('error', 'unknown error')
-            report_lines.append(f"  ✗ {host:<30} Error: {error[:40]}")
-    
-    report_lines.append(f"{'=' * 70}\n")
-    
-    return '\n'.join(report_lines)
-
-
-def run_audit(nr, hosts: List[str] = None, group: str = None) -> Dict:
-    """Execute connectivity audit across specified devices."""
-    if hosts:
-        host_list = [h.strip() for h in hosts]
-        filtered = nr.filter(F(name__in=host_list))
-        scope_msg = f"hosts: {', '.join(host_list)}"
-    elif group:
-        filtered = nr.filter(F(groups__contains=group))
-        scope_msg = f"group: {group}"
-    else:
-        filtered = nr
-        scope_msg = "all inventory"
-    
-    if not filtered.inventory.hosts:
-        logger.error(f"No devices found matching {scope_msg}")
-        return {}
-    
-    logger.info(f"Starting audit of {scope_msg} ({len(filtered.inventory.hosts)} device(s))")
-    
-    results = filtered.run(task=test_device_connectivity, num_workers=4)
-    
-    audit_results = {}
-    for host_name, task_results in results.items():
-        for task_result in task_results.values():
-            audit_results[host_name] = task_result.result
-            status_symbol = "✓" if task_result.result['status'] == 'reachable' else "✗"
-            logger.info(
-                f"{status_symbol} {host_name}: {task_result.result['status']}"
-            )
-    
-    return audit_results
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Audit device connectivity and credential validity'
-    )
-    parser.add_argument(
-        '--hosts',
-        help='Comma-separated list of device hostnames'
-    )
-    parser.add_argument(
-        '--group',
-        help='Nornir inventory group to audit'
-    )
-    parser.add_argument(
-        '--all',
-        action='store_true',
-        help='Audit all devices in inventory'
-    )
-    parser.add_argument(
-        '--username',
-        help='SSH username (overrides inventory setting)'
-    )
-    parser.add_argument(
-        '--password',
-        help='SSH password (overrides inventory setting)'
-    )
-    parser.add_argument(
-        '--output',
-        help='Output file for report (stdout if not specified)'
-    )
-    parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        default='INFO',
-        help='Logging verbosity'
-    )
-    
-    args = parser.parse_args()
-    logger.setLevel(args.log_level)
-    
-    if not any([args.hosts, args.group, args.all]):
-        logger.error("Specify --hosts, --group, or --all")
-        sys.exit(1)
-    
-    try:
-        nr = InitNornir(config_file='config.yaml')
-    except FileNotFoundError:
-        logger.error("config.yaml not found in current directory")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to initialize Nornir: {e}")
-        sys.exit(1)
-    
-    if args.username:
         for host in nr.inventory.hosts.values():
             host.username = args.username
-    if args.password:
-        for host in nr.inventory.hosts.values():
             host.password = args.password
-    
-    audit_results = run_audit(
-        nr,
-        hosts=[h.strip() for h in args.hosts.split(',')] if args.hosts else None,
-        group=args.group
-    )
-    
-    if not audit_results:
-        logger.error("Audit produced no results")
-        sys.exit(1)
-    
-    report = generate_audit_report(audit_results)
-    
-    if args.output:
-        Path(args.output).write_text(report)
-        logger.info(f"Report saved to {args.output}")
-    else:
-        print(report)
+
+        logger.info("Collecting health metrics from all devices")
+        results = nr.run(task=collect_device_health)
+
+        health_data = {}
+        failed_hosts = []
+
+        for host_name, multi_result in results.items():
+            if multi_result[0].result:
+                health_data[host_name] = multi_result[0].result
+            else:
+                failed_hosts.append(host_name)
+                logger.warning(
+                    f"Failed to collect from {host_name}: "
+                    f"{multi_result[0].exception}"
+                )
+
+        if not health_data:
+            logger.error("No health data collected from any device")
+            return 1
+
+        if args.format == "json":
+            print(json.dumps(health_data, indent=2))
+        else:
+            print_text_report(health_data)
+
+        if failed_hosts:
+            logger.warning(f"Failed on {len(failed_hosts)} device(s)")
+            return 1
+
+        logger.info("Health check completed successfully")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
 ```
