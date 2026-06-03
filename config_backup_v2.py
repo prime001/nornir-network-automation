@@ -1,195 +1,207 @@
-config_drift.py - Configuration Drift Detector
+config_drift.py — Detect configuration drift against saved backup snapshots.
 
-Compares current running configurations against saved baseline backups to
-detect unauthorized or unexpected changes. Outputs a unified diff per device
-and exits non-zero if any drift is found, making it suitable for CI/CD
-pipeline integration or scheduled monitoring.
+Purpose:
+    Compares each device's current running configuration against the most
+    recently saved backup file on disk. Devices with no saved backup are
+    flagged as untracked. Useful for post-maintenance audits and detecting
+    unauthorized or undocumented changes across the fleet.
 
 Usage:
-    python config_drift.py --backup-dir ./backups --username admin --password secret
-    python config_drift.py --backup-dir ./backups --host 192.168.1.1 --username admin
-    python config_drift.py --backup-dir ./backups --save-on-drift --quiet
+    python config_drift.py --backup-dir ./backups
+    python config_drift.py --backup-dir ./backups --group core-routers
+    python config_drift.py --backup-dir ./backups --host sw-01 --save
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils netmiko
-    Baseline backups must exist under --backup-dir as <hostname>.cfg files.
-    Inventory configured via nornir config file or --host for ad-hoc runs.
+    pip install nornir nornir-netmiko nornir-utils
+    Inventory files: hosts.yaml, groups.yaml, defaults.yaml in --inventory dir
+    Backup files named <hostname>.txt must exist in --backup-dir for comparison;
+    run once with --save to create the initial baseline for each device.
+
+Exit codes:
+    0 — all devices clean (no drift)
+    1 — fatal error (inventory empty, connection failures for all hosts)
+    2 — drift detected on one or more devices
 """
 
 import argparse
 import difflib
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Result, Task
+from nornir.core.task import Task, Result
 from nornir_netmiko.tasks import netmiko_send_command
-from nornir_utils.plugins.functions import print_title
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger("config_drift")
+logger = logging.getLogger(__name__)
+
+MAX_DIFF_LINES = 80
 
 
-def fetch_running_config(task: Task) -> Result:
-    result = task.run(
+def compare_config(task: Task, backup_dir: Path, save: bool) -> Result:
+    """Pull running config and diff it against the saved backup for this host."""
+    backup_file = backup_dir / f"{task.host.name}.txt"
+
+    fetch = task.run(
         task=netmiko_send_command,
         command_string="show running-config",
         use_textfsm=False,
     )
-    return Result(host=task.host, result=result.result)
+    running_lines = fetch[0].result.strip().splitlines(keepends=True)
 
+    if not backup_file.exists():
+        if save:
+            backup_file.write_text("".join(running_lines))
+            return Result(
+                host=task.host,
+                result=f"[BASELINE] {task.host.name}: no prior backup — baseline saved.",
+                changed=True,
+            )
+        return Result(
+            host=task.host,
+            result=f"[UNTRACKED] {task.host.name}: no backup found at {backup_file}",
+            changed=False,
+        )
 
-def load_baseline(backup_dir: Path, hostname: str) -> str | None:
-    candidates = [
-        backup_dir / f"{hostname}.cfg",
-        backup_dir / f"{hostname}.txt",
-        backup_dir / f"{hostname}.conf",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path.read_text(errors="replace")
-    return None
-
-
-def diff_configs(baseline: str, current: str, hostname: str) -> list[str]:
-    baseline_lines = baseline.splitlines(keepends=True)
-    current_lines = current.splitlines(keepends=True)
-    return list(
+    saved_lines = backup_file.read_text().strip().splitlines(keepends=True)
+    diff = list(
         difflib.unified_diff(
-            baseline_lines,
-            current_lines,
-            fromfile=f"{hostname} (baseline)",
-            tofile=f"{hostname} (current)",
+            saved_lines,
+            running_lines,
+            fromfile=f"{task.host.name} (saved)",
+            tofile=f"{task.host.name} (running)",
             lineterm="",
         )
     )
 
-
-def save_config(backup_dir: Path, hostname: str, config: str) -> None:
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    path = backup_dir / f"{hostname}.cfg"
-    path.write_text(config)
-    log.info("Saved updated baseline for %s to %s", hostname, path)
-
-
-def check_drift(task: Task, backup_dir: Path, save_on_drift: bool) -> Result:
-    hostname = task.host.name
-    baseline = load_baseline(backup_dir, hostname)
-    if baseline is None:
+    if not diff:
         return Result(
             host=task.host,
-            result=None,
-            failed=False,
-            severity_level=logging.WARNING,
+            result=f"[CLEAN] {task.host.name}: running config matches backup",
+            changed=False,
         )
 
-    fetch_result = task.run(task=fetch_running_config)
-    current = fetch_result[0].result
-    if not current:
-        return Result(host=task.host, result=None, failed=True)
+    shown = diff[:MAX_DIFF_LINES]
+    truncated = len(diff) - MAX_DIFF_LINES
+    body = "".join(shown)
+    if truncated > 0:
+        body += f"\n... ({truncated} more diff lines not shown)"
 
-    diff = diff_configs(baseline, current, hostname)
+    summary = f"[DRIFT] {task.host.name}: {len(diff)} diff lines\n{body}"
 
-    if diff and save_on_drift:
-        save_config(backup_dir, hostname, current)
+    if save:
+        backup_file.write_text("".join(running_lines))
+        summary += "\n[SAVED] Backup updated with current running config."
 
-    return Result(host=task.host, result={"diff": diff, "current": current})
+    return Result(host=task.host, result=summary, changed=True)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Detect configuration drift against saved baselines."
+    p = argparse.ArgumentParser(
+        description="Detect per-device config drift against saved backup snapshots.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    p.add_argument(
         "--backup-dir",
-        required=True,
+        default="./backups",
         metavar="DIR",
-        help="Directory containing baseline .cfg files named <hostname>.cfg",
+        help="Directory containing per-device backup .txt files",
     )
-    parser.add_argument("--config", default="nornir.yaml", help="Nornir config file")
-    parser.add_argument("--host", help="Filter to a single hostname or IP")
-    parser.add_argument("--group", help="Filter to a device group")
-    parser.add_argument("--username", help="Override username from inventory")
-    parser.add_argument("--password", help="Override password from inventory")
-    parser.add_argument(
-        "--save-on-drift",
+    p.add_argument(
+        "--inventory",
+        default=".",
+        metavar="DIR",
+        help="Directory containing hosts.yaml, groups.yaml, defaults.yaml",
+    )
+    p.add_argument("--host", metavar="NAME", help="Target a single host by inventory name")
+    p.add_argument("--group", metavar="NAME", help="Target a device group from inventory")
+    p.add_argument(
+        "--save",
         action="store_true",
-        help="Overwrite baseline with current config when drift is detected",
+        help="After diff, write current running config as the new backup baseline",
     )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress diff output; exit code still reflects drift",
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Concurrent worker threads",
     )
-    parser.add_argument("--workers", type=int, default=10)
-    return parser.parse_args()
+    p.add_argument("--username", metavar="USER", help="Override inventory username")
+    p.add_argument("--password", metavar="PASS", help="Override inventory password")
+    return p.parse_args()
 
 
-def main() -> int:
+def main() -> None:
     args = parse_args()
     backup_dir = Path(args.backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
 
-    nr = InitNornir(config_file=args.config, core={"num_workers": args.workers})
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": f"{args.inventory}/hosts.yaml",
+                "group_file": f"{args.inventory}/groups.yaml",
+                "defaults_file": f"{args.inventory}/defaults.yaml",
+            },
+        },
+    )
 
     if args.username:
         nr.inventory.defaults.username = args.username
     if args.password:
         nr.inventory.defaults.password = args.password
+
     if args.host:
-        nr = nr.filter(F(name=args.host) | F(hostname=args.host))
-    if args.group:
-        nr = nr.filter(F(groups__contains=args.group))
+        nr = nr.filter(name=args.host)
+    elif args.group:
+        nr = nr.filter(groups__contains=args.group)
 
     if not nr.inventory.hosts:
-        log.error("No hosts matched the given filters.")
-        return 2
+        logger.error("No hosts matched — check --host / --group or inventory files.")
+        sys.exit(1)
 
-    print_title(f"Config Drift Check — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(
+        "Checking %d device(s) for drift; backups in: %s",
+        len(nr.inventory.hosts),
+        backup_dir,
+    )
 
     results = nr.run(
-        task=check_drift,
+        task=compare_config,
         backup_dir=backup_dir,
-        save_on_drift=args.save_on_drift,
+        save=args.save,
+        name="config_drift",
     )
 
-    drifted: list[str] = []
-    no_baseline: list[str] = []
+    failed = [h for h, r in results.items() if r.failed]
+    drifted = [h for h, r in results.items() if not r.failed and r.changed]
+    clean = [h for h, r in results.items() if not r.failed and not r.changed]
 
-    for hostname, multi in results.items():
-        if multi.failed:
-            print(f"[ERROR]   {hostname}: failed to retrieve config")
-            continue
-
-        data = multi[0].result
-        if data is None:
-            no_baseline.append(hostname)
-            print(f"[SKIP]    {hostname}: no baseline found in {backup_dir}")
-            continue
-
-        diff = data["diff"]
-        if diff:
-            drifted.append(hostname)
-            print(f"[DRIFT]   {hostname}: {len(diff)} changed lines")
-            if not args.quiet:
-                print("\n".join(diff))
-                print()
+    print("\n" + "=" * 64)
+    for host_name, host_result in results.items():
+        if host_result.failed:
+            print(f"[ERROR] {host_name}: {host_result.exception}")
         else:
-            print(f"[OK]      {hostname}: no drift detected")
-
+            print(host_result.result)
+    print("=" * 64)
     print(
-        f"\nSummary: {len(drifted)} drifted, "
-        f"{len(no_baseline)} skipped (no baseline), "
-        f"{len(results) - len(drifted) - len(no_baseline)} clean"
+        f"Summary: {len(clean)} clean  |  {len(drifted)} drifted  |  {len(failed)} failed"
+        f"  |  {len(nr.inventory.hosts)} total"
     )
 
-    return 1 if drifted else 0
+    if failed and not drifted and not clean:
+        sys.exit(1)
+    if drifted:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
