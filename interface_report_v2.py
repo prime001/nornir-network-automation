@@ -1,219 +1,183 @@
 ```python
 """
-LLDP Neighbor Discovery and Topology Report.
+Device Health Check and Monitoring Report
 
-Purpose: Discover network topology by collecting LLDP neighbor information from
-devices and generating a comprehensive neighbor relationship report.
+Retrieves CPU, memory, temperature, and uptime metrics from network devices
+using NAPALM getters. Generates a formatted health report and alerts on
+threshold violations.
 
 Usage:
-    python lldp_topology_report.py --inventory inventory.yaml --group routers
-    python lldp_topology_report.py --inventory inventory.yaml --device router1
-    python lldp_topology_report.py --inventory inventory.yaml --format json
+    python device_health_check.py --inventory inventory.yaml --hosts "router1,router2"
+    python device_health_check.py --inventory inventory.yaml --groups "core"
+    python device_health_check.py --inventory inventory.yaml --cpu-threshold 80
 
 Prerequisites:
-    - Nornir installed with NAPALM plugin
-    - YAML inventory file with device configurations
-    - Network connectivity to target devices
-    - LLDP enabled on network devices
-    - Appropriate credentials (in inventory or environment variables)
-
-Output Formats:
-    - table (default): Human-readable ASCII table of neighbors
-    - json: JSON format for programmatic consumption
-    - text: Detailed text report with connection summary
+    - nornir and nornir plugins installed
+    - NAPALM drivers available for device types
+    - Inventory file in YAML/JSON format
+    - Network connectivity to all target devices
 """
 
 import argparse
-import json
 import logging
-import sys
-from typing import Dict, List, Any
-
+import json
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Task
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import napalm_get
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging for the script."""
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
-
-def get_lldp_neighbors(task: Task) -> Dict[str, Any]:
-    """Retrieve LLDP neighbor information from device."""
+def get_device_health(task: Task, cpu_warn: int, mem_warn: int) -> Result:
+    """Collect device health metrics using NAPALM."""
     try:
-        result = task.run(napalm_get, getters=["get_lldp_neighbors"])
-        neighbors = result[0].result.get("get_lldp_neighbors", {})
+        result = task.run(napalm_get, getters=["environment", "facts"])
+        device_facts = result[1].result
+        device_env = result[0].result
         
-        return {
-            "device": task.host.name,
-            "neighbors": neighbors,
-            "status": "success",
+        health_data = {
+            "hostname": task.host.name,
+            "device_type": task.host.get("device_type", "unknown"),
+            "facts": device_facts.get("facts", {}),
+            "environment": device_env.get("environment", {}),
         }
+        return Result(host=task.host, result=health_data)
     except Exception as e:
-        logging.warning(f"Failed to get LLDP neighbors from {task.host.name}: {e}")
-        return {
-            "device": task.host.name,
-            "neighbors": {},
-            "status": "failed",
-            "error": str(e),
-        }
+        logger.error(f"{task.host.name}: Failed to retrieve health data - {e}")
+        return Result(host=task.host, result=None, failed=True, exception=e)
 
 
-def build_topology(results: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Build topology from collected LLDP data."""
-    connections = []
+def analyze_health(health_data: dict, cpu_warn: int, mem_warn: int) -> dict:
+    """Analyze health metrics and identify issues."""
+    if not health_data:
+        return {"status": "ERROR", "message": "No data collected"}
     
-    for host, task_results in results.items():
-        result = task_results[0].result
-        if result.get("status") == "success":
-            neighbors = result.get("neighbors", {})
-            for local_intf, neighbor_list in neighbors.items():
-                for neighbor in neighbor_list:
-                    connections.append({
-                        "source_device": result["device"],
-                        "source_interface": local_intf,
-                        "neighbor_device": neighbor.get("hostname", "unknown"),
-                        "neighbor_interface": neighbor.get("port", "unknown"),
-                    })
+    analysis = {
+        "hostname": health_data["hostname"],
+        "device_type": health_data["device_type"],
+        "alerts": [],
+        "status": "HEALTHY"
+    }
     
-    return connections
+    facts = health_data.get("facts", {})
+    env = health_data.get("environment", {})
+    
+    if "uptime_seconds" in facts:
+        days = facts["uptime_seconds"] // 86400
+        analysis["uptime_days"] = days
+        if days < 7:
+            analysis["alerts"].append(f"Low uptime: {days} days")
+            analysis["status"] = "WARNING"
+    
+    for cpu_name, cpu_data in env.get("cpu", {}).items():
+        if isinstance(cpu_data, dict):
+            cpu_util = cpu_data.get("%usage", 0)
+            if cpu_util > cpu_warn:
+                analysis["alerts"].append(f"High CPU: {cpu_name} = {cpu_util}%")
+                analysis["status"] = "CRITICAL" if cpu_util > 95 else "WARNING"
+    
+    mem = env.get("memory", {})
+    if "available_ram" in mem and "used_ram" in mem:
+        total = mem["available_ram"] + mem["used_ram"]
+        if total > 0:
+            mem_util = (mem["used_ram"] / total) * 100
+            if mem_util > mem_warn:
+                analysis["alerts"].append(f"High memory: {mem_util:.1f}%")
+                analysis["status"] = "CRITICAL" if mem_util > 98 else "WARNING"
+    
+    for sensor_name, sensor_data in env.get("temperature", {}).items():
+        if isinstance(sensor_data, dict):
+            current_temp = sensor_data.get("current_reading", 0)
+            if current_temp > 75:
+                analysis["alerts"].append(f"High temp: {sensor_name} = {current_temp}C")
+                analysis["status"] = "CRITICAL" if current_temp > 85 else "WARNING"
+    
+    if not analysis["alerts"]:
+        analysis["alerts"] = ["All metrics within normal range"]
+    
+    return analysis
 
 
-def format_table_output(connections: List[Dict[str, str]]) -> str:
-    """Format connections as ASCII table."""
-    if not connections:
-        return "No LLDP neighbors discovered."
+def print_report(analyses: list) -> None:
+    """Format and print health report."""
+    print("\n" + "=" * 80)
+    print("DEVICE HEALTH REPORT")
+    print("=" * 80)
     
-    header = f"{'Source Device':<20} {'Source Interface':<18} {'Neighbor Device':<20} {'Neighbor Interface':<18}"
-    separator = "-" * (20 + 18 + 20 + 18 + 3)
+    critical = sum(1 for a in analyses if a["status"] == "CRITICAL")
+    warning = sum(1 for a in analyses if a["status"] == "WARNING")
+    healthy = sum(1 for a in analyses if a["status"] == "HEALTHY")
     
-    rows = [header, separator]
-    for conn in connections:
-        row = (
-            f"{conn['source_device']:<20} {conn['source_interface']:<18} "
-            f"{conn['neighbor_device']:<20} {conn['neighbor_interface']:<18}"
-        )
-        rows.append(row)
+    print(f"\nSummary: {healthy} healthy, {warning} warning, {critical} critical")
+    print("-" * 80)
     
-    return "\n".join(rows)
-
-
-def format_text_output(
-    connections: List[Dict[str, str]],
-    results: Dict[str, Any]
-) -> str:
-    """Format connections as detailed text report."""
-    lines = ["LLDP Topology Report\n", "=" * 80]
-    
-    successful = sum(1 for r in results.values() if r[0].result.get("status") == "success")
-    failed = sum(1 for r in results.values() if r[0].result.get("status") != "success")
-    
-    lines.append(f"\nDevices Scanned: {len(results)}")
-    lines.append(f"Successful: {successful}")
-    lines.append(f"Failed: {failed}")
-    lines.append(f"Total Connections: {len(connections)}\n")
-    
-    if connections:
-        lines.append("Device Connections:")
-        lines.append("-" * 80)
+    for analysis in sorted(analyses, key=lambda x: x["status"], reverse=True):
+        status = analysis["status"]
+        marker = "⚠️ " if status == "WARNING" else "🔴" if status == "CRITICAL" else "✓"
+        print(f"\n{marker} {analysis['hostname']} ({analysis['device_type']}) - {status}")
         
-        devices = {}
-        for conn in connections:
-            src = conn["source_device"]
-            if src not in devices:
-                devices[src] = []
-            devices[src].append(
-                f"  {conn['source_interface']} -> "
-                f"{conn['neighbor_device']}:{conn['neighbor_interface']}"
-            )
+        if "uptime_days" in analysis:
+            print(f"  Uptime: {analysis['uptime_days']} days")
         
-        for device, conns in sorted(devices.items()):
-            lines.append(f"\n{device}:")
-            lines.extend(conns)
-    else:
-        lines.append("No LLDP neighbors discovered on any device.")
-    
-    return "\n".join(lines)
+        for alert in analysis["alerts"]:
+            print(f"  • {alert}")
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Discover network topology using LLDP neighbor information.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Check device health metrics (CPU, memory, temperature)"
     )
-    
-    parser.add_argument(
-        "--inventory",
-        default="inventory.yaml",
-        help="Path to Nornir inventory file (default: inventory.yaml)",
-    )
-    parser.add_argument(
-        "--group",
-        help="Filter devices by inventory group",
-    )
-    parser.add_argument(
-        "--device",
-        help="Specific device hostname to check",
-    )
-    parser.add_argument(
-        "--format",
-        choices=["table", "json", "text"],
-        default="table",
-        help="Output format (default: table)",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level (default: INFO)",
-    )
+    parser.add_argument("--inventory", required=True, help="Path to nornir inventory file")
+    parser.add_argument("--hosts", help="Comma-separated list of hosts to check")
+    parser.add_argument("--groups", help="Comma-separated list of groups to check")
+    parser.add_argument("--cpu-threshold", type=int, default=85, help="CPU warning threshold %")
+    parser.add_argument("--memory-threshold", type=int, default=90, help="Memory warning threshold %")
+    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     
     args = parser.parse_args()
-    setup_logging(args.log_level)
     
     try:
         nr = InitNornir(config_file=args.inventory)
         
-        if args.device:
-            nr = nr.filter(name=args.device)
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
+        if args.hosts:
+            nr = nr.filter(name=args.hosts.split(","))
+        elif args.groups:
+            nr = nr.filter(group=args.groups.split(","))
         
-        if not nr.inventory.hosts:
-            logging.error("No devices matched the filter criteria.")
-            sys.exit(1)
+        logger.info(f"Checking health for {len(nr.inventory.hosts)} devices")
         
-        logging.info(f"Collecting LLDP data from {len(nr.inventory.hosts)} device(s)...")
-        results = nr.run(task=get_lldp_neighbors)
+        results = nr.run(
+            task=get_device_health,
+            cpu_warn=args.cpu_threshold,
+            mem_warn=args.memory_threshold
+        )
         
-        connections = build_topology(results)
+        analyses = []
+        for host_name, multi_result in results.items():
+            if multi_result[0].result:
+                analysis = analyze_health(
+                    multi_result[0].result,
+                    args.cpu_threshold,
+                    args.memory_threshold
+                )
+                analyses.append(analysis)
         
-        if args.format == "json":
-            output = {
-                "total_devices": len(results),
-                "total_connections": len(connections),
-                "connections": connections,
-            }
-            print(json.dumps(output, indent=2))
-        elif args.format == "text":
-            print(format_text_output(connections, results))
-        else:  # table format
-            print(format_table_output(connections))
+        if args.json:
+            print(json.dumps(analyses, indent=2))
+        else:
+            print_report(analyses)
         
-        logging.info("Report generated successfully.")
+        critical_count = sum(1 for a in analyses if a["status"] == "CRITICAL")
+        if critical_count > 0:
+            logger.warning(f"Found {critical_count} device(s) in CRITICAL state")
         
-    except FileNotFoundError as e:
-        logging.error(f"Configuration file not found: {e}")
-        sys.exit(1)
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.error(f"Health check failed: {e}")
+        raise
 
 
 if __name__ == "__main__":
