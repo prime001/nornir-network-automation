@@ -1,224 +1,211 @@
 ```python
 """
-LLDP Neighbor Discovery Script
+Route Table Analyzer - Analyze and report on device routing tables.
 
-Discovers and reports LLDP neighbors for network devices, displaying device
-interconnections and physical topology relationships.
+Purpose:
+    Connects to network devices and gathers routing table information,
+    analyzing route statistics by protocol, identifying default routes,
+    and generating comprehensive routing reports for network auditing.
 
 Usage:
-    python discover_neighbors.py --device router1 router2 --user admin --password pass
-    python discover_neighbors.py --host-file devices.txt --user admin --password pass
+    python route_analyzer.py --devices r1,r2,r3 --username admin --password pass
+    python route_analyzer.py --devices prod_routers --format json --output routes.json
+    python route_analyzer.py --devices all --check-overlaps --verbose
 
 Prerequisites:
-    - nornir with napalm plugin installed
-    - Network devices with LLDP enabled
-    - SSH/Telnet connectivity to devices
-    - Appropriate credentials with read permissions
+    - Nornir installed and configured with inventory
+    - Network device SSH access with appropriate credentials
+    - napalm library available (pip install napalm)
+    - Devices running IOS, IOS-XE, Junos, or EOS
+
+Arguments:
+    --devices       Comma-separated device names or inventory group name
+    --username      SSH username (optional if set in inventory)
+    --password      SSH password (optional if set in inventory)
+    --format        Output format: json or text (default: text)
+    --output        Output file path (default: stdout)
+    --check-overlaps Check for overlapping routes across devices
+    --verbose       Enable verbose debug logging
 """
 
 import argparse
+import json
 import logging
-import sys
-from typing import Dict, List
-
+from collections import defaultdict
 from nornir import InitNornir
-from nornir.core.inventory import Host, Inventory, Groups
-from nornir.core.task import Result, Task
+from nornir.core.filter import F
 from nornir.plugins.tasks.networking import napalm_get
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-def get_lldp_data(task: Task) -> Result:
-    """Retrieve LLDP neighbor information from device."""
-    try:
-        result = task.run(napalm_get, getters=["lldp_neighbors"])
-        return result
-    except Exception as e:
-        logger.error(f"{task.host.name}: Failed to retrieve LLDP data - {e}")
-        return Result(host=task.host, result={}, failed=True)
-
-
-def discover_neighbors(
-    devices: List[str],
-    username: str,
-    password: str,
-    timeout: int = 30
-) -> Dict[str, Dict]:
-    """
-    Discover LLDP neighbors for a list of devices.
-
-    Args:
-        devices: List of device hostnames
-        username: SSH username
-        password: SSH password
-        timeout: Connection timeout in seconds
-
-    Returns:
-        Dictionary mapping device names to their LLDP neighbor data
-    """
-    try:
-        hosts = {dev: Host(name=dev, hostname=dev) for dev in devices}
-        nr = InitNornir(
-            inventory={
-                "plugin": "SimpleInventory",
-                "options": {
-                    "host_file": None,
-                    "group_file": None,
-                    "defaults_file": None
-                }
-            }
-        )
-        nr.inventory = Inventory(hosts=hosts, groups=Groups(), defaults={})
-
-        for host in nr.inventory.hosts.values():
-            host.username = username
-            host.password = password
-
-        logger.info(f"Querying LLDP neighbors on {len(devices)} device(s)...")
-        results = nr.run(task=get_lldp_data)
-
-        neighbors = {}
-        for device, task_result in results.items():
-            if task_result[0].failed:
-                logger.warning(f"Skipping {device}: Unable to retrieve LLDP data")
-                continue
-
-            lldp_data = task_result[0].result.get("lldp_neighbors", {})
-            neighbors[device] = lldp_data
-
-            neighbor_count = sum(len(ifaces) for ifaces in lldp_data.values())
-            logger.info(f"{device}: Discovered {neighbor_count} neighbor(s)")
-
-        return neighbors
-
-    except Exception as e:
-        logger.error(f"LLDP discovery failed: {e}")
-        raise
-
-
-def display_results(neighbors: Dict[str, Dict]) -> None:
-    """Display discovered neighbors in formatted table."""
-    if not neighbors or not any(neighbors.values()):
-        print("\nNo LLDP neighbors discovered.\n")
-        return
-
-    print("\n" + "=" * 105)
-    print(
-        f"{'Local Device':<20} {'Local Port':<22} "
-        f"{'Remote Device':<20} {'Remote Port':<22}"
+def setup_logging(verbose):
+    """Configure logging."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    print("=" * 105)
+    return logging.getLogger(__name__)
 
-    for device in sorted(neighbors.keys()):
-        lldp_data = neighbors[device]
 
-        if not lldp_data:
-            print(f"{device:<20} {'No neighbors':<22}")
+def get_routes(task):
+    """Retrieve routing table from device."""
+    try:
+        result = task.run(napalm_get, getters=["route_table"])
+        if result[0].result:
+            return result[0].result.get("route_table", {})
+    except Exception as e:
+        task.host.log(f"Failed to get routes: {e}")
+    return None
+
+
+def analyze_routes(routes):
+    """Generate route statistics."""
+    stats = {
+        "total": 0,
+        "by_protocol": defaultdict(int),
+        "default_routes": [],
+        "host_routes": 0,
+    }
+    
+    if not routes:
+        return stats
+    
+    for vrf, route_list in routes.items():
+        for route in route_list:
+            stats["total"] += 1
+            protocol = route.get("protocol", "unknown").upper()
+            stats["by_protocol"][protocol] += 1
+            
+            destination = route.get("destination", "")
+            if destination in ("0.0.0.0/0", "::/0"):
+                stats["default_routes"].append({
+                    "destination": destination,
+                    "next_hop": route.get("next_hop", ""),
+                    "protocol": protocol,
+                })
+            elif "/32" in destination or "/128" in destination:
+                stats["host_routes"] += 1
+    
+    return stats
+
+
+def check_overlaps(all_routes):
+    """Identify overlapping routes."""
+    overlaps = []
+    subnets = defaultdict(list)
+    
+    for device, routes in all_routes.items():
+        if not routes:
             continue
+        for vrf, route_list in routes.items():
+            for route in route_list:
+                subnet = route.get("destination", "")
+                subnets[subnet].append({
+                    "device": device,
+                    "next_hop": route.get("next_hop", "")
+                })
+    
+    return [{"subnet": s, "devices": d} for s, d in subnets.items() if len(d) > 1]
 
-        for local_port in sorted(lldp_data.keys()):
-            for neighbor in lldp_data[local_port]:
-                remote_device = neighbor.get("remote_system_name", "Unknown")
-                remote_port = neighbor.get("remote_port_description", "Unknown")
 
-                print(
-                    f"{device:<20} {local_port:<22} "
-                    f"{remote_device:<20} {remote_port:<22}"
-                )
+def format_text(analysis, overlaps):
+    """Format output as text."""
+    lines = ["\n" + "=" * 70, "ROUTING TABLE ANALYSIS", "=" * 70 + "\n"]
+    
+    for device, data in analysis.items():
+        stats = data["stats"]
+        lines.append(f"Device: {device}")
+        lines.append(f"  Total Routes: {stats['total']}")
+        lines.append(f"  Default Routes: {len(stats['default_routes'])}")
+        lines.append(f"  Host Routes: {stats['host_routes']}")
+        lines.append("  By Protocol:")
+        for protocol, count in sorted(stats["by_protocol"].items()):
+            lines.append(f"    {protocol}: {count}")
+        lines.append("")
+    
+    if overlaps:
+        lines.append("OVERLAPPING ROUTES\n")
+        for overlap in overlaps[:10]:
+            lines.append(f"  {overlap['subnet']}: {len(overlap['devices'])} devices")
+    
+    return "\n".join(lines)
 
-    print("=" * 105 + "\n")
+
+def format_json(analysis, overlaps):
+    """Format output as JSON."""
+    return json.dumps({
+        "devices": {
+            device: {
+                "total_routes": data["stats"]["total"],
+                "by_protocol": dict(data["stats"]["by_protocol"]),
+                "default_routes": data["stats"]["default_routes"],
+                "host_routes": data["stats"]["host_routes"]
+            }
+            for device, data in analysis.items()
+        },
+        "overlapping_subnets": len(overlaps or [])
+    }, indent=2)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Analyze routing tables across network devices"
     )
-
-    parser.add_argument(
-        "--device",
-        action="append",
-        dest="devices",
-        metavar="HOSTNAME",
-        help="Device hostname (can be repeated)"
-    )
-    parser.add_argument(
-        "--host-file", "-f",
-        metavar="FILE",
-        help="Text file with one hostname per line (comments start with #)"
-    )
-    parser.add_argument(
-        "--user", "-u",
-        required=True,
-        metavar="USERNAME",
-        help="SSH username"
-    )
-    parser.add_argument(
-        "--password", "-p",
-        required=True,
-        metavar="PASSWORD",
-        help="SSH password"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        metavar="SECONDS",
-        help="Connection timeout in seconds (default: 30)"
-    )
-
+    parser.add_argument("--devices", required=True,
+                        help="Device names (comma-separated) or group")
+    parser.add_argument("--username", help="SSH username")
+    parser.add_argument("--password", help="SSH password")
+    parser.add_argument("--format", choices=["json", "text"],
+                        default="text", help="Output format")
+    parser.add_argument("--output", help="Output file")
+    parser.add_argument("--check-overlaps", action="store_true",
+                        help="Check for overlapping routes")
+    parser.add_argument("--verbose", action="store_true")
+    
     args = parser.parse_args()
-
-    devices = []
-
-    if args.host_file:
-        try:
-            with open(args.host_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        devices.append(line)
-        except IOError as e:
-            logger.error(f"Cannot read host file '{args.host_file}': {e}")
-            sys.exit(1)
-
-    if args.devices:
-        devices.extend(args.devices)
-
-    if not devices:
-        parser.error("No devices specified. Use --device or --host-file")
-
-    devices = list(dict.fromkeys(devices))
-
+    logger = setup_logging(args.verbose)
+    
     try:
-        neighbors = discover_neighbors(
-            devices,
-            args.user,
-            args.password,
-            args.timeout
-        )
-        display_results(neighbors)
-
-        total_neighbors = sum(
-            sum(len(ifaces) for ifaces in device_neighbors.values())
-            for device_neighbors in neighbors.values()
-        )
-        logger.info(f"Success: Discovered {total_neighbors} total neighbor relationship(s)")
-
-    except KeyboardInterrupt:
-        logger.info("Discovery cancelled by user")
-        sys.exit(130)
+        nr = InitNornir()
+        devices = args.devices.split(",")
+        hosts = nr.filter(F(name__in=devices))
+        
+        if not hosts:
+            logger.error(f"No devices found: {args.devices}")
+            return 1
+        
+        logger.info(f"Gathering routes from {len(hosts.inventory.hosts)} devices")
+        results = hosts.run(task=get_routes)
+        
+        analysis = {}
+        all_routes = {}
+        
+        for device_name, result in results.items():
+            routes = result[0].result if result[0].result else {}
+            all_routes[device_name] = routes
+            analysis[device_name] = {"stats": analyze_routes(routes)}
+        
+        overlaps = check_overlaps(all_routes) if args.check_overlaps else None
+        
+        if args.format == "json":
+            output = format_json(analysis, overlaps)
+        else:
+            output = format_text(analysis, overlaps)
+        
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output)
+            logger.info(f"Output written to {args.output}")
+        else:
+            print(output)
+        
+        return 0
+    
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.error(f"Script failed: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
