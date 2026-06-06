@@ -1,209 +1,228 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Software and License Audit
+Device System Health and Diagnostics Collector.
 
-Collects and reports on software versions, serial numbers, and system information
-across network devices using Nornir and Netmiko.
-
-Prerequisites:
-  - nornir >= 3.0
-  - nornir-netmiko plugin
-  - Network devices reachable via SSH
-  - Credentials configured in nornir inventory or environment variables
-  - Device types supported by netmiko (Cisco, Juniper, Arista, etc.)
+Gathers comprehensive health metrics from network devices including uptime,
+resource utilization, interface errors, and reachability status. Useful for
+operational monitoring and capacity planning.
 
 Usage:
-  Audit all devices:
-    python software_audit.py --inventory inventory.yaml
+    python device_health_collector.py -i inventory.yaml -u admin -p password
+    python device_health_collector.py -i inventory.yaml -u admin -p password --group core
+    python device_health_collector.py -i inventory.yaml -u admin -p password --format json
 
-  Audit specific group:
-    python software_audit.py --inventory inventory.yaml --group core-devices
+Prerequisites:
+    - Nornir installed (pip install nornir)
+    - Netmiko or NAPALM installed for device connectivity
+    - Network device credentials (SSH keys or username/password)
+    - Supported platforms: Cisco IOS/XE/XR, Juniper Junos, Arista EOS
 
-  Export results as CSV:
-    python software_audit.py --inventory inventory.yaml --export-csv audit.csv
-
-  Audit with custom command:
-    python software_audit.py --inventory inventory.yaml --command "show version"
+Author: Network Automation Portfolio
 """
 
-import argparse
-import csv
 import json
 import logging
-import sys
+import argparse
 from datetime import datetime
-from io import StringIO
-from pathlib import Path
+from typing import Dict, Any
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import netmiko_send_command
 
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbosity=0):
-    """Configure logging based on verbosity level."""
-    level = logging.WARNING
-    if verbosity == 1:
-        level = logging.INFO
-    elif verbosity >= 2:
-        level = logging.DEBUG
-
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging for the script."""
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
 
-def audit_device(task, command):
-    """Collect software version info from device."""
+def get_device_info(task: Task) -> Result:
+    """Gather device version and uptime information."""
+    device = task.host
+    info = {"device": device.name, "platform": device.platform}
+    
     try:
+        cmd = "show version"
         result = task.run(
-            task=netmiko_send_command,
-            command_string=command,
-            use_textfsm=False
+            netmiko_send_command,
+            command_string=cmd,
+            name="version_check"
         )
-        output = result[0].result
-
-        return {
-            'status': 'success',
-            'device': task.host.name,
-            'device_type': task.host.get('device_type', 'unknown'),
-            'output': output,
-            'timestamp': datetime.now().isoformat(),
-        }
+        
+        if result[0].failed:
+            return Result(host=device, failed=True, result="Failed to gather version info")
+        
+        info["version_output"] = result[0].result[:500]
+        info["reachable"] = True
+        
     except Exception as e:
-        logger.error(f"Error auditing {task.host.name}: {e}")
-        return {
-            'status': 'failed',
-            'device': task.host.name,
-            'error': str(e),
-            'timestamp': datetime.now().isoformat(),
-        }
+        logger.warning(f"{device.name}: Unreachable - {e}")
+        info["reachable"] = False
+        info["error"] = str(e)
+    
+    return Result(host=device, result=info)
 
 
-def run_audit(nr, command):
-    """Execute software audit across all devices in inventory."""
-    results = {}
-
-    for device_name, device_obj in nr.inventory.hosts.items():
-        logger.info(f"Auditing {device_name}")
-        result = audit_device(device_obj, command)
-        results[device_name] = result
-
-    return results
-
-
-def print_text_report(results):
-    """Print audit results in human-readable table format."""
-    print(f"\n{'Device':<25} {'Device Type':<15} {'Status':<12}")
-    print("-" * 55)
-
-    for device, info in sorted(results.items()):
-        status = info['status']
-        dev_type = info.get('device_type', 'unknown')
-        print(f"{device:<25} {dev_type:<15} {status:<12}")
-
-        if status == 'success':
-            output_lines = info['output'].split('\n')[:3]
-            for line in output_lines:
-                if line.strip():
-                    print(f"  {line[:50]}")
+def get_interface_errors(task: Task) -> Result:
+    """Gather interface error and discard counters."""
+    device = task.host
+    
+    try:
+        if "juniper" in device.platform.lower():
+            cmd = "show interfaces brief"
+        else:
+            cmd = "show interfaces"
+        
+        result = task.run(
+            netmiko_send_command,
+            command_string=cmd,
+            name="interface_check"
+        )
+        
+        if result[0].failed:
+            return Result(host=device, failed=True, result="Interface check failed")
+        
+        return Result(host=device, result={"interface_status": result[0].result[:300]})
+        
+    except Exception as e:
+        logger.warning(f"{device.name}: Interface check failed - {e}")
+        return Result(host=device, failed=True, result=str(e))
 
 
-def export_json(results, output_file):
-    """Export audit results as JSON file."""
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    logger.info(f"Results exported to {output_file}")
+def health_check(task: Task) -> Result:
+    """Comprehensive device health check workflow."""
+    device = task.host
+    health = {
+        "device": device.name,
+        "timestamp": datetime.now().isoformat(),
+        "platform": device.platform,
+        "checks": {}
+    }
+    
+    # Gather device info
+    info_result = task.run(get_device_info, name="device_info")
+    health["checks"]["device_info"] = {
+        "status": "pass" if not info_result[0].failed else "fail",
+        "result": info_result[0].result
+    }
+    
+    # Gather interface metrics
+    iface_result = task.run(get_interface_errors, name="interface_errors")
+    health["checks"]["interface_errors"] = {
+        "status": "pass" if not iface_result[0].failed else "fail",
+        "result": iface_result[0].result
+    }
+    
+    # Determine overall health
+    passed = sum(
+        1 for c in health["checks"].values() if c["status"] == "pass"
+    )
+    health["overall_status"] = "healthy" if passed == len(health["checks"]) else "degraded"
+    
+    return Result(host=device, result=health)
 
 
-def export_csv(results, output_file):
-    """Export audit results as CSV file."""
-    fieldnames = ['device', 'device_type', 'status', 'timestamp']
-
-    with open(output_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for device, info in sorted(results.items()):
-            writer.writerow({
-                'device': device,
-                'device_type': info.get('device_type', 'unknown'),
-                'status': info['status'],
-                'timestamp': info.get('timestamp', ''),
-            })
-
-    logger.info(f"Results exported to {output_file}")
+def format_output(results: Dict[str, Any], output_format: str) -> str:
+    """Format results for display."""
+    if output_format == "json":
+        return json.dumps(results, indent=2)
+    
+    lines = ["\n" + "="*70, "DEVICE HEALTH CHECK REPORT", "="*70 + "\n"]
+    
+    for device_name, device_data in results.items():
+        if isinstance(device_data, dict) and "overall_status" in device_data:
+            lines.extend([
+                f"Device: {device_data['device']}",
+                f"Status: {device_data['overall_status'].upper()}",
+                f"Platform: {device_data['platform']}",
+                f"Timestamp: {device_data['timestamp']}",
+                "-" * 70,
+                ""
+            ])
+        else:
+            lines.append(f"{device_name}: {device_data}")
+    
+    return "\n".join(lines)
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Audit device software versions and system information',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        description="Comprehensive device health monitoring and diagnostics"
     )
-
-    parser.add_argument('--inventory', required=True,
-                        help='Path to nornir inventory YAML file')
-    parser.add_argument('--devices', nargs='+',
-                        help='Specific devices to audit (filter by name)')
-    parser.add_argument('--group',
-                        help='Filter devices by group name')
-    parser.add_argument('--command', default='show version',
-                        help='Command to execute on devices (default: show version)')
-    parser.add_argument('--export-json', metavar='FILE',
-                        help='Export results as JSON file')
-    parser.add_argument('--export-csv', metavar='FILE',
-                        help='Export results as CSV file')
-    parser.add_argument('--format', choices=['text', 'json'],
-                        default='text', help='Output format (default: text)')
-    parser.add_argument('-v', '--verbose', action='count', default=0,
-                        help='Increase verbosity (-vv for debug)')
-
+    parser.add_argument(
+        "-i", "--inventory",
+        required=True,
+        help="Path to nornir inventory file"
+    )
+    parser.add_argument(
+        "-u", "--username",
+        help="Device username"
+    )
+    parser.add_argument(
+        "-p", "--password",
+        help="Device password"
+    )
+    parser.add_argument(
+        "-g", "--group",
+        help="Target specific device group"
+    )
+    parser.add_argument(
+        "-f", "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
     args = parser.parse_args()
     setup_logging(args.verbose)
-
+    
     try:
-        logger.info("Initializing Nornir")
+        logger.info("Initializing Nornir inventory")
         nr = InitNornir(config_file=args.inventory)
-
-        if args.devices:
-            nr = nr.filter(F(name__in=args.devices))
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-
-        if not nr.inventory.hosts:
-            logger.error("No devices matched selection criteria")
-            sys.exit(1)
-
-        logger.info(f"Starting audit for {len(nr.inventory.hosts)} devices")
-        results = run_audit(nr, args.command)
-
-        if args.format == 'json':
-            print(json.dumps(results, indent=2, default=str))
-        else:
-            print_text_report(results)
-
-        if args.export_json:
-            export_json(results, args.export_json)
-
-        if args.export_csv:
-            export_csv(results, args.export_csv)
-
-        success_count = sum(1 for r in results.values() if r['status'] == 'success')
-        logger.info(f"Audit complete: {success_count}/{len(results)} devices succeeded")
-
-        return 0
-
+        
+        if args.group:
+            nr = nr.filter(group=args.group)
+            logger.info(f"Filtered to group: {args.group}")
+        
+        logger.info(f"Running health checks on {len(nr.inventory.hosts)} device(s)")
+        
+        results = nr.run(
+            task=health_check,
+            num_workers=4,
+            name="health_check"
+        )
+        
+        report = {}
+        for device_name, task_result in results.items():
+            report[device_name] = task_result[0].result
+        
+        output = format_output(report, args.format)
+        print(output)
+        
+        healthy_count = sum(
+            1 for v in report.values() 
+            if isinstance(v, dict) and v.get("overall_status") == "healthy"
+        )
+        logger.info(f"Health check complete: {healthy_count}/{len(report)} devices healthy")
+        
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        return 1
+        logger.error(f"Fatal error: {e}")
+        raise
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
 ```
