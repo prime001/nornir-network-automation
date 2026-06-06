@@ -1,234 +1,208 @@
 ```python
-"""Route Table Analyzer and Verification Tool.
+"""
+Device Health Status Report - Nornir Network Automation
 
-Analyzes routing tables from network devices to identify inefficiencies,
-overlaps, and potential issues. Generates recommendations for optimization.
+Purpose:
+    Collects system health metrics from network devices including uptime,
+    CPU/memory utilization, interface status, and connectivity diagnostics.
+    Useful for quick network health checks and identifying offline/degraded
+    devices.
 
 Usage:
-    python route_analyzer.py --devices all --analyze
-    python route_analyzer.py --devices rtr1,rtr2 --export routes.json
-    python route_analyzer.py --devices all --check-coverage 10.0.0.0/8
+    python device_health.py -i inventory.yaml -c credentials.yaml
+    python device_health.py -i inventory.yaml -c credentials.yaml --group routers
+    python device_health.py -i inventory.yaml -c credentials.yaml --format json
 
 Prerequisites:
-    - Nornir with inventory configured
-    - NAPALM installed: pip install napalm
-    - Devices must support get_route_to() via NAPALM
-    - SSH/CLI access with proper credentials
-
-Examples:
-    Analyze all routing tables:
-        python route_analyzer.py --devices all --analyze
-
-    Check specific prefix coverage:
-        python route_analyzer.py --devices all --check-coverage 172.16.0.0/12
-
-    Export route data to JSON:
-        python route_analyzer.py --devices rtr1,rtr2 --export routes.json
+    - Nornir with netmiko driver
+    - Network devices with SSH access
+    - Supported platforms: Cisco IOS/XE/XR, Arista, Juniper
+    - Credentials configured in secrets backend
 """
 
 import argparse
-import logging
 import json
-from pathlib import Path
-from typing import Dict, List, Any
-from collections import defaultdict
-import ipaddress
+import logging
+from typing import Dict, Any
+from datetime import datetime
 
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
+
 
 logger = logging.getLogger(__name__)
 
 
-def get_routing_table(task: Task) -> Result:
-    """Retrieve routing table using NAPALM."""
+def parse_uptime(uptime_str: str) -> str:
+    """Extract uptime from version output."""
     try:
-        result = task.run(napalm_get, getters=["route_info"])
-        routes = result[0].result.get("route_info", {})
-        return Result(host=task.host, result=routes)
-    except Exception as e:
-        logger.error(f"Failed to get routes from {task.host.name}: {e}")
-        return Result(host=task.host, result={}, failed=True)
+        for line in uptime_str.split('\n'):
+            if 'uptime' in line.lower():
+                return line.strip()
+    except Exception:
+        pass
+    return "Unknown"
 
 
-def analyze_routes(routes: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze routing table for issues and statistics."""
-    analysis = {
-        "total_routes": len(routes),
-        "default_routes": 0,
-        "static_routes": 0,
-        "dynamic_routes": 0,
-        "issues": [],
-        "protocol_distribution": defaultdict(int),
+def collect_health_metrics(task: Task) -> Result:
+    """Collect device health metrics via netmiko."""
+    health = {
+        'hostname': task.host.name,
+        'timestamp': datetime.now().isoformat(),
+        'reachable': False,
+        'metrics': {}
     }
     
-    for prefix, route_data in routes.items():
-        if prefix == "0.0.0.0/0" or prefix == "::/0":
-            analysis["default_routes"] += 1
+    try:
+        # Get version and uptime
+        version_output = task.run(
+            netmiko_send_command,
+            command_string="show version",
+            name="version"
+        )
         
-        if isinstance(route_data, list):
-            for route in route_data:
-                protocol = route.get("protocol", "unknown").lower()
-                if "static" in protocol or protocol == "s":
-                    analysis["static_routes"] += 1
-                else:
-                    analysis["dynamic_routes"] += 1
-                
-                analysis["protocol_distribution"][protocol] += 1
-                
-                metric = route.get("metric", 0)
-                if isinstance(metric, (int, float)) and metric > 100:
-                    analysis["issues"].append(
-                        f"High metric: {prefix} via {route.get('via', 'N/A')} "
-                        f"(metric: {metric})"
-                    )
-    
-    return analysis
-
-
-def check_coverage(routes: Dict[str, Any], target_prefix: str) -> Dict[str, Any]:
-    """Check if a prefix is covered in the routing table."""
-    try:
-        target_net = ipaddress.ip_network(target_prefix, strict=False)
-    except ValueError as e:
-        return {"error": f"Invalid prefix: {e}", "covered": False}
-    
-    covering_routes = []
-    for prefix in routes.keys():
+        if version_output.result:
+            health['reachable'] = True
+            health['metrics']['uptime'] = parse_uptime(version_output.result)
+        
+        # Get interface status
+        int_brief = task.run(
+            netmiko_send_command,
+            command_string="show interface brief",
+            name="interfaces"
+        )
+        
+        if int_brief.result:
+            lines = int_brief.result.split('\n')
+            up_count = sum(1 for line in lines if 'up' in line.lower() and 'down' not in line.lower())
+            down_count = sum(1 for line in lines if 'down' in line.lower())
+            health['metrics']['interfaces_up'] = up_count
+            health['metrics']['interfaces_down'] = down_count
+        
+        # Get system resources (CPU, memory)
+        resource_cmd = {
+            'ios': 'show processes cpu sorted',
+            'iosxe': 'show processes cpu sorted',
+            'iosxr': 'show processes cpu',
+            'eos': 'show system resources',
+            'junos': 'show system processes extensive'
+        }.get(task.host.platform, 'show processes cpu')
+        
         try:
-            route_net = ipaddress.ip_network(prefix, strict=False)
-            if target_net.subnet_of(route_net) or target_net == route_net:
-                covering_routes.append(prefix)
-        except ValueError:
-            continue
+            resources = task.run(
+                netmiko_send_command,
+                command_string=resource_cmd,
+                name="resources"
+            )
+            if resources.result:
+                # Extract first line of output for CPU
+                cpu_line = resources.result.split('\n')[0]
+                health['metrics']['cpu_line'] = cpu_line[:80]
+        except Exception as e:
+            logger.debug(f"Could not get resource info: {e}")
+        
+        return Result(
+            host=task.host,
+            result=health,
+            name="health_check"
+        )
     
-    return {
-        "target_prefix": target_prefix,
-        "covered": len(covering_routes) > 0,
-        "covering_routes": covering_routes,
-    }
+    except Exception as e:
+        logger.error(f"Failed to collect metrics from {task.host.name}: {e}")
+        health['error'] = str(e)
+        return Result(
+            host=task.host,
+            result=health,
+            failed=True
+        )
 
 
-def print_analysis_report(results: Dict[str, Any]) -> None:
-    """Print formatted analysis report."""
-    print("\n" + "=" * 80)
-    print(f"{'Route Analysis Report':<40}")
-    print("=" * 80)
+def format_output(results: Dict[str, Any], format_type: str) -> None:
+    """Format and display results."""
+    if format_type == "json":
+        output = {}
+        for host, task_results in results.items():
+            if task_results:
+                output[host] = task_results[0].result
+            else:
+                output[host] = {"error": "No result"}
+        print(json.dumps(output, indent=2))
     
-    for device_name in sorted(results.keys()):
-        analysis = results[device_name]
-        if isinstance(analysis, dict) and "error" not in analysis:
-            print(f"\n{device_name}:")
-            print(f"  Total Routes:        {analysis['total_routes']}")
-            print(f"  Default Routes:      {analysis['default_routes']}")
-            print(f"  Static Routes:       {analysis['static_routes']}")
-            print(f"  Dynamic Routes:      {analysis['dynamic_routes']}")
+    else:
+        print("\n" + "="*70)
+        print("DEVICE HEALTH STATUS REPORT")
+        print("="*70 + "\n")
+        
+        for host, task_results in sorted(results.items()):
+            if not task_results:
+                print(f"{host}: No result")
+                continue
             
-            protocols = dict(analysis['protocol_distribution'])
-            print(f"  Protocol Summary:    {protocols}")
+            data = task_results[0].result
+            status = "REACHABLE" if data.get('reachable') else "UNREACHABLE"
+            status_sym = "✓" if data.get('reachable') else "✗"
             
-            if analysis['issues']:
-                print(f"  Issues Found:        {len(analysis['issues'])}")
-                for issue in analysis['issues'][:5]:
-                    print(f"    - {issue}")
-                if len(analysis['issues']) > 5:
-                    print(f"    ... and {len(analysis['issues']) - 5} more")
-    
-    print("\n" + "=" * 80)
+            print(f"{status_sym} {host:25} [{status}]")
+            
+            if 'error' in data:
+                print(f"   Error: {data['error']}\n")
+                continue
+            
+            metrics = data.get('metrics', {})
+            if metrics.get('uptime'):
+                print(f"   Uptime: {metrics['uptime']}")
+            if 'interfaces_up' in metrics:
+                print(f"   Interfaces: {metrics['interfaces_up']} up, "
+                      f"{metrics['interfaces_down']} down")
+            if metrics.get('cpu_line'):
+                print(f"   CPU: {metrics['cpu_line']}")
+            print()
 
 
 def main():
+    """Main execution."""
     parser = argparse.ArgumentParser(
-        description="Analyze routing tables from network devices.",
+        description="Collect device health metrics across network"
     )
-    parser.add_argument(
-        "--devices",
-        type=str,
-        default="all",
-        help="Device names comma-separated or 'all' (default: all)",
-    )
-    parser.add_argument(
-        "--analyze",
-        action="store_true",
-        help="Perform route analysis and display report",
-    )
-    parser.add_argument(
-        "--check-coverage",
-        type=str,
-        metavar="PREFIX",
-        help="Check if prefix is covered (e.g., 10.0.0.0/8)",
-    )
-    parser.add_argument(
-        "--export",
-        type=str,
-        metavar="FILE",
-        help="Export routes to JSON file",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose logging",
-    )
+    parser.add_argument("-i", "--inventory", required=True,
+                        help="Inventory file path")
+    parser.add_argument("-c", "--credentials", required=True,
+                        help="Credentials file path")
+    parser.add_argument("-g", "--group", help="Filter by group")
+    parser.add_argument("-f", "--format", choices=["text", "json"],
+                        default="text", help="Output format")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose logging")
     
     args = parser.parse_args()
     
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(levelname)s - %(message)s"
     )
     
     try:
-        nr = InitNornir(config_file="config.yaml")
+        nr = InitNornir(config_file="nornir_config.yaml")
         
-        if args.devices != "all":
-            device_list = [d.strip() for d in args.devices.split(",")]
-            nr = nr.filter(name__in=device_list)
+        if args.group:
+            nr = nr.filter(group=args.group)
         
-        logger.info(f"Collecting routes from {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=get_routing_table)
+        logger.info(f"Running health check on {len(nr.inventory.hosts)} devices")
+        results = nr.run(task=collect_health_metrics, num_workers=10)
         
-        routes_data = {}
-        for device_name, task_result in results.items():
-            if not task_result[0].failed:
-                routes_data[device_name] = task_result[0].result
+        format_output(dict(results), args.format)
         
-        logger.info(f"Successfully retrieved routes from {len(routes_data)} device(s)")
-        
-        if args.analyze:
-            analysis = {
-                device: analyze_routes(routes)
-                for device, routes in routes_data.items()
-            }
-            print_analysis_report(analysis)
-        
-        if args.check_coverage:
-            print(f"\nCoverage check for {args.check_coverage}:")
-            for device, routes in sorted(routes_data.items()):
-                result = check_coverage(routes, args.check_coverage)
-                if "error" in result:
-                    print(f"  {device}: {result['error']}")
-                else:
-                    status = "✓ COVERED" if result["covered"] else "✗ NOT COVERED"
-                    routes_str = ", ".join(result["covering_routes"]) or "None"
-                    print(f"  {device}: {status} by [{routes_str}]")
-        
-        if args.export:
-            with open(args.export, "w") as f:
-                json.dump(routes_data, f, indent=2, default=str)
-            logger.info(f"Routes exported to {args.export}")
-        
-        if not any([args.analyze, args.check_coverage, args.export]):
-            print("No action specified. Use --help for options.")
-            return 1
+        if results.failed_hosts:
+            logger.warning(
+                f"Health check failed for: {', '.join(results.failed_hosts.keys())}"
+            )
     
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
-        return 1
-    
-    return 0
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
