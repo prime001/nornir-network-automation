@@ -1,202 +1,216 @@
 ```python
+#!/usr/bin/env python3
 """
-Device Facts Collector and Change Detector
+NTP Synchronization Audit Tool
 
-Collects device facts (OS version, uptime, serial numbers, interfaces, etc.)
-using NAPALM and stores them locally. Detects configuration/fact changes from
-previous baseline collections.
+Audits NTP configuration and synchronization status across network devices.
+Validates NTP peers, checks sync status, and identifies time drift issues.
 
 Usage:
-    python device_facts.py -i inventory.yaml -c credentials.yaml --output facts.json
-    python device_facts.py --compare --output facts.json --previous facts_baseline.json
+    python ntp_sync_audit.py --all
+    python ntp_sync_audit.py --device router1 --output ntp_report.json
+    python ntp_sync_audit.py --group core --verbose
 
 Prerequisites:
-    - Nornir with NAPALM plugin installed
-    - Network devices accessible via SSH/netconf
-    - Inventory file in YAML format with device groups
-    - Credentials provided via CLI arguments or environment variables
+    - nornir and nornir-netmiko installed
+    - hosts.yml and groups.yml configured in current directory
+    - Device credentials configured via environment or hosts.yml
+    - Network connectivity to target devices
+
+Returns:
+    0 if all devices synchronized, 1 if sync issues detected
 """
 
 import json
 import logging
 import argparse
+import sys
+import re
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.plugins.tasks.napalm_utils import napalm_get
+from nornir.core.task import Task, Result
+from nornir_netmiko.tasks import netmiko_send_command
 
 
-def setup_logging(verbose: bool) -> None:
-    """Configure logging output."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=level,
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def collect_device_facts(norn: InitNornir, devices: Optional[str] = None) -> Dict[str, Any]:
-    """Collect facts from devices using NAPALM get_facts."""
-    logger = logging.getLogger("facts_collector")
-    
-    if devices:
-        norn_filtered = norn.filter(F(name__contains=devices))
-    else:
-        norn_filtered = norn
-    
-    logger.info(f"Collecting facts from {len(norn_filtered.inventory.hosts)} device(s)")
-    
-    results = norn_filtered.run(
-        task=napalm_get,
-        getters=["facts", "interfaces", "interfaces_counters"],
-    )
-    
-    facts_data = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "devices": {},
+def parse_ntp_status(output: str) -> Dict[str, Any]:
+    """Parse NTP status output for Cisco devices."""
+    status = {
+        'synchronized': False,
+        'peer_count': 0,
+        'selected_peer': None,
+        'stratum': None,
+        'issues': []
     }
     
-    for device_name, task_result in results.items():
-        if task_result.failed:
-            logger.error(f"{device_name}: Task failed - {task_result[0].exception}")
-            facts_data["devices"][device_name] = {"error": str(task_result[0].exception)}
-            continue
+    lines = output.split('\n')
+    for line in lines:
+        if 'Clock is' in line:
+            if 'unsynchronized' in line.lower():
+                status['issues'].append('Clock is unsynchronized')
+            elif 'synchronized' in line.lower():
+                status['synchronized'] = True
         
-        device_facts = {}
-        for subtask_name, subtask_result in task_result.items():
-            if subtask_result.failed:
-                logger.warning(f"{device_name}/{subtask_name}: {subtask_result.exception}")
-            else:
-                device_facts.update({subtask_name: subtask_result.result})
+        if 'stratum' in line.lower():
+            match = re.search(r'stratum (\d+)', line, re.IGNORECASE)
+            if match:
+                status['stratum'] = int(match.group(1))
         
-        facts_data["devices"][device_name] = device_facts
-        logger.info(f"{device_name}: Facts collected successfully")
+        if 'system peer' in line.lower():
+            parts = line.split()
+            if len(parts) > 2:
+                status['selected_peer'] = parts[-1]
     
-    return facts_data
+    return status
 
 
-def detect_changes(
-    current: Dict[str, Any], previous: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Compare current facts against baseline and report changes."""
-    logger = logging.getLogger("change_detector")
-    changes = {"devices": {}}
+def audit_ntp(task: Task) -> Result:
+    """Audit NTP configuration and status on a device."""
+    audit = {
+        'hostname': task.host.name,
+        'ip': task.host.get('ip'),
+        'device_type': task.host.get('device_type'),
+        'timestamp': datetime.now().isoformat(),
+        'ntp_enabled': False,
+        'status': {},
+        'peers': [],
+        'errors': []
+    }
     
-    for device_name in current["devices"]:
-        if device_name not in previous["devices"]:
-            changes["devices"][device_name] = {"status": "new_device"}
-            logger.info(f"{device_name}: New device detected")
-            continue
+    try:
+        config_result = task.run(
+            netmiko_send_command,
+            command_string='show running-config | include ntp'
+        )
+        config_output = config_result[0].result
         
-        current_facts = current["devices"][device_name]
-        previous_facts = previous["devices"][device_name]
+        if not config_output or 'ntp' not in config_output.lower():
+            audit['errors'].append('NTP not configured')
+            return Result(host=task.host, result=audit)
         
-        if current_facts == previous_facts:
-            changes["devices"][device_name] = {"status": "unchanged"}
-            continue
+        audit['ntp_enabled'] = True
         
-        device_changes = {"status": "changed", "differences": {}}
+        status_result = task.run(
+            netmiko_send_command,
+            command_string='show ntp status'
+        )
+        status_output = status_result[0].result
+        audit['status'] = parse_ntp_status(status_output)
         
-        current_top = set(current_facts.keys())
-        previous_top = set(previous_facts.keys())
+        association_result = task.run(
+            netmiko_send_command,
+            command_string='show ntp associations'
+        )
+        association_output = association_result[0].result
         
-        for key in current_top - previous_top:
-            device_changes["differences"][key] = {"type": "added"}
+        for line in association_output.split('\n')[3:]:
+            if line.strip() and not line.startswith('~'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    audit['peers'].append({
+                        'address': parts[0],
+                        'reachability': parts[1] if len(parts) > 1 else 'unknown'
+                    })
         
-        for key in previous_top - current_top:
-            device_changes["differences"][key] = {"type": "removed"}
+        if not audit['peers']:
+            audit['errors'].append('No NTP peers configured')
         
-        for key in current_top & previous_top:
-            if current_facts[key] != previous_facts[key]:
-                device_changes["differences"][key] = {
-                    "type": "modified",
-                    "previous": previous_facts[key],
-                    "current": current_facts[key],
-                }
+        if not audit['status'].get('synchronized'):
+            audit['errors'].append('Device not synchronized to NTP')
         
-        changes["devices"][device_name] = device_changes
-        logger.warning(f"{device_name}: {len(device_changes['differences'])} change(s) detected")
+        audit['sync_status'] = 'OK' if not audit['errors'] else 'ISSUES'
+        
+    except Exception as e:
+        logger.warning(f"Error auditing NTP on {task.host.name}: {e}")
+        audit['sync_status'] = 'ERROR'
+        audit['errors'].append(str(e))
     
-    for device_name in previous["devices"]:
-        if device_name not in current["devices"]:
-            changes["devices"][device_name] = {"status": "device_unreachable"}
-            logger.warning(f"{device_name}: Device no longer reachable")
-    
-    return changes
+    return Result(host=task.host, result=audit)
 
 
-def main() -> None:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "-i", "--inventory", default="inventory.yaml",
-        help="Path to Nornir inventory file (default: inventory.yaml)"
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "-c", "--credentials", default=".env",
-        help="Path to credentials file or .env (default: .env)"
-    )
-    parser.add_argument(
-        "-d", "--devices", help="Filter devices by name pattern"
-    )
-    parser.add_argument(
-        "-o", "--output", default="facts.json",
-        help="Output file for collected facts (default: facts.json)"
-    )
-    parser.add_argument(
-        "--compare", action="store_true",
-        help="Compare against previous baseline and detect changes"
-    )
-    parser.add_argument(
-        "--previous", default="facts_baseline.json",
-        help="Path to previous facts baseline (default: facts_baseline.json)"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Enable debug logging"
-    )
+    parser.add_argument('--device', help='Single device hostname')
+    parser.add_argument('--group', help='Filter by device group')
+    parser.add_argument('--all', action='store_true', help='Audit all devices')
+    parser.add_argument('--output', help='JSON output file path')
+    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
+    parser.add_argument('--strict', action='store_true', 
+                       help='Fail if any device has NTP issues')
     
     args = parser.parse_args()
-    setup_logging(args.verbose)
-    logger = logging.getLogger("main")
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    if not (args.device or args.group or args.all):
+        parser.error('Must specify --device, --group, or --all')
     
     try:
-        norn = InitNornir(config_file=args.inventory)
-        logger.info(f"Loaded inventory with {len(norn.inventory.hosts)} host(s)")
+        nr = InitNornir(config_file='config.yaml')
     except Exception as e:
-        logger.error(f"Failed to initialize Nornir: {e}")
-        return
+        logger.error(f"Nornir initialization failed: {e}")
+        return 1
     
-    try:
-        current_facts = collect_device_facts(norn, args.devices)
-    except Exception as e:
-        logger.error(f"Fact collection failed: {e}")
-        return
+    if args.device:
+        nr = nr.filter(name=args.device)
+    elif args.group:
+        nr = nr.filter(groups__contains=args.group)
     
-    output_path = Path(args.output)
-    output_path.write_text(json.dumps(current_facts, indent=2))
-    logger.info(f"Facts written to {output_path}")
+    if len(nr.inventory.hosts) == 0:
+        logger.error('No devices matched filter criteria')
+        return 1
     
-    if args.compare:
-        previous_path = Path(args.previous)
-        if not previous_path.exists():
-            logger.warning(f"Baseline not found at {previous_path}, skipping comparison")
-            return
-        
-        try:
-            previous_facts = json.loads(previous_path.read_text())
-            changes = detect_changes(current_facts, previous_facts)
+    logger.info(f'Auditing NTP on {len(nr.inventory.hosts)} device(s)')
+    
+    results = nr.run(task=audit_ntp)
+    
+    audit_results: List[Dict[str, Any]] = []
+    issues_count = 0
+    
+    for host, task_result in results.items():
+        if task_result:
+            result_data = task_result[0].result
+            audit_results.append(result_data)
             
-            changes_path = Path(args.output.replace(".json", "_changes.json"))
-            changes_path.write_text(json.dumps(changes, indent=2))
-            logger.info(f"Change report written to {changes_path}")
-        except Exception as e:
-            logger.error(f"Change detection failed: {e}")
+            if result_data.get('errors'):
+                issues_count += 1
+                logger.error(f"{host}: {', '.join(result_data['errors'])}")
+            else:
+                logger.info(f"{host}: NTP synchronized")
+    
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(audit_results, f, indent=2)
+        logger.info(f'Audit results saved to {args.output}')
+    else:
+        print(json.dumps(audit_results, indent=2))
+    
+    summary = {
+        'total_devices': len(audit_results),
+        'synchronized': len(audit_results) - issues_count,
+        'with_issues': issues_count,
+        'timestamp': datetime.now().isoformat()
+    }
+    logger.info(f"Summary: {summary}")
+    
+    if args.strict and issues_count > 0:
+        return 1
+    
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
 ```
