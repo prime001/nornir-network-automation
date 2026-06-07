@@ -1,155 +1,181 @@
 ```python
 """
-Device Health Check and Status Report
+config_drift.py - Detect configuration drift against saved baselines.
 
 Purpose:
-    Collects and reports health metrics from network devices including uptime,
-    CPU usage, memory utilization, and temperature data. Provides quick health
-    assessment before maintenance or for ongoing network monitoring.
+    Compares each device's current running configuration against a previously
+    saved baseline, reporting any lines added or removed since the snapshot.
+    Useful for change-window auditing, unauthorized-change detection, and
+    pre/post-maintenance diffs.
 
 Usage:
-    python device_health.py --hosts all
-    python device_health.py --hosts leaf01,leaf02
-    python device_health.py --inventory custom_inv.yaml --csv health_report.csv
+    python config_drift.py --inventory hosts.yaml --baseline-dir ./baselines
+    python config_drift.py --inventory hosts.yaml --baseline-dir ./baselines \
+        --filter role=core --fail-on-drift
 
 Prerequisites:
-    - Nornir installed with NAPALM drivers
-    - Network devices reachable via SSH
-    - Credentials configured in inventory.yaml or environment variables
+    pip install nornir nornir-netmiko nornir-utils netmiko
+    Baseline files must be named <hostname>.txt and live in --baseline-dir.
+    Generate them first with config_backup.py or any show-run capture.
 """
 
-import logging
 import argparse
-import csv
-from typing import Dict, Any
+import difflib
+import logging
+import sys
+from pathlib import Path
+
 from nornir import InitNornir
 from nornir.core.filter import F
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
 from nornir_utils.plugins.functions import print_result
-from nornir_napalm.plugins.tasks import napalm_get
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def gather_health_metrics(task) -> Dict[str, Any]:
-    """Gather device health metrics using NAPALM."""
-    health = {
-        "hostname": task.host.name,
-        "reachable": False,
-        "model": "N/A",
-        "os_version": "N/A",
-        "uptime_days": 0,
-        "cpu_percent": 0,
-        "memory_percent": 0,
-    }
-    
-    try:
-        facts_result = task.run(napalm_get, getters=["facts"])
-        facts = facts_result[0].result.get("facts", {})
-        
-        health.update({
-            "reachable": True,
-            "model": facts.get("model", "Unknown"),
-            "os_version": facts.get("os_version", "Unknown"),
-            "serial_number": facts.get("serial_number", "N/A"),
-            "uptime_days": facts.get("uptime_seconds", 0) // 86400,
-        })
-        
-        try:
-            env_result = task.run(napalm_get, getters=["environment"])
-            env = env_result[0].result.get("environment", {})
-            
-            if env.get("cpu") and len(env["cpu"]) > 0:
-                health["cpu_percent"] = env["cpu"][0].get("cpu_utilization", 0)
-            
-            if env.get("memory"):
-                health["memory_percent"] = env["memory"].get("used_ram", 0)
-        except Exception as e:
-            logger.debug(f"Could not retrieve environment data for {task.host.name}: {e}")
-    
-    except Exception as e:
-        logger.error(f"Failed to check {task.host.name}: {e}")
-        health["error"] = str(e)
-    
-    return health
+def _load_baseline(hostname: str, baseline_dir: Path) -> list[str] | None:
+    path = baseline_dir / f"{hostname}.txt"
+    if not path.exists():
+        return None
+    return path.read_text().splitlines(keepends=True)
 
 
-def export_to_csv(results, filename: str):
-    """Export health check results to CSV file."""
-    try:
-        fieldnames = ["hostname", "reachable", "model", "os_version", 
-                      "uptime_days", "cpu_percent", "memory_percent", "error"]
-        
-        with open(filename, "w", newline="") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for host, task_results in results.items():
-                if task_results[0].result:
-                    row = {k: task_results[0].result.get(k, "") for k in fieldnames}
-                    writer.writerow(row)
-        
-        logger.info(f"Results exported to {filename}")
-    except Exception as e:
-        logger.error(f"Failed to export CSV: {e}")
+def detect_drift(task: Task, baseline_dir: Path, context_lines: int) -> Result:
+    hostname = task.host.name
+    baseline = _load_baseline(hostname, baseline_dir)
+    if baseline is None:
+        return Result(
+            host=task.host,
+            result=f"No baseline file found for {hostname}",
+            failed=False,
+            changed=False,
+        )
 
+    cmd = task.host.get("show_run_cmd", "show running-config")
+    r = task.run(netmiko_send_command, command_string=cmd, use_textfsm=False)
+    current = r.result.splitlines(keepends=True)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Check health status of network devices"
+    diff = list(
+        difflib.unified_diff(
+            baseline,
+            current,
+            fromfile=f"{hostname}/baseline",
+            tofile=f"{hostname}/current",
+            n=context_lines,
+        )
     )
-    parser.add_argument(
-        "--hosts",
-        default="all",
-        help="Comma-separated host list or 'all' (default: all)"
+
+    if diff:
+        return Result(
+            host=task.host,
+            result="".join(diff),
+            failed=False,
+            changed=True,
+        )
+    return Result(host=task.host, result="No drift detected", failed=False, changed=False)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Detect config drift between running configs and saved baselines."
     )
-    parser.add_argument(
-        "--inventory",
-        default="inventory.yaml",
-        help="Path to Nornir inventory file (default: inventory.yaml)"
+    p.add_argument("--inventory", required=True, help="Nornir hosts YAML file")
+    p.add_argument(
+        "--baseline-dir",
+        required=True,
+        type=Path,
+        help="Directory containing <hostname>.txt baseline files",
     )
-    parser.add_argument(
-        "--csv",
-        help="Export results to CSV file"
+    p.add_argument(
+        "--filter",
+        metavar="KEY=VALUE",
+        action="append",
+        dest="filters",
+        default=[],
+        help="Filter hosts by data field, e.g. --filter role=core",
     )
-    parser.add_argument(
-        "--workers",
+    p.add_argument(
+        "--context",
         type=int,
-        default=4,
-        help="Number of parallel workers (default: 4)"
+        default=3,
+        metavar="N",
+        help="Lines of context around each diff hunk (default: 3)",
     )
-    
-    args = parser.parse_args()
-    
-    try:
-        nr = InitNornir(config_file=args.inventory)
-        logger.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-        
-        if args.hosts.lower() != "all":
-            host_list = [h.strip() for h in args.hosts.split(",")]
-            nr = nr.filter(F(name__in=host_list))
-            logger.info(f"Filtered to {len(nr.inventory.hosts)} specified hosts")
-        
-        results = nr.run(task=gather_health_metrics, num_workers=args.workers)
-        print_result(results)
-        
-        if args.csv:
-            export_to_csv(results, args.csv)
-        
-        logger.info("Health check completed")
-        return 0
-    
-    except FileNotFoundError as e:
-        logger.error(f"Inventory file not found: {e}")
-        return 1
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return 1
+    p.add_argument(
+        "--fail-on-drift",
+        action="store_true",
+        help="Exit with status 1 if any host has drift (useful for CI gates)",
+    )
+    p.add_argument("--username", help="Override inventory username")
+    p.add_argument("--password", help="Override inventory password")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p.parse_args()
+
+
+def build_filter(filters: list[str]) -> F | None:
+    if not filters:
+        return None
+    combined = None
+    for kv in filters:
+        key, _, value = kv.partition("=")
+        f = F(**{key: value})
+        combined = f if combined is None else combined & f
+    return combined
 
 
 if __name__ == "__main__":
-    exit(main())
+    args = parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if not args.baseline_dir.is_dir():
+        log.error("Baseline directory does not exist: %s", args.baseline_dir)
+        sys.exit(2)
+
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": 10}},
+        inventory={"plugin": "SimpleInventory", "options": {"host_file": args.inventory}},
+        logging={"enabled": False},
+    )
+
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
+
+    host_filter = build_filter(args.filters)
+    if host_filter:
+        nr = nr.filter(host_filter)
+
+    if not nr.inventory.hosts:
+        log.error("No hosts matched the supplied filters.")
+        sys.exit(2)
+
+    log.info("Checking drift on %d host(s)...", len(nr.inventory.hosts))
+    results = nr.run(
+        task=detect_drift,
+        name="config_drift",
+        baseline_dir=args.baseline_dir,
+        context_lines=args.context,
+    )
+
+    print_result(results)
+
+    drifted = [h for h, mr in results.items() if mr.changed]
+    failed = [h for h, mr in results.items() if mr.failed]
+
+    if failed:
+        log.warning("%d host(s) failed: %s", len(failed), ", ".join(failed))
+    if drifted:
+        log.warning("Drift detected on %d host(s): %s", len(drifted), ", ".join(drifted))
+    else:
+        log.info("All reachable hosts match their baselines.")
+
+    if args.fail_on_drift and drifted:
+        sys.exit(1)
 ```
