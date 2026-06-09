@@ -1,208 +1,163 @@
 ```python
 """
-Device Health Status Report - Nornir Network Automation
+Device Health Check Script
 
-Purpose:
-    Collects system health metrics from network devices including uptime,
-    CPU/memory utilization, interface status, and connectivity diagnostics.
-    Useful for quick network health checks and identifying offline/degraded
-    devices.
+Gathers system health metrics from network devices including uptime, memory usage,
+CPU utilization, and version information. Useful for capacity planning and device
+monitoring across your network infrastructure.
 
 Usage:
-    python device_health.py -i inventory.yaml -c credentials.yaml
-    python device_health.py -i inventory.yaml -c credentials.yaml --group routers
-    python device_health.py -i inventory.yaml -c credentials.yaml --format json
+    python device_health_check.py -i inventory.yaml
+    python device_health_check.py -i inventory.yaml --device core-01
+    python device_health_check.py -i inventory.yaml --format json
 
 Prerequisites:
-    - Nornir with netmiko driver
-    - Network devices with SSH access
-    - Supported platforms: Cisco IOS/XE/XR, Arista, Juniper
-    - Credentials configured in secrets backend
+    - Nornir and netmiko installed
+    - Valid network device credentials in inventory
+    - Device SSH/telnet access configured
 """
 
 import argparse
 import json
 import logging
 from typing import Dict, Any
-from datetime import datetime
 
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir_utils.plugins.functions import print_result
+from netmiko import ConnectHandler
+from netmiko.ssh_exception import NetmikoTimeoutException
 
 
 logger = logging.getLogger(__name__)
 
 
-def parse_uptime(uptime_str: str) -> str:
-    """Extract uptime from version output."""
+def get_device_health(task: Task) -> Result:
+    """Gather device health metrics via netmiko."""
     try:
-        for line in uptime_str.split('\n'):
-            if 'uptime' in line.lower():
-                return line.strip()
-    except Exception:
-        pass
-    return "Unknown"
-
-
-def collect_health_metrics(task: Task) -> Result:
-    """Collect device health metrics via netmiko."""
-    health = {
-        'hostname': task.host.name,
-        'timestamp': datetime.now().isoformat(),
-        'reachable': False,
-        'metrics': {}
-    }
-    
-    try:
-        # Get version and uptime
-        version_output = task.run(
-            netmiko_send_command,
-            command_string="show version",
-            name="version"
-        )
+        device = task.host
+        conn_params = {
+            "device_type": device.platform,
+            "host": device.hostname,
+            "username": device.username,
+            "password": device.password,
+            "timeout": 10,
+            "global_delay_factor": 2,
+        }
         
-        if version_output.result:
-            health['reachable'] = True
-            health['metrics']['uptime'] = parse_uptime(version_output.result)
-        
-        # Get interface status
-        int_brief = task.run(
-            netmiko_send_command,
-            command_string="show interface brief",
-            name="interfaces"
-        )
-        
-        if int_brief.result:
-            lines = int_brief.result.split('\n')
-            up_count = sum(1 for line in lines if 'up' in line.lower() and 'down' not in line.lower())
-            down_count = sum(1 for line in lines if 'down' in line.lower())
-            health['metrics']['interfaces_up'] = up_count
-            health['metrics']['interfaces_down'] = down_count
-        
-        # Get system resources (CPU, memory)
-        resource_cmd = {
-            'ios': 'show processes cpu sorted',
-            'iosxe': 'show processes cpu sorted',
-            'iosxr': 'show processes cpu',
-            'eos': 'show system resources',
-            'junos': 'show system processes extensive'
-        }.get(task.host.platform, 'show processes cpu')
-        
-        try:
-            resources = task.run(
-                netmiko_send_command,
-                command_string=resource_cmd,
-                name="resources"
-            )
-            if resources.result:
-                # Extract first line of output for CPU
-                cpu_line = resources.result.split('\n')[0]
-                health['metrics']['cpu_line'] = cpu_line[:80]
-        except Exception as e:
-            logger.debug(f"Could not get resource info: {e}")
-        
-        return Result(
-            host=task.host,
-            result=health,
-            name="health_check"
-        )
-    
-    except Exception as e:
-        logger.error(f"Failed to collect metrics from {task.host.name}: {e}")
-        health['error'] = str(e)
-        return Result(
-            host=task.host,
-            result=health,
-            failed=True
-        )
-
-
-def format_output(results: Dict[str, Any], format_type: str) -> None:
-    """Format and display results."""
-    if format_type == "json":
-        output = {}
-        for host, task_results in results.items():
-            if task_results:
-                output[host] = task_results[0].result
+        with ConnectHandler(**conn_params) as net_connect:
+            metrics = {"hostname": device.hostname, "platform": device.platform}
+            
+            if device.platform == "cisco_ios":
+                version_out = net_connect.send_command("show version")
+                uptime_line = [l for l in version_out.split("\n") if "uptime" in l.lower()]
+                metrics["uptime"] = uptime_line[0].strip() if uptime_line else "Unknown"
+                
+                memory_out = net_connect.send_command("show processes memory | include Processor")
+                metrics["memory"] = memory_out.strip()
+                
+            elif device.platform == "arista_eos":
+                uptime_out = net_connect.send_command("show uptime")
+                metrics["uptime"] = uptime_out.split("\n")[0].strip()
+                
+                version_out = net_connect.send_command("show version | json")
+                try:
+                    version_data = json.loads(version_out)
+                    metrics["model"] = version_data.get("modelName", "Unknown")
+                    metrics["version"] = version_data.get("version", "Unknown")
+                except json.JSONDecodeError:
+                    metrics["version"] = "Unable to parse"
+                    
+            elif device.platform in ["juniper_junos", "juniper"]:
+                uptime_out = net_connect.send_command("show system uptime")
+                metrics["uptime"] = uptime_out.split("\n")[0].strip()
+                
+                version_out = net_connect.send_command("show version")
+                for line in version_out.split("\n"):
+                    if "Junos:" in line:
+                        metrics["version"] = line.strip()
+                        break
             else:
-                output[host] = {"error": "No result"}
-        print(json.dumps(output, indent=2))
-    
-    else:
-        print("\n" + "="*70)
-        print("DEVICE HEALTH STATUS REPORT")
-        print("="*70 + "\n")
-        
-        for host, task_results in sorted(results.items()):
-            if not task_results:
-                print(f"{host}: No result")
-                continue
+                metrics["status"] = "Unsupported platform"
             
-            data = task_results[0].result
-            status = "REACHABLE" if data.get('reachable') else "UNREACHABLE"
-            status_sym = "✓" if data.get('reachable') else "✗"
+            return Result(host=task.host, result=metrics)
             
-            print(f"{status_sym} {host:25} [{status}]")
-            
-            if 'error' in data:
-                print(f"   Error: {data['error']}\n")
-                continue
-            
-            metrics = data.get('metrics', {})
-            if metrics.get('uptime'):
-                print(f"   Uptime: {metrics['uptime']}")
-            if 'interfaces_up' in metrics:
-                print(f"   Interfaces: {metrics['interfaces_up']} up, "
-                      f"{metrics['interfaces_down']} down")
-            if metrics.get('cpu_line'):
-                print(f"   CPU: {metrics['cpu_line']}")
-            print()
+    except NetmikoTimeoutException:
+        logger.error(f"Timeout connecting to {task.host.hostname}")
+        return Result(
+            host=task.host,
+            result={"hostname": task.host.hostname, "error": "Connection timeout"},
+            failed=True,
+        )
+    except Exception as e:
+        logger.error(f"Error gathering health for {task.host.hostname}: {str(e)}")
+        return Result(
+            host=task.host,
+            result={"hostname": task.host.hostname, "error": str(e)},
+            failed=True,
+        )
 
 
 def main():
-    """Main execution."""
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Collect device health metrics across network"
+        description="Gather device health metrics from network devices"
     )
-    parser.add_argument("-i", "--inventory", required=True,
-                        help="Inventory file path")
-    parser.add_argument("-c", "--credentials", required=True,
-                        help="Credentials file path")
-    parser.add_argument("-g", "--group", help="Filter by group")
-    parser.add_argument("-f", "--format", choices=["text", "json"],
-                        default="text", help="Output format")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Verbose logging")
+    parser.add_argument(
+        "-i", "--inventory",
+        default="inventory.yaml",
+        help="Path to nornir inventory file",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        help="Filter to specific device by hostname",
+    )
+    parser.add_argument(
+        "-f", "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
+    )
     
     args = parser.parse_args()
     
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
     
     try:
-        nr = InitNornir(config_file="nornir_config.yaml")
+        nr = InitNornir(config_file=args.inventory)
         
-        if args.group:
-            nr = nr.filter(group=args.group)
+        if args.device:
+            nr = nr.filter(name=args.device)
+            if not nr.inventory.hosts:
+                logger.error(f"Device '{args.device}' not found in inventory")
+                return 1
         
-        logger.info(f"Running health check on {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=collect_health_metrics, num_workers=10)
+        logger.info(f"Gathering health metrics from {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(task=get_device_health, num_workers=4)
         
-        format_output(dict(results), args.format)
+        if args.format == "json":
+            output = {}
+            for host, task_result in results.items():
+                output[host] = task_result[0].result
+            print(json.dumps(output, indent=2))
+        else:
+            print_result(results)
         
-        if results.failed_hosts:
-            logger.warning(
-                f"Health check failed for: {', '.join(results.failed_hosts.keys())}"
-            )
-    
+        return 0
+        
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        raise
+        logger.error(f"Fatal error: {str(e)}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
