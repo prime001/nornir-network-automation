@@ -1,185 +1,172 @@
-```python
-"""
-Device Health Check and Monitoring Report
+Device Health and Metrics Collector using Nornir.
 
-Retrieves CPU, memory, temperature, and uptime metrics from network devices
-using NAPALM getters. Generates a formatted health report and alerts on
-threshold violations.
+Purpose:
+    Collects system health metrics from network devices including uptime,
+    memory usage, and system information. Generates a comprehensive health
+    report for monitoring and baseline establishment.
 
 Usage:
-    python device_health_check.py --inventory inventory.yaml --hosts "router1,router2"
-    python device_health_check.py --inventory inventory.yaml --groups "core"
-    python device_health_check.py --inventory inventory.yaml --cpu-threshold 80
+    python device_health_check.py --hosts all --output health_report.txt
+    python device_health_check.py --hosts r1,r2 --verbose
 
 Prerequisites:
-    - nornir and nornir plugins installed
-    - NAPALM drivers available for device types
-    - Inventory file in YAML/JSON format
-    - Network connectivity to all target devices
+    - Nornir installed and configured
+    - Inventory file (config.yaml) with device definitions
+    - Device credentials configured (SSH keys or username/password)
+    - Netmiko support for target device types
+    - SSH connectivity to all target devices
 """
 
 import argparse
 import logging
-import json
+import sys
+from typing import Dict, Any
+
 from nornir import InitNornir
 from nornir.core.task import Task, Result
-from nornir.tasks.networking import napalm_get
+from nornir.tasks.networking import netmiko_send_command
+from nornir.core.filter import F
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+
 logger = logging.getLogger(__name__)
 
 
-def get_device_health(task: Task, cpu_warn: int, mem_warn: int) -> Result:
-    """Collect device health metrics using NAPALM."""
+def extract_metrics(task: Task, command: str) -> Result:
+    """Execute command and extract basic metrics from output."""
     try:
-        result = task.run(napalm_get, getters=["environment", "facts"])
-        device_facts = result[1].result
-        device_env = result[0].result
+        result = task.run(
+            netmiko_send_command,
+            command_string=command,
+            name=f"Collect metrics on {task.host.name}"
+        )
         
-        health_data = {
-            "hostname": task.host.name,
-            "device_type": task.host.get("device_type", "unknown"),
-            "facts": device_facts.get("facts", {}),
-            "environment": device_env.get("environment", {}),
+        if result.failed:
+            return Result(
+                host=task.host,
+                result={"status": "failed", "reason": "command execution failed"},
+                failed=True
+            )
+        
+        output = result[0].result
+        metrics = {
+            "status": "healthy",
+            "command": command,
+            "output_length": len(output),
+            "uptime_line": None
         }
-        return Result(host=task.host, result=health_data)
+        
+        for line in output.split("\n"):
+            if "uptime" in line.lower():
+                metrics["uptime_line"] = line.strip()
+                break
+        
+        task.host["metrics"] = metrics
+        
+        return Result(
+            host=task.host,
+            result=metrics,
+            failed=False
+        )
+    
     except Exception as e:
-        logger.error(f"{task.host.name}: Failed to retrieve health data - {e}")
-        return Result(host=task.host, result=None, failed=True, exception=e)
+        logger.exception(f"Error collecting metrics from {task.host.name}")
+        return Result(
+            host=task.host,
+            result={"status": "error", "exception": str(e)},
+            failed=True
+        )
 
 
-def analyze_health(health_data: dict, cpu_warn: int, mem_warn: int) -> dict:
-    """Analyze health metrics and identify issues."""
-    if not health_data:
-        return {"status": "ERROR", "message": "No data collected"}
+def generate_report(nr, output_file: str = None) -> None:
+    """Generate health report from collected metrics."""
+    lines = ["=" * 70, "Device Health Report", "=" * 70, ""]
     
-    analysis = {
-        "hostname": health_data["hostname"],
-        "device_type": health_data["device_type"],
-        "alerts": [],
-        "status": "HEALTHY"
-    }
+    healthy, failed, total = 0, 0, len(nr.inventory.hosts)
     
-    facts = health_data.get("facts", {})
-    env = health_data.get("environment", {})
-    
-    if "uptime_seconds" in facts:
-        days = facts["uptime_seconds"] // 86400
-        analysis["uptime_days"] = days
-        if days < 7:
-            analysis["alerts"].append(f"Low uptime: {days} days")
-            analysis["status"] = "WARNING"
-    
-    for cpu_name, cpu_data in env.get("cpu", {}).items():
-        if isinstance(cpu_data, dict):
-            cpu_util = cpu_data.get("%usage", 0)
-            if cpu_util > cpu_warn:
-                analysis["alerts"].append(f"High CPU: {cpu_name} = {cpu_util}%")
-                analysis["status"] = "CRITICAL" if cpu_util > 95 else "WARNING"
-    
-    mem = env.get("memory", {})
-    if "available_ram" in mem and "used_ram" in mem:
-        total = mem["available_ram"] + mem["used_ram"]
-        if total > 0:
-            mem_util = (mem["used_ram"] / total) * 100
-            if mem_util > mem_warn:
-                analysis["alerts"].append(f"High memory: {mem_util:.1f}%")
-                analysis["status"] = "CRITICAL" if mem_util > 98 else "WARNING"
-    
-    for sensor_name, sensor_data in env.get("temperature", {}).items():
-        if isinstance(sensor_data, dict):
-            current_temp = sensor_data.get("current_reading", 0)
-            if current_temp > 75:
-                analysis["alerts"].append(f"High temp: {sensor_name} = {current_temp}C")
-                analysis["status"] = "CRITICAL" if current_temp > 85 else "WARNING"
-    
-    if not analysis["alerts"]:
-        analysis["alerts"] = ["All metrics within normal range"]
-    
-    return analysis
-
-
-def print_report(analyses: list) -> None:
-    """Format and print health report."""
-    print("\n" + "=" * 80)
-    print("DEVICE HEALTH REPORT")
-    print("=" * 80)
-    
-    critical = sum(1 for a in analyses if a["status"] == "CRITICAL")
-    warning = sum(1 for a in analyses if a["status"] == "WARNING")
-    healthy = sum(1 for a in analyses if a["status"] == "HEALTHY")
-    
-    print(f"\nSummary: {healthy} healthy, {warning} warning, {critical} critical")
-    print("-" * 80)
-    
-    for analysis in sorted(analyses, key=lambda x: x["status"], reverse=True):
-        status = analysis["status"]
-        marker = "⚠️ " if status == "WARNING" else "🔴" if status == "CRITICAL" else "✓"
-        print(f"\n{marker} {analysis['hostname']} ({analysis['device_type']}) - {status}")
+    for host_name, host in nr.inventory.hosts.items():
+        metrics = host.get("metrics", {})
+        status = metrics.get("status", "unknown")
         
-        if "uptime_days" in analysis:
-            print(f"  Uptime: {analysis['uptime_days']} days")
+        lines.append(
+            f"{host_name:20} | Status: {status:10} | {metrics.get('uptime_line', 'N/A')}"
+        )
         
-        for alert in analysis["alerts"]:
-            print(f"  • {alert}")
+        if status == "healthy":
+            healthy += 1
+        else:
+            failed += 1
+    
+    lines.extend([
+        "",
+        "=" * 70,
+        f"Summary: {healthy}/{total} healthy, {failed}/{total} failed",
+        "=" * 70
+    ])
+    
+    report = "\n".join(lines)
+    print(report)
+    
+    if output_file:
+        with open(output_file, "w") as f:
+            f.write(report)
+        logger.info(f"Report saved to {output_file}")
 
 
-def main():
+def main() -> int:
+    """Execute device health check."""
     parser = argparse.ArgumentParser(
-        description="Check device health metrics (CPU, memory, temperature)"
+        description="Monitor device health metrics using Nornir"
     )
-    parser.add_argument("--inventory", required=True, help="Path to nornir inventory file")
-    parser.add_argument("--hosts", help="Comma-separated list of hosts to check")
-    parser.add_argument("--groups", help="Comma-separated list of groups to check")
-    parser.add_argument("--cpu-threshold", type=int, default=85, help="CPU warning threshold %")
-    parser.add_argument("--memory-threshold", type=int, default=90, help="Memory warning threshold %")
-    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
+    parser.add_argument(
+        "--hosts",
+        default="all",
+        help="Comma-separated host names or 'all'"
+    )
+    parser.add_argument(
+        "--output",
+        help="Output file for report"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
     
     args = parser.parse_args()
     
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    
     try:
-        nr = InitNornir(config_file=args.inventory)
-        
-        if args.hosts:
-            nr = nr.filter(name=args.hosts.split(","))
-        elif args.groups:
-            nr = nr.filter(group=args.groups.split(","))
-        
-        logger.info(f"Checking health for {len(nr.inventory.hosts)} devices")
-        
-        results = nr.run(
-            task=get_device_health,
-            cpu_warn=args.cpu_threshold,
-            mem_warn=args.memory_threshold
-        )
-        
-        analyses = []
-        for host_name, multi_result in results.items():
-            if multi_result[0].result:
-                analysis = analyze_health(
-                    multi_result[0].result,
-                    args.cpu_threshold,
-                    args.memory_threshold
-                )
-                analyses.append(analysis)
-        
-        if args.json:
-            print(json.dumps(analyses, indent=2))
-        else:
-            print_report(analyses)
-        
-        critical_count = sum(1 for a in analyses if a["status"] == "CRITICAL")
-        if critical_count > 0:
-            logger.warning(f"Found {critical_count} device(s) in CRITICAL state")
-        
+        nr = InitNornir(config_file="config.yaml")
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise
+        logger.error(f"Failed to load Nornir config: {e}")
+        return 1
+    
+    if args.hosts != "all":
+        hosts = [h.strip() for h in args.hosts.split(",")]
+        nr = nr.filter(F(name__in=hosts))
+    
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched filter")
+        return 1
+    
+    logger.info(f"Collecting metrics from {len(nr.inventory.hosts)} device(s)")
+    
+    try:
+        results = nr.run(
+            task=extract_metrics,
+            command="show version",
+            num_workers=10
+        )
+        generate_report(nr, args.output)
+        return 0 if not results.failed_hosts else 1
+    except Exception as e:
+        logger.exception("Execution failed")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
-```
+    sys.exit(main())
