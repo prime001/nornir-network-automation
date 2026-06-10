@@ -1,160 +1,234 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Software Version Reporter
+Device Health Monitor
 
-Retrieves and reports software/OS versions across network devices.
-Uses NAPALM to gather device facts and generates compliance reports.
+Gathers and reports health metrics from network devices using Nornir.
+
+Purpose:
+    Monitor device connectivity, reachability, and basic health across the
+    network inventory. Collects device information and validates SSH/Netmiko
+    connectivity. Useful for identifying unreachable devices and basic health
+    status before running operational tasks.
 
 Usage:
-    python device_software_versions.py -i inventory.yaml
-    python device_software_versions.py -i inventory.yaml -d router1
-    python device_software_versions.py -i inventory.yaml -t 15.3.1 -o json
+    python device_health_monitor.py --devices all
+    python device_health_monitor.py --devices rtr-core-01,rtr-core-02
+    python device_health_monitor.py --devices all --format json
+    python device_health_monitor.py --devices all --verbose
 
 Prerequisites:
-    - Nornir configured with device inventory
-    - NAPALM plugin installed (pip install nornir-napalm)
-    - Network connectivity and SSH credentials to devices
-    - nornir_config.yaml in working directory
+    - Nornir installed with netmiko connection plugin
+    - config.yaml with inventory settings
+    - hosts.yaml with device definitions
+    - SSH credentials configured (username/password in group_vars or env)
+    - Network connectivity to target devices
 """
 
 import argparse
 import json
 import logging
-from pathlib import Path
+import sys
+from typing import Any, Dict
 
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.filter import F
+from nornir.core.task import Result, Task
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
-def get_device_software(task: Task) -> Result:
-    """Retrieve device software version using NAPALM get_facts."""
-    result = task.run(napalm_get, getters=["facts"])
-    facts = result[0].result.get("facts", {})
-    
-    return Result(
-        host=task.host,
-        result={
-            "model": facts.get("model"),
-            "os_version": facts.get("os_version"),
-            "serial_number": facts.get("serial_number"),
-            "uptime_seconds": facts.get("uptime_seconds"),
-        },
+def check_device_health(task: Task) -> Result:
+    """Check device connectivity and gather basic health information."""
+    health_data = {
+        "device": task.host.name,
+        "hostname": task.host.hostname,
+        "platform": task.host.get("platform", "unknown"),
+        "status": "unknown",
+    }
+
+    try:
+        cmd = task.host.get("health_check_cmd", "show version")
+        output = task.host.send_command(cmd)
+
+        if output and len(output) > 0:
+            health_data["status"] = "healthy"
+            health_data["connected"] = True
+            health_data["response_length"] = len(output)
+
+            if "uptime" in output.lower():
+                health_data["uptime_available"] = True
+        else:
+            health_data["status"] = "degraded"
+            health_data["connected"] = True
+            health_data["response_length"] = 0
+
+        return Result(host=task.host, result=health_data)
+
+    except Exception as e:
+        health_data["status"] = "unreachable"
+        health_data["connected"] = False
+        health_data["error"] = str(e)
+        logger.warning(f"Device {task.host.name} unreachable: {e}")
+        return Result(host=task.host, result=health_data, failed=True)
+
+
+def validate_device_config(task: Task) -> Result:
+    """Validate device has required attributes for operation."""
+    validation = {
+        "device": task.host.name,
+        "valid": True,
+        "issues": [],
+    }
+
+    if not task.host.hostname:
+        validation["valid"] = False
+        validation["issues"].append("Missing hostname")
+
+    if not task.host.get("platform"):
+        validation["valid"] = False
+        validation["issues"].append("Missing platform definition")
+
+    return Result(host=task.host, result=validation)
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="Check health and connectivity of network devices",
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="all",
+        help="Device(s) to check: 'all' or comma-separated names",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (text or json)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        help="Nornir config file path",
     )
 
+    return parser.parse_args()
 
-def generate_text_report(device_data, target_version=None):
-    """Generate human-readable report."""
-    print("\n" + "=" * 80)
-    print("DEVICE SOFTWARE VERSION REPORT")
-    print("=" * 80 + "\n")
-    
-    compliant = non_compliant = 0
-    
-    for host in sorted(device_data.keys()):
-        info = device_data[host]
-        if "error" in info:
-            print(f"{host:<20} [ERROR] {info['error']}\n")
-            continue
-        
-        os_version = info.get("os_version", "Unknown")
-        status = ""
-        
-        if target_version:
-            is_compliant = os_version == target_version
-            status = " [✓]" if is_compliant else " [✗]"
-            compliant += is_compliant
-            non_compliant += not is_compliant
-        
-        print(f"Host:           {host}{status}")
-        print(f"  Model:        {info.get('model', 'N/A')}")
-        print(f"  OS Version:   {os_version}")
-        print(f"  Serial:       {info.get('serial_number', 'N/A')}")
-        print(f"  Uptime (sec): {info.get('uptime_seconds', 'N/A')}\n")
-    
-    if target_version:
-        print("=" * 80)
-        print(f"Compliance Summary (Target: {target_version})")
-        print(f"  Compliant:     {compliant}")
-        print(f"  Non-compliant: {non_compliant}")
-        print("=" * 80 + "\n")
+
+def format_text_report(results: Dict[str, Any]) -> str:
+    """Format results as text report."""
+    lines = [
+        "\n" + "=" * 80,
+        "DEVICE HEALTH CHECK REPORT",
+        "=" * 80,
+        f"{'Device':<25} {'Platform':<15} {'Status':<12} {'Error':<30}",
+        "-" * 80,
+    ]
+
+    for device_name in sorted(results.keys()):
+        for task_result in results[device_name]:
+            if task_result.result:
+                device = task_result.result.get("device", device_name)
+                platform = task_result.result.get("platform", "N/A")
+                status = task_result.result.get("status", "unknown")
+                error = task_result.result.get("error", "")
+
+                lines.append(
+                    f"{device:<25} {platform:<15} {status:<12} {error:<30}",
+                )
+
+    lines.append("=" * 80 + "\n")
+    return "\n".join(lines)
+
+
+def format_json_report(results: Dict[str, Any]) -> str:
+    """Format results as JSON."""
+    output = {}
+
+    for device_name in results.keys():
+        for task_result in results[device_name]:
+            if task_result.result:
+                output[device_name] = task_result.result
+
+    return json.dumps(output, indent=2)
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Report device software versions across network devices"
-    )
-    parser.add_argument(
-        "-i", "--inventory",
-        type=Path, default=Path("inventory.yaml"),
-        help="Path to Nornir inventory file"
-    )
-    parser.add_argument(
-        "-d", "--device",
-        help="Target specific device by hostname"
-    )
-    parser.add_argument(
-        "-g", "--group",
-        help="Filter devices by group"
-    )
-    parser.add_argument(
-        "-t", "--target-version",
-        help="Target version for compliance check"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        choices=["text", "json"], default="text",
-        help="Output format"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable debug logging"
-    )
-    
-    args = parser.parse_args()
-    
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    
+    """Main execution function."""
+    args = parse_arguments()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+
     try:
-        nr = InitNornir(config_file="nornir_config.yaml")
-        
-        if args.group:
-            nr = nr.filter(group=args.group)
-        if args.device:
-            nr = nr.filter(name=args.device)
-        
-        if not nr.inventory.hosts:
-            logger.error("No devices matched filter criteria")
-            return
-        
-        logger.info(f"Scanning {len(nr.inventory.hosts)} device(s)...")
-        
-        device_data = {}
-        for host_name in sorted(nr.inventory.hosts.keys()):
-            try:
-                result = get_device_software(nr[host_name])
-                device_data[host_name] = result.result
-            except Exception as e:
-                device_data[host_name] = {"error": str(e)}
-                logger.warning(f"Failed to query {host_name}: {e}")
-        
-        if args.output == "json":
-            print(json.dumps(device_data, indent=2, default=str))
-        else:
-            generate_text_report(device_data, args.target_version)
-            
+        logger.info(f"Loading Nornir configuration from {args.config}")
+        nr = InitNornir(config_file=args.config)
+
+    except FileNotFoundError as e:
+        logger.error(f"Configuration file not found: {args.config}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Failed to initialize Nornir: {e}")
-        return
+        sys.exit(1)
+
+    try:
+        if args.devices != "all":
+            device_list = [d.strip() for d in args.devices.split(",")]
+            logger.info(f"Filtering to devices: {device_list}")
+            nr = nr.filter(F(name__any=device_list))
+
+        if len(nr.inventory.hosts) == 0:
+            logger.error("No devices matched the filter")
+            sys.exit(1)
+
+        logger.info(f"Starting health check on {len(nr.inventory.hosts)} devices")
+
+        results = nr.run(task=check_device_health)
+
+        healthy = sum(
+            1
+            for device_results in results.values()
+            for task_result in device_results
+            if task_result.result and task_result.result.get("status") == "healthy"
+        )
+        unreachable = sum(
+            1
+            for device_results in results.values()
+            for task_result in device_results
+            if task_result.result and task_result.result.get("status") == "unreachable"
+        )
+
+        if args.format == "json":
+            output = format_json_report(results)
+        else:
+            output = format_text_report(results)
+
+        print(output)
+
+        logger.info(
+            f"Health check complete: {healthy} healthy, {unreachable} unreachable",
+        )
+
+        if unreachable > 0:
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Health check failed: {e}", exc_info=args.verbose)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
