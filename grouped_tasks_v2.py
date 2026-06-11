@@ -1,206 +1,223 @@
 ```python
 """
-Multi-device command execution with drift detection and reporting.
+routing_snapshot.py - Network Routing Table Snapshot and Analysis
 
-Executes a show command on multiple network devices and identifies
-configuration drift by comparing outputs across the network.
+Purpose:
+    Collect routing tables from network devices using Nornir, group results
+    by device group, and produce a summary showing route counts by protocol
+    (static, OSPF, BGP, EIGRP, connected) with optional prefix search.
 
 Usage:
-    python device_drift_detection.py \\
-        --command "show version" \\
-        --devices router1 router2 router3
-    
-    python device_drift_detection.py \\
-        --command "show interfaces brief" \\
-        --verbose
+    python routing_snapshot.py
+    python routing_snapshot.py --groups core,distribution --search 10.0.0.0/8
+    python routing_snapshot.py --platform ios --vrf MGMT --output snapshot.json
 
 Prerequisites:
-    - Nornir configured with inventory and credentials
-    - netmiko installed for device connectivity
-    - Devices must support the specified show command
+    pip install nornir nornir-netmiko nornir-utils
+    Nornir inventory files: hosts.yaml, groups.yaml, defaults.yaml
+    SSH access to target devices with credentials in inventory or via CLI flags
 """
 
 import argparse
-import hashlib
 import json
 import logging
+import sys
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 from nornir import InitNornir
+from nornir.core import Nornir
 from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir_netmiko.tasks import netmiko_send_command
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-
-def execute_show_command(task: Task, command: str) -> Result:
-    """Execute show command on device."""
-    try:
-        result = task.run(
-            netmiko_send_command,
-            command_string=command,
-            use_timing=False
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Command failed on {task.host.name}: {e}")
-        raise
+PROTOCOL_CODES = {
+    "S": "static",
+    "O": "ospf",
+    "B": "bgp",
+    "D": "eigrp",
+    "C": "connected",
+    "L": "local",
+    "i": "isis",
+    "R": "rip",
+}
 
 
-def hash_output(output: str) -> str:
-    """Generate hash of command output for comparison."""
-    normalized = output.strip().lower()
-    return hashlib.md5(normalized.encode()).hexdigest()
+def collect_routing_table(task: Task, vrf: str = "default") -> Result:
+    cmd = "show ip route" if vrf == "default" else f"show ip route vrf {vrf}"
+    result = task.run(task=netmiko_send_command, command_string=cmd)
+    return Result(host=task.host, result=result.result)
 
 
-def group_by_output(outputs: Dict[str, str]) -> Dict[str, List[str]]:
-    """Group devices by identical command output."""
-    groups = defaultdict(list)
-    for device, output in outputs.items():
-        output_hash = hash_output(output)
-        groups[output_hash].append(device)
-    return dict(groups)
+def parse_route_counts(output: str) -> Dict[str, int]:
+    counts: Dict[str, int] = defaultdict(int)
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("Codes", "Gateway", "#")):
+            continue
+        proto = PROTOCOL_CODES.get(stripped[0])
+        if proto:
+            counts[proto] += 1
+    return dict(counts)
 
 
-def format_report(
-    groups: Dict[str, List[str]],
-    outputs: Dict[str, str],
-    command: str
-) -> str:
-    """Generate formatted drift analysis report."""
-    lines = [
-        "\n" + "=" * 75,
-        "CONFIGURATION DRIFT ANALYSIS",
-        "=" * 75,
-        f"Command: {command}",
-        f"Devices scanned: {len(outputs)}",
-        f"Unique outputs: {len(groups)}",
-        "=" * 75 + "\n"
-    ]
-    
-    if len(groups) == 1:
-        devices = list(groups.values())[0]
-        lines.append("✓ NO DRIFT DETECTED")
-        lines.append(f"  All {len(devices)} devices have identical output\n")
-    else:
-        lines.append("⚠ DRIFT DETECTED\n")
-        for idx, (_, devices) in enumerate(groups.items(), 1):
-            lines.append(f"Output Group {idx} ({len(devices)} device{'s' if len(devices) > 1 else ''}):")
-            for device in sorted(devices):
-                lines.append(f"  • {device}")
-            lines.append("")
-    
-    lines.append("=" * 75 + "\n")
-    return "\n".join(lines)
+def find_prefix_matches(output: str, prefix: str) -> List[str]:
+    return [line.strip() for line in output.splitlines() if prefix in line]
 
 
-def show_sample_outputs(
-    groups: Dict[str, List[str]],
-    outputs: Dict[str, str],
-    max_length: int = 300
-) -> str:
-    """Display sample outputs from each group."""
-    lines = ["SAMPLE OUTPUTS:\n"]
-    
-    for idx, (output_hash, devices) in enumerate(groups.items(), 1):
-        sample_device = devices[0]
-        sample_output = outputs[sample_device]
-        truncated = sample_output[:max_length]
-        
-        lines.append(f"Group {idx} (from {sample_device}):")
-        lines.append("-" * 75)
-        lines.append(truncated)
-        if len(sample_output) > max_length:
-            lines.append(f"... [output truncated, {len(sample_output)} chars total]")
-        lines.append("")
-    
-    return "\n".join(lines)
+def init_nornir(
+    inventory: str,
+    groups_file: str,
+    defaults_file: str,
+    username: Optional[str],
+    password: Optional[str],
+    groups_filter: Optional[List[str]],
+    platform_filter: Optional[str],
+) -> Nornir:
+    nr = InitNornir(
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": inventory,
+                "group_file": groups_file,
+                "defaults_file": defaults_file,
+            },
+        },
+        logging={"enabled": False},
+    )
+    if username:
+        nr.inventory.defaults.username = username
+    if password:
+        nr.inventory.defaults.password = password
+    if groups_filter:
+        nr = nr.filter(lambda h: any(g in h.groups for g in groups_filter))
+    if platform_filter:
+        nr = nr.filter(platform=platform_filter)
+    return nr
 
 
-def main() -> int:
+def print_summary(summary: Dict[str, dict], vrf: str, search: Optional[str]) -> None:
+    print(f"\n{'='*65}")
+    print(f"Routing Table Summary — VRF: {vrf}")
+    print(f"{'='*65}")
+
+    by_group: Dict[str, List[str]] = defaultdict(list)
+    for hostname, data in summary.items():
+        for grp in data.get("groups") or ["(ungrouped)"]:
+            by_group[grp].append(hostname)
+
+    header = f"  {'Host':<25} {'Total':>7}  {'Connected':>10}  {'OSPF':>6}  {'BGP':>5}  {'Static':>7}"
+    divider = f"  {'-'*25} {'-'*7}  {'-'*10}  {'-'*6}  {'-'*5}  {'-'*7}"
+
+    for group in sorted(by_group):
+        print(f"\nGroup: {group}")
+        print(header)
+        print(divider)
+        for hostname in by_group[group]:
+            d = summary[hostname]
+            rc = d["route_counts"]
+            print(
+                f"  {hostname:<25} {d['total_routes']:>7}"
+                f"  {rc.get('connected', 0):>10}"
+                f"  {rc.get('ospf', 0):>6}"
+                f"  {rc.get('bgp', 0):>5}"
+                f"  {rc.get('static', 0):>7}"
+            )
+            if search and "prefix_search" in d:
+                ps = d["prefix_search"]
+                status = "FOUND" if ps["found"] else "not found"
+                print(f"    [{search}] {status}")
+                for match in ps["matches"]:
+                    print(f"      {match}")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Detect configuration drift across network devices"
+        description="Collect and analyze routing tables across network devices"
     )
-    parser.add_argument(
-        "--command",
-        required=True,
-        help="Show command to execute on devices"
-    )
-    parser.add_argument(
-        "--devices",
-        nargs="*",
-        default=None,
-        help="Specific device names to target (all devices if not specified)"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Display sample outputs from each group"
-    )
-    parser.add_argument(
-        "--inventory",
-        default="inventory",
-        help="Path to Nornir inventory"
-    )
-    
+    parser.add_argument("--inventory", default="hosts.yaml")
+    parser.add_argument("--groups-file", default="groups.yaml")
+    parser.add_argument("--defaults-file", default="defaults.yaml")
+    parser.add_argument("--username", help="Override inventory username")
+    parser.add_argument("--password", help="Override inventory password")
+    parser.add_argument("--groups", help="Comma-separated Nornir groups to target")
+    parser.add_argument("--platform", help="Filter by platform (e.g. ios, eos)")
+    parser.add_argument("--vrf", default="default", help="VRF to query")
+    parser.add_argument("--search", metavar="PREFIX", help="Search for a prefix in results")
+    parser.add_argument("--output", help="Write full results to JSON file")
+    parser.add_argument("--verbose", action="store_true", help="Include raw output in JSON")
     args = parser.parse_args()
-    
+
+    groups_filter = [g.strip() for g in args.groups.split(",")] if args.groups else None
+
     try:
-        nr = InitNornir(inventory=args.inventory)
-        
-        if args.devices:
-            nr = nr.filter(name__in=args.devices)
-            logger.info(f"Targeting {len(nr.inventory.hosts)} specified device(s)")
-        else:
-            logger.info(f"Targeting all {len(nr.inventory.hosts)} device(s)")
-        
-        if not nr.inventory.hosts:
-            logger.error("No devices found in inventory")
-            return 1
-        
-        logger.info(f"Executing: {args.command}")
-        results = nr.run(
-            task=execute_show_command,
-            command=args.command
+        nr = init_nornir(
+            inventory=args.inventory,
+            groups_file=args.groups_file,
+            defaults_file=args.defaults_file,
+            username=args.username,
+            password=args.password,
+            groups_filter=groups_filter,
+            platform_filter=args.platform,
         )
-        
-        outputs = {}
-        failed_devices = []
-        
-        for device, task_result in results.items():
-            if task_result[0].ok:
-                outputs[device] = task_result[0].result
-            else:
-                failed_devices.append(device)
-        
-        if failed_devices:
-            logger.warning(f"Failed on {len(failed_devices)} device(s): {', '.join(failed_devices)}")
-        
-        if not outputs:
-            logger.error("No successful command executions")
-            return 2
-        
-        groups = group_by_output(outputs)
-        report = format_report(groups, outputs, args.command)
-        print(report)
-        
-        if args.verbose and len(groups) > 1:
-            sample = show_sample_outputs(groups, outputs)
-            print(sample)
-        
-        has_drift = len(groups) > 1
-        return 1 if has_drift else 0
-        
-    except Exception as e:
-        logger.error(f"Script execution failed: {e}", exc_info=True)
-        return 2
+    except Exception as exc:
+        logger.error("Failed to initialize inventory: %s", exc)
+        sys.exit(1)
+
+    if not nr.inventory.hosts:
+        logger.error("No hosts matched the specified filters.")
+        sys.exit(1)
+
+    logger.info("Targeting %d host(s)", len(nr.inventory.hosts))
+    results = nr.run(task=collect_routing_table, vrf=args.vrf)
+
+    summary: Dict[str, dict] = {}
+    failed: List[str] = []
+
+    for hostname, multi_result in results.items():
+        if multi_result.failed:
+            logger.warning("Collection failed for %s: %s", hostname, multi_result[0].exception)
+            failed.append(hostname)
+            continue
+
+        raw = multi_result[0].result
+        route_counts = parse_route_counts(raw)
+        host_data: Dict = {
+            "groups": [str(g) for g in nr.inventory.hosts[hostname].groups],
+            "platform": nr.inventory.hosts[hostname].platform,
+            "route_counts": route_counts,
+            "total_routes": sum(route_counts.values()),
+        }
+        if args.search:
+            matches = find_prefix_matches(raw, args.search)
+            host_data["prefix_search"] = {"query": args.search, "matches": matches, "found": bool(matches)}
+        if args.verbose:
+            host_data["raw_output"] = raw
+        summary[hostname] = host_data
+
+    print_summary(summary, args.vrf, args.search)
+
+    print(f"\n{'='*65}")
+    print(f"Total: {len(summary)} succeeded, {len(failed)} failed")
+    if failed:
+        print(f"Failed hosts: {', '.join(failed)}")
+
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(summary, fh, indent=2)
+            logger.info("Results written to %s", args.output)
+        except OSError as exc:
+            logger.error("Could not write output file: %s", exc)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
