@@ -1,198 +1,180 @@
 ```python
 """
-NTP Synchronization Status Validator for network device inventory.
+Device Facts Collector - Network Automation Portfolio Script
 
-Connects to network devices and validates NTP synchronization status,
-identifying unsynchronized systems and potential clock skew issues.
-Useful for ensuring accurate timestamps across infrastructure.
+Purpose:
+    Collects and reports device facts (OS version, uptime, serial number, model)
+    from network devices using nornir and NAPALM. Useful for inventory audits,
+    capacity planning, and firmware management tracking.
 
 Usage:
-    python ntp_sync_validator.py -i inventory.yaml -u admin -p password
+    python device_facts.py -i inventory/ [-d "device1,device2"] [-f json]
 
 Prerequisites:
-    - Nornir installed with netmiko connector
-    - Device inventory file with SSH connectivity configured
-    - Network devices must support 'show ntp status' command
-    - SSH credentials with privilege to execute show commands
+    - nornir and napalm installed
+    - Inventory directory with hosts.yaml and defaults.yaml configured
+    - Device SSH credentials accessible via environment or inventory
+    - NAPALM driver support for target device types
+
+Output:
+    Generates device facts report in text, JSON, or CSV format.
 """
 
 import argparse
+import json
 import logging
-import sys
-
+from pathlib import Path
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.plugins.tasks.networking import napalm_get
 
-
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
-def validate_ntp_sync(task: Task, warn_offset: float = 100.0) -> Result:
-    """
-    Check NTP synchronization status on a device.
-    
-    Returns synchronized state, stratum, clock offset, and any issues.
-    """
-    try:
-        cmd_result = task.run(
-            netmiko_send_command,
-            command_string='show ntp status'
-        )
-        
-        if cmd_result[0].failed:
-            return Result(
-                host=task.host,
-                failed=True,
-                result={'error': 'Failed to retrieve NTP status'}
+def get_device_facts(task):
+    """Retrieve device facts using NAPALM get_facts."""
+    task.run(task=napalm_get, getters=["facts"])
+
+
+def collect_facts(nr):
+    """Execute facts collection across inventory."""
+    results = nr.run(task=get_device_facts)
+    facts_data = {}
+
+    for host, result in results.items():
+        if result.failed:
+            facts_data[host] = {"error": str(result[0].exception)}
+            logger.warning(f"Failed to collect facts from {host}")
+        else:
+            try:
+                facts = result[0].result["facts"]
+                facts_data[host] = {
+                    "vendor": facts.get("vendor", "N/A"),
+                    "model": facts.get("model", "N/A"),
+                    "os_version": facts.get("os_version", "N/A"),
+                    "serial_number": facts.get("serial_number", "N/A"),
+                    "uptime_seconds": facts.get("uptime_seconds", 0),
+                    "hostname": facts.get("hostname", host),
+                }
+            except (KeyError, TypeError) as e:
+                facts_data[host] = {"error": f"Parse error: {str(e)}"}
+                logger.warning(f"Error parsing facts from {host}: {e}")
+
+    return facts_data
+
+
+def format_text(facts_data):
+    """Format facts as human-readable text."""
+    lines = ["\nDevice Facts Report", "=" * 70]
+    for host, data in facts_data.items():
+        lines.append(f"\n{host}")
+        if "error" in data:
+            lines.append(f"  ERROR: {data['error']}")
+        else:
+            for key, value in data.items():
+                if key != "hostname":
+                    label = key.replace("_", " ").title()
+                    lines.append(f"  {label}: {value}")
+    return "\n".join(lines)
+
+
+def format_json(facts_data):
+    """Format facts as JSON."""
+    return json.dumps(facts_data, indent=2)
+
+
+def format_csv(facts_data):
+    """Format facts as CSV."""
+    headers = ["Host", "Vendor", "Model", "OS Version", "Serial Number"]
+    lines = [",".join(headers)]
+
+    for host, data in facts_data.items():
+        if "error" in data:
+            lines.append(f"{host},ERROR,{data['error']},,,")
+        else:
+            lines.append(
+                f"{host},{data['vendor']},{data['model']},"
+                f"{data['os_version']},{data['serial_number']}"
             )
-        
-        output = cmd_result[0].result
-        if not output:
-            return Result(
-                host=task.host,
-                failed=True,
-                result={'error': 'Empty response from device'}
-            )
-        
-        synchronized = 'synchronized' in output.lower() and \
-                      'yes' in output.lower()
-        stratum = None
-        offset = None
-        
-        for line in output.split('\n'):
-            line = line.strip()
-            if 'stratum' in line.lower():
-                try:
-                    stratum = int(line.split()[-1])
-                except (ValueError, IndexError):
-                    pass
-            if 'offset' in line.lower():
-                try:
-                    offset = float(line.split()[-2])
-                except (ValueError, IndexError):
-                    pass
-        
-        issues = []
-        if not synchronized:
-            issues.append('Device not synchronized to NTP')
-        if stratum and stratum > 10:
-            issues.append(f'Stratum too high: {stratum}')
-        if offset and abs(offset) > warn_offset:
-            issues.append(f'Clock offset: {offset:.2f}ms')
-        
-        return Result(
-            host=task.host,
-            result={
-                'synchronized': synchronized,
-                'stratum': stratum,
-                'offset_ms': offset,
-                'issues': issues,
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f'{task.host.name}: {type(e).__name__}: {e}')
-        return Result(
-            host=task.host,
-            failed=True,
-            result={'error': str(e)}
-        )
+    return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Validate NTP synchronization across network devices'
+        description="Collect device facts from network devices via NAPALM"
     )
     parser.add_argument(
-        '-i', '--inventory',
-        required=True,
-        help='Path to Nornir inventory file'
+        "-i", "--inventory",
+        default="inventory",
+        help="Path to nornir inventory directory (default: inventory)"
     )
     parser.add_argument(
-        '-u', '--username',
-        required=True,
-        help='Device SSH username'
+        "-d", "--devices",
+        help="Comma-separated list of target devices (all if omitted)"
     )
     parser.add_argument(
-        '-p', '--password',
-        required=True,
-        help='Device SSH password'
+        "-f", "--format",
+        choices=["text", "json", "csv"],
+        default="text",
+        help="Output format (default: text)"
     )
     parser.add_argument(
-        '-w', '--warn-offset',
-        type=float,
-        default=100.0,
-        help='Warning threshold for clock offset in milliseconds (default: 100)'
+        "-o", "--output",
+        help="Output file path (stdout if omitted)"
     )
-    parser.add_argument(
-        '--filter',
-        help='Optional: filter devices by name pattern'
-    )
-    
+
     args = parser.parse_args()
-    
-    try:
-        nr = InitNornir(config_file=args.inventory)
-        
-        if args.filter:
-            nr = nr.filter(name__contains=args.filter)
-        
-        nr.inventory.defaults.username = args.username
-        nr.inventory.defaults.password = args.password
-        
-        device_count = len(nr.inventory.hosts)
-        logger.info(f'Validating NTP sync on {device_count} device(s)')
-        
-        results = nr.run(
-            task=validate_ntp_sync,
-            warn_offset=args.warn_offset,
-            name='NTP Synchronization Validator'
-        )
-        
-        print('\n' + '='*70)
-        print('NTP SYNCHRONIZATION STATUS REPORT')
-        print('='*70)
-        
-        synced_count = 0
-        issue_count = 0
-        failed_count = 0
-        
-        for host_name, task_results in results.items():
-            task_result = task_results[0]
-            result_data = task_result.result
-            
-            if task_result.failed:
-                status = '❌ ERROR'
-                failed_count += 1
-                error_msg = result_data.get('error', 'Unknown error')
-                print(f'{host_name}: {status} - {error_msg}')
-            elif result_data.get('issues'):
-                status = '⚠️  WARNING'
-                issue_count += 1
-                issues_str = '; '.join(result_data['issues'])
-                print(f'{host_name}: {status} - {issues_str}')
-            else:
-                status = '✅ OK'
-                synced_count += 1
-                stratum = result_data.get('stratum', 'N/A')
-                offset = result_data.get('offset_ms')
-                offset_str = f' (offset: {offset:.2f}ms)' if offset else ''
-                print(f'{host_name}: {status} - Stratum {stratum}{offset_str}')
-        
-        print('='*70)
-        print(f'Summary: {synced_count} synchronized, '
-              f'{issue_count} with issues, {failed_count} failed')
-        print('='*70 + '\n')
-        
-        return 0 if failed_count == 0 else 1
-        
-    except Exception as e:
-        logger.error(f'Fatal error: {e}', exc_info=True)
+
+    inv_path = Path(args.inventory)
+    if not inv_path.exists():
+        logger.error(f"Inventory path not found: {args.inventory}")
         return 1
 
+    try:
+        nr = InitNornir(config_file=str(inv_path / "config.yaml"))
+    except Exception as e:
+        logger.error(f"Failed to initialize nornir: {e}")
+        return 1
 
-if __name__ == '__main__':
-    sys.exit(main())
+    if args.devices:
+        device_list = [d.strip() for d in args.devices.split(",")]
+        nr = nr.filter(name__in=device_list)
+
+    if not nr.inventory.hosts:
+        logger.error("No devices found in inventory")
+        return 1
+
+    logger.info(f"Collecting facts from {len(nr.inventory.hosts)} device(s)")
+
+    try:
+        facts_data = collect_facts(nr)
+    except Exception as e:
+        logger.error(f"Task execution failed: {e}")
+        return 1
+
+    if args.format == "json":
+        output = format_json(facts_data)
+    elif args.format == "csv":
+        output = format_csv(facts_data)
+    else:
+        output = format_text(facts_data)
+
+    if args.output:
+        try:
+            Path(args.output).write_text(output)
+            logger.info(f"Report written to {args.output}")
+        except IOError as e:
+            logger.error(f"Failed to write output file: {e}")
+            return 1
+    else:
+        print(output)
+
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
 ```
