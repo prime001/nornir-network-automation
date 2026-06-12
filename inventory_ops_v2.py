@@ -1,230 +1,178 @@
 ```python
 """
-Device Uptime and Restart Tracker
+Device Neighbor Discovery and Link Validation Script.
 
-Purpose: Monitor device uptime and detect recent unexpected restarts.
+Discovers neighbors using LLDP/CDP via NAPALM, validates bidirectional
+relationships, and reports potential link issues or topology problems.
 
 Usage:
-  python uptime_tracker.py --config config.yaml --output json
-  python uptime_tracker.py --filter site:dc1 --threshold 24
-  python uptime_tracker.py --devices router1,router2 --verbose
+    python neighbor_validator.py --inventory inventory.yaml --device switch01
+    python neighbor_validator.py --inventory inventory.yaml --username admin --password pass
 
 Prerequisites:
-- Nornir installed and configured with netmiko
-- Credentials in environment (NORNIR_USERNAME, NORNIR_PASSWORD)
-- Device inventory with hostnames reachable via SSH
-
-Output formats: text (default), json, csv
-Threshold: Alert if uptime less than N hours (default 168 = 7 days)
+    - nornir with NAPALM plugin
+    - LLDP/CDP enabled on all network devices
+    - Read-only access to device management interfaces
 """
 
 import argparse
-import json
 import logging
-import sys
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from collections import defaultdict
+from typing import Dict, List
 
 from nornir import InitNornir
-from nornir.core.task import Task
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import napalm_get
 
 
 logger = logging.getLogger(__name__)
 
 
-def parse_uptime(output: str) -> int:
-    """Parse uptime in hours from show version output."""
-    try:
-        # Look for uptime patterns like "10 days, 3 hours" or "3 hours, 45 minutes"
-        lines = output.lower().split('\n')
-        for line in lines:
-            if 'uptime' in line:
-                hours = 0
-                if 'day' in line:
-                    days = int(line.split()[0])
-                    hours += days * 24
-                if 'hour' in line:
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if part.startswith('hour'):
-                            hours += int(parts[i-1])
-                            break
-                return hours
-        return -1
-    except Exception as e:
-        logger.error(f"Failed to parse uptime: {e}")
-        return -1
+def get_neighbors(task: Task) -> Result:
+    """Retrieve LLDP/CDP neighbors using NAPALM."""
+    result = task.run(napalm_get, getters=["lldp_neighbors"])
+    return result
 
 
-def collect_uptime(task: Task) -> Dict:
-    """Collect device uptime information."""
-    device_data = {
-        "name": task.host.name,
-        "hostname": task.host.hostname,
-        "platform": task.host.platform or "unknown",
-        "status": "unreachable",
-        "uptime_hours": None,
-        "error": None
-    }
-    
-    try:
-        result = task.run(netmiko_send_command, command_string="show version")
-        output = result[0].result
-        
-        uptime_hours = parse_uptime(output)
-        if uptime_hours >= 0:
-            device_data["status"] = "reachable"
-            device_data["uptime_hours"] = uptime_hours
+def validate_neighbors(inventory_file: str, device: str = None,
+                      username: str = None, password: str = None) -> None:
+    """
+    Discover and validate device neighbors.
+
+    Args:
+        inventory_file: Path to nornir inventory file
+        device: Specific device to check (optional)
+        username: Override inventory username
+        password: Override inventory password
+    """
+    nr = InitNornir(config_file=inventory_file)
+
+    if device:
+        nr = nr.filter(name=device)
+
+    if username:
+        nr.inventory.defaults.username = username
+    if password:
+        nr.inventory.defaults.password = password
+
+    logger.info(f"Gathering neighbors from {len(nr.inventory.hosts)} devices")
+
+    results = nr.run(task=get_neighbors)
+
+    neighbors_map: Dict[str, List[Dict]] = defaultdict(list)
+    device_neighbors: Dict[str, Dict] = {}
+
+    for host_name, task_result in results.items():
+        if not task_result.failed:
+            try:
+                napalm_result = task_result[0].result
+                neighbors = napalm_result.get("lldp_neighbors", {})
+                device_neighbors[host_name] = neighbors
+
+                for local_iface, remote_list in neighbors.items():
+                    for remote in remote_list:
+                        neighbors_map[host_name].append({
+                            "local_interface": local_iface,
+                            "remote_device": remote["hostname"],
+                            "remote_interface": remote["port"],
+                        })
+                logger.debug(f"{host_name}: Found {len(neighbors_map[host_name])} "
+                           f"neighbors")
+            except Exception as e:
+                logger.error(f"{host_name}: Failed to parse neighbors - {e}")
         else:
-            device_data["status"] = "parse_failed"
-            device_data["error"] = "Could not parse uptime from output"
-            
-    except Exception as e:
-        device_data["status"] = "unreachable"
-        device_data["error"] = str(e)
-        logger.warning(f"Connection failed for {task.host.name}: {e}")
-    
-    return device_data
+            logger.error(f"{host_name}: Task failed - "
+                        f"{task_result[0].exception}")
+
+    print("\n" + "="*80)
+    print("DEVICE NEIGHBOR DISCOVERY REPORT")
+    print("="*80)
+
+    unidirectional = []
+
+    for device_name in sorted(neighbors_map.keys()):
+        print(f"\n{device_name}:")
+        for neighbor in neighbors_map[device_name]:
+            remote = neighbor["remote_device"]
+            local_if = neighbor["local_interface"]
+            remote_if = neighbor["remote_interface"]
+
+            is_bidirectional = False
+            for remote_neighbor in neighbors_map.get(remote, []):
+                if (remote_neighbor["remote_device"] == device_name and
+                    remote_neighbor["remote_interface"] == local_if):
+                    is_bidirectional = True
+                    break
+
+            status = "✓ Bidirectional" if is_bidirectional else "✗ Unidirectional"
+            print(f"  {local_if} -> {remote} {remote_if}  [{status}]")
+
+            if not is_bidirectional:
+                unidirectional.append(
+                    f"{device_name}:{local_if} -> {remote}:{remote_if}"
+                )
+
+    print("\n" + "="*80)
+    print(f"Total devices discovered: {len(neighbors_map)}")
+    total_links = sum(len(n) for n in neighbors_map.values())
+    print(f"Total neighbor relationships: {total_links}")
+
+    if unidirectional:
+        print(f"\nWARNING: {len(unidirectional)} unidirectional link(s) found:")
+        for link in unidirectional:
+            print(f"  - {link}")
+    else:
+        print("\n✓ All discovered links are bidirectional")
+
+    print("="*80)
 
 
-def format_text_output(devices: List[Dict], threshold_hours: int) -> str:
-    """Format output as human-readable text."""
-    lines = [
-        "=" * 80,
-        "Device Uptime and Restart Tracker",
-        f"Threshold: {threshold_hours} hours ({threshold_hours / 24:.1f} days)",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 80,
-        ""
-    ]
-    
-    restarted = []
-    for dev in devices:
-        status_symbol = "✓" if dev["status"] == "reachable" else "✗"
-        lines.append(f"{status_symbol} {dev['name']:<20} ({dev['hostname']})")
-        
-        if dev["status"] == "reachable":
-            hours = dev["uptime_hours"]
-            days = hours // 24
-            remaining_hours = hours % 24
-            lines.append(f"  Uptime: {days}d {remaining_hours}h ({hours}h total)")
-            
-            if hours < threshold_hours:
-                lines.append(f"  ⚠️  ALERT: Uptime below threshold!")
-                restarted.append(dev["name"])
-        else:
-            lines.append(f"  Status: {dev['status']}")
-            if dev["error"]:
-                lines.append(f"  Error: {dev['error'][:60]}")
-        lines.append("")
-    
-    if restarted:
-        lines.append(f"\nDevices with recent restarts: {', '.join(restarted)}")
-    
-    return "\n".join(lines)
-
-
-def format_json_output(devices: List[Dict]) -> str:
-    """Format output as JSON."""
-    return json.dumps(devices, indent=2, default=str)
-
-
-def format_csv_output(devices: List[Dict]) -> str:
-    """Format output as CSV."""
-    lines = ["Name,Hostname,Platform,Status,Uptime_Hours,Error"]
-    for dev in devices:
-        error = dev.get("error", "").replace(",", ";") if dev.get("error") else ""
-        lines.append(
-            f"{dev['name']},{dev['hostname']},{dev['platform']},"
-            f"{dev['status']},{dev['uptime_hours']},{error}"
-        )
-    return "\n".join(lines)
-
-
-def main():
+def main() -> None:
+    """Parse arguments and execute validation."""
     parser = argparse.ArgumentParser(
-        description="Track device uptime and detect unexpected restarts"
+        description="Discover and validate device neighbor relationships"
     )
     parser.add_argument(
-        "-c", "--config",
-        default="config.yaml",
-        help="Nornir config file path (default: config.yaml)"
+        "--inventory",
+        required=True,
+        help="Path to nornir inventory file"
     )
     parser.add_argument(
-        "-f", "--filter",
-        help="Filter devices by attribute (e.g., 'site:dc1', 'role:router')"
+        "--device",
+        help="Specific device to validate (optional)"
     )
     parser.add_argument(
-        "-d", "--devices",
-        help="Comma-separated device names (overrides filter)"
+        "--username",
+        help="Override inventory username"
     )
     parser.add_argument(
-        "-t", "--threshold",
-        type=int,
-        default=168,
-        help="Alert threshold in hours (default: 168 = 7 days)"
+        "--password",
+        help="Override inventory password"
     )
     parser.add_argument(
-        "-o", "--output",
-        choices=["text", "json", "csv"],
-        default="text",
-        help="Output format (default: text)"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging"
     )
-    
+
     args = parser.parse_args()
-    
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    
+
     try:
-        nr = InitNornir(config_file=args.config)
-        
-        if args.devices:
-            device_list = [d.strip() for d in args.devices.split(",")]
-            nr = nr.filter(name=lambda x: x in device_list)
-        elif args.filter:
-            key, value = args.filter.split(":", 1)
-            nr = nr.filter(**{key: value})
-        
-        if not nr.inventory.hosts:
-            logger.error("No devices found matching filter")
-            sys.exit(1)
-        
-        logger.info(f"Collecting uptime from {len(nr.inventory.hosts)} devices")
-        
-        device_data = []
-        for device_name in sorted(nr.inventory.hosts.keys()):
-            host = nr.inventory.hosts[device_name]
-            data = collect_uptime(host)
-            device_data.append(data)
-        
-        if args.output == "json":
-            output = format_json_output(device_data)
-        elif args.output == "csv":
-            output = format_csv_output(device_data)
-        else:
-            output = format_text_output(device_data, args.threshold)
-        
-        print(output)
-        logger.info("Collection complete")
-        
-    except FileNotFoundError:
-        logger.error(f"Config file not found: {args.config}")
-        sys.exit(1)
+        validate_neighbors(
+            args.inventory,
+            device=args.device,
+            username=args.username,
+            password=args.password
+        )
     except Exception as e:
-        logger.error(f"Error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+        logger.error(f"Fatal error: {e}")
+        raise
 
 
 if __name__ == "__main__":
