@@ -1,171 +1,186 @@
-```python
-#!/usr/bin/env python3
-"""
-Device Health Dashboard - Network Device Performance Monitor
+Route Table Filter - Nornir-based routing table collector and filter.
 
-Purpose:
-    Collects and monitors key health metrics from network devices including
-    CPU utilization, memory usage, uptime, and temperature. Compares metrics
-    against configurable thresholds and generates actionable health reports.
+Collects IP routing tables from network devices and filters results by
+routing protocol, destination prefix (with subnet overlap detection), or
+next-hop address. Useful for quickly verifying route propagation across
+a fleet without logging into each device individually.
 
 Usage:
-    python device_health_dashboard.py --inventory config.yaml \
-        --username admin --password secret \
-        --threshold-cpu 80 --threshold-memory 85
+    python 008_route_filter.py --protocol ospf
+    python 008_route_filter.py --prefix 10.0.0.0/8 --hosts router1,router2
+    python 008_route_filter.py --next-hop 192.168.1.1 --group core
+    python 008_route_filter.py --protocol bgp --prefix 0.0.0.0/0
 
 Prerequisites:
-    - nornir >= 3.0
-    - napalm
-    - paramiko or netmiko backend
+    pip install nornir nornir-netmiko nornir-utils
+    Nornir inventory: hosts.yaml, groups.yaml, defaults.yaml (or config.yaml)
+    Devices must support "show ip route" (IOS, IOS-XE, IOS-XR, NX-OS).
 """
 
 import argparse
+import ipaddress
 import logging
-from typing import Dict, Optional
-from dataclasses import dataclass
+import re
+import sys
+from typing import Optional
+
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.tasks.networking import napalm_get
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
 
 
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+PROTOCOL_CODES = {
+    "ospf": ["O", "O IA", "O E1", "O E2", "O N1", "O N2"],
+    "bgp": ["B"],
+    "connected": ["C"],
+    "static": ["S", "S*"],
+    "eigrp": ["D", "D EX"],
+    "rip": ["R"],
+    "isis": ["i", "i L1", "i L2"],
+}
 
-@dataclass
-class HealthMetrics:
-    """Device health measurement snapshot."""
-    hostname: str
-    uptime_seconds: int
-    cpu_usage: Optional[float]
-    memory_usage: Optional[float]
-    health_status: str
-    alerts: list
+_ROUTE_RE = re.compile(
+    r"^[ \t]*([A-Za-z*][ A-Za-z*]{0,5})"
+    r"[ \t]+(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)"
+    r"(?:[^\n]*?via[ \t]+(\d{1,3}(?:\.\d{1,3}){3}))?",
+    re.MULTILINE,
+)
 
 
-def get_device_health(task: Task, thresholds: Dict) -> Result:
-    """Collect and analyze device health metrics via NAPALM."""
+def parse_routes(raw: str) -> list:
+    routes = []
+    for m in _ROUTE_RE.finditer(raw):
+        proto = m.group(1).strip()
+        network = m.group(2)
+        next_hop = m.group(3) or ""
+        if proto and network:
+            routes.append({"protocol": proto, "network": network, "next_hop": next_hop})
+    return routes
+
+
+def collect_routes(task: Task) -> Result:
+    r = task.run(task=netmiko_send_command, command_string="show ip route")
+    return Result(host=task.host, result=parse_routes(r.result))
+
+
+def _overlaps(network: str, target: str) -> bool:
     try:
-        facts_result = task.run(napalm_get, getters=["facts"])
-        facts = facts_result[0].result
-
-        uptime = facts.get("uptime", 0)
-        cpu = facts.get("cpu_utilization", 0)
-        memory = facts.get("memory_usage", {})
-        memory_pct = memory.get("used_percent", 0) if isinstance(memory, dict) else 0
-
-        alerts = []
-        status = "healthy"
-
-        if cpu > thresholds["cpu"]:
-            status = "warning"
-            alerts.append(f"CPU {cpu:.1f}% exceeds threshold {thresholds['cpu']}%")
-
-        if memory_pct > thresholds["memory"]:
-            status = "warning"
-            alerts.append(f"Memory {memory_pct:.1f}% exceeds threshold {thresholds['memory']}%")
-
-        if uptime < thresholds["uptime"]:
-            status = "alert"
-            alerts.append(f"Device recently rebooted: {uptime}s uptime")
-
-        metrics = HealthMetrics(
-            hostname=task.host.name,
-            uptime_seconds=uptime,
-            cpu_usage=cpu,
-            memory_usage=memory_pct,
-            health_status=status,
-            alerts=alerts,
+        return ipaddress.ip_network(network, strict=False).overlaps(
+            ipaddress.ip_network(target, strict=False)
         )
-
-        return Result(host=task.host, result=metrics)
-
-    except Exception as e:
-        logger.error(f"Health check failed for {task.host.name}: {e}")
-        return Result(host=task.host, failed=True, exception=e)
+    except ValueError:
+        return False
 
 
-def format_uptime(seconds: int) -> str:
-    """Convert seconds to human-readable uptime string."""
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    return f"{days}d {hours}h {minutes}m"
+def filter_routes(
+    routes: list,
+    protocol: Optional[str],
+    prefix: Optional[str],
+    next_hop: Optional[str],
+) -> list:
+    out = routes
+
+    if protocol:
+        codes = PROTOCOL_CODES.get(protocol.lower(), [protocol.upper()])
+        out = [r for r in out if any(r["protocol"].startswith(c) for c in codes)]
+
+    if prefix:
+        out = [r for r in out if _overlaps(r["network"], prefix)]
+
+    if next_hop:
+        out = [r for r in out if next_hop in r["next_hop"]]
+
+    return out
 
 
-def print_health_report(results: Dict) -> None:
-    """Print formatted health report from task results."""
-    metrics = [r.result for r in results.values() if r.result and not r.failed]
-
-    if not metrics:
-        print("No metrics collected successfully")
-        return
-
-    healthy = sum(1 for m in metrics if m.health_status == "healthy")
-    warning = sum(1 for m in metrics if m.health_status == "warning")
-    alert = sum(1 for m in metrics if m.health_status == "alert")
-
-    print(f"\n{'='*110}")
-    print(f"{'DEVICE HEALTH DASHBOARD':^110}")
-    print(f"{'='*110}")
-    print(f"\nOverall Status: {healthy} healthy | {warning} warning | {alert} alert\n")
-    print(f"{'Hostname':<25} {'Status':<12} {'CPU %':<12} {'Memory %':<12} {'Uptime':<25}")
-    print(f"{'-'*110}")
-
-    for metric in sorted(metrics, key=lambda x: x.hostname):
-        symbol = "✓" if metric.health_status == "healthy" else ("⚠" if metric.health_status == "warning" else "✗")
-        cpu_str = f"{metric.cpu_usage:.1f}" if metric.cpu_usage is not None else "N/A"
-        mem_str = f"{metric.memory_usage:.1f}" if metric.memory_usage is not None else "N/A"
-
-        print(f"{metric.hostname:<25} {symbol} {metric.health_status:<10} {cpu_str:<11} {mem_str:<11} {format_uptime(metric.uptime_seconds):<25}")
-
-        for alert in metric.alerts:
-            print(f"  ├─ {alert}")
-
-    print(f"{'='*110}\n")
+def _print_table(host: str, routes: list) -> None:
+    print(f"[{host}] {len(routes)} route(s) matched:")
+    print(f"  {'Proto':<10} {'Network':<22} {'Next-Hop'}")
+    print(f"  {'-'*10} {'-'*22} {'-'*16}")
+    for r in routes:
+        print(f"  {r['protocol']:<10} {r['network']:<22} {r['next_hop'] or '(direct)'}")
+    print()
 
 
-def main():
-    """Main execution function."""
-    parser = argparse.ArgumentParser(description="Monitor network device health metrics")
-    parser.add_argument("--inventory", default="config.yaml", help="Nornir inventory config file")
-    parser.add_argument("--hosts", help="Comma-separated list of hostnames to monitor")
-    parser.add_argument("--username", required=True, help="Device username")
-    parser.add_argument("--password", required=True, help="Device password")
-    parser.add_argument("--threshold-cpu", type=float, default=80, help="CPU usage alert threshold %%")
-    parser.add_argument("--threshold-memory", type=float, default=85, help="Memory usage alert threshold %%")
-    parser.add_argument("--threshold-uptime", type=int, default=3600, help="Minimum acceptable uptime in seconds")
-    parser.add_argument("--loglevel", default="INFO", help="Logging level")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Collect and filter IP routing tables across network devices."
+    )
+    p.add_argument("--config", default="config.yaml", help="Nornir config file")
+    p.add_argument("--hosts", help="Comma-separated hostnames to target")
+    p.add_argument("--group", help="Limit to a named inventory group")
+    p.add_argument(
+        "--protocol",
+        choices=list(PROTOCOL_CODES.keys()),
+        metavar="PROTO",
+        help=f"Filter by protocol: {', '.join(PROTOCOL_CODES.keys())}",
+    )
+    p.add_argument("--prefix", metavar="NET/LEN", help="Filter by destination prefix overlap")
+    p.add_argument("--next-hop", dest="next_hop", metavar="IP", help="Filter by next-hop address")
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return p
 
-    args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.loglevel))
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if not any([args.protocol, args.prefix, args.next_hop]):
+        print("error: specify at least one filter: --protocol, --prefix, or --next-hop",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.prefix:
+        try:
+            ipaddress.ip_network(args.prefix, strict=False)
+        except ValueError as exc:
+            print(f"error: invalid prefix '{args.prefix}': {exc}", file=sys.stderr)
+            sys.exit(1)
 
     try:
-        nr = InitNornir(config_file=args.inventory)
+        nr = InitNornir(config_file=args.config)
+    except Exception as exc:
+        logger.error("Nornir init failed: %s", exc)
+        sys.exit(1)
 
-        if args.hosts:
-            hostnames = args.hosts.split(",")
-            nr = nr.filter(name__in=hostnames)
+    if args.hosts:
+        wanted = set(args.hosts.split(","))
+        nr = nr.filter(filter_func=lambda h: h.name in wanted)
+    elif args.group:
+        group = args.group
+        nr = nr.filter(filter_func=lambda h: group in h.groups)
 
-        if not nr.inventory.hosts:
-            logger.warning("No devices found matching filter criteria")
-            return
+    if not nr.inventory.hosts:
+        print("No hosts matched.", file=sys.stderr)
+        sys.exit(1)
 
-        thresholds = {
-            "cpu": args.threshold_cpu,
-            "memory": args.threshold_memory,
-            "uptime": args.threshold_uptime,
-        }
+    print(f"Querying {len(nr.inventory.hosts)} device(s)...\n")
+    results = nr.run(task=collect_routes)
 
-        logger.info(f"Checking health metrics for {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=get_device_health, thresholds=thresholds)
+    any_found = False
+    for host, multi in results.items():
+        if multi.failed:
+            print(f"[{host}] FAILED: {multi.exception}\n")
+            continue
+        matched = filter_routes(multi[0].result, args.protocol, args.prefix, args.next_hop)
+        if not matched:
+            print(f"[{host}] No matching routes.\n")
+        else:
+            any_found = True
+            _print_table(host, matched)
 
-        print_health_report(results)
-
-    except Exception as e:
-        logger.error(f"Execution failed: {e}", exc_info=True)
-        raise
+    if not any_found:
+        print("No matching routes found across any queried device.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
     main()
-```
