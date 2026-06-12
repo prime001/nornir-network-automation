@@ -1,216 +1,125 @@
 ```python
-#!/usr/bin/env python3
 """
-NTP Synchronization Audit Tool
+Device Health Check - Gathers CPU, memory, and uptime metrics.
 
-Audits NTP configuration and synchronization status across network devices.
-Validates NTP peers, checks sync status, and identifies time drift issues.
+Purpose:
+    Collects device health metrics (CPU, memory, uptime) from network devices
+    using NAPALM getters and displays a summary report.
 
 Usage:
-    python ntp_sync_audit.py --all
-    python ntp_sync_audit.py --device router1 --output ntp_report.json
-    python ntp_sync_audit.py --group core --verbose
+    python 009_device_health_check.py --device all --username admin --password secret
 
 Prerequisites:
-    - nornir and nornir-netmiko installed
-    - hosts.yml and groups.yml configured in current directory
-    - Device credentials configured via environment or hosts.yml
-    - Network connectivity to target devices
-
-Returns:
-    0 if all devices synchronized, 1 if sync issues detected
+    - nornir >= 3.0
+    - napalm
+    - nornir inventory (hosts.yaml, groups.yaml)
+    - Device credentials in environment or CLI args
 """
 
-import json
 import logging
 import argparse
-import sys
-import re
-from datetime import datetime
-from typing import Dict, Any, List
-
 from nornir import InitNornir
 from nornir.core.task import Task, Result
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.plugins.tasks.napalm import napalm_get
+from nornir.plugins.functions.text import print_result
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-def parse_ntp_status(output: str) -> Dict[str, Any]:
-    """Parse NTP status output for Cisco devices."""
-    status = {
-        'synchronized': False,
-        'peer_count': 0,
-        'selected_peer': None,
-        'stratum': None,
-        'issues': []
-    }
-    
-    lines = output.split('\n')
-    for line in lines:
-        if 'Clock is' in line:
-            if 'unsynchronized' in line.lower():
-                status['issues'].append('Clock is unsynchronized')
-            elif 'synchronized' in line.lower():
-                status['synchronized'] = True
-        
-        if 'stratum' in line.lower():
-            match = re.search(r'stratum (\d+)', line, re.IGNORECASE)
-            if match:
-                status['stratum'] = int(match.group(1))
-        
-        if 'system peer' in line.lower():
-            parts = line.split()
-            if len(parts) > 2:
-                status['selected_peer'] = parts[-1]
-    
-    return status
-
-
-def audit_ntp(task: Task) -> Result:
-    """Audit NTP configuration and status on a device."""
-    audit = {
-        'hostname': task.host.name,
-        'ip': task.host.get('ip'),
-        'device_type': task.host.get('device_type'),
-        'timestamp': datetime.now().isoformat(),
-        'ntp_enabled': False,
-        'status': {},
-        'peers': [],
-        'errors': []
-    }
-    
+def health_check(task: Task) -> Result:
+    """Gather CPU, memory, and uptime metrics from device."""
     try:
-        config_result = task.run(
-            netmiko_send_command,
-            command_string='show running-config | include ntp'
+        napalm_result = task.run(
+            napalm_get,
+            getters=["get_facts", "get_environment"]
         )
-        config_output = config_result[0].result
         
-        if not config_output or 'ntp' not in config_output.lower():
-            audit['errors'].append('NTP not configured')
-            return Result(host=task.host, result=audit)
+        data = napalm_result.result
+        facts = data.get("get_facts", {})
+        env = data.get("get_environment", {})
         
-        audit['ntp_enabled'] = True
+        health_info = {
+            "hostname": facts.get("hostname", "N/A"),
+            "os_version": facts.get("os_version", "N/A"),
+            "uptime_seconds": facts.get("uptime_seconds", 0),
+            "model": facts.get("model", "N/A"),
+        }
         
-        status_result = task.run(
-            netmiko_send_command,
-            command_string='show ntp status'
-        )
-        status_output = status_result[0].result
-        audit['status'] = parse_ntp_status(status_output)
+        cpu_list = env.get("cpu", {}).get("CPU", [])
+        if cpu_list:
+            health_info["cpu_usage"] = cpu_list[0].get("%usage", "N/A")
         
-        association_result = task.run(
-            netmiko_send_command,
-            command_string='show ntp associations'
-        )
-        association_output = association_result[0].result
+        memory = env.get("memory", {})
+        if memory:
+            health_info["memory_usage"] = memory.get("used_percent", "N/A")
         
-        for line in association_output.split('\n')[3:]:
-            if line.strip() and not line.startswith('~'):
-                parts = line.split()
-                if len(parts) >= 2:
-                    audit['peers'].append({
-                        'address': parts[0],
-                        'reachability': parts[1] if len(parts) > 1 else 'unknown'
-                    })
-        
-        if not audit['peers']:
-            audit['errors'].append('No NTP peers configured')
-        
-        if not audit['status'].get('synchronized'):
-            audit['errors'].append('Device not synchronized to NTP')
-        
-        audit['sync_status'] = 'OK' if not audit['errors'] else 'ISSUES'
-        
-    except Exception as e:
-        logger.warning(f"Error auditing NTP on {task.host.name}: {e}")
-        audit['sync_status'] = 'ERROR'
-        audit['errors'].append(str(e))
+        return Result(host=task.host, result=health_info)
     
-    return Result(host=task.host, result=audit)
+    except Exception as e:
+        logger.error(f"Error on {task.host}: {e}")
+        return Result(
+            host=task.host,
+            result={"error": str(e)},
+            failed=True
+        )
 
 
 def main():
+    """Load inventory and execute health checks."""
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Collect device health metrics"
     )
-    parser.add_argument('--device', help='Single device hostname')
-    parser.add_argument('--group', help='Filter by device group')
-    parser.add_argument('--all', action='store_true', help='Audit all devices')
-    parser.add_argument('--output', help='JSON output file path')
-    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
-    parser.add_argument('--strict', action='store_true', 
-                       help='Fail if any device has NTP issues')
+    parser.add_argument(
+        "--device",
+        default="all",
+        help="Target device or 'all' (default: all)"
+    )
+    parser.add_argument("--username", help="Device username")
+    parser.add_argument("--password", help="Device password")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     
     args = parser.parse_args()
     
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    if not (args.device or args.group or args.all):
-        parser.error('Must specify --device, --group, or --all')
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     
     try:
-        nr = InitNornir(config_file='config.yaml')
+        nr = InitNornir(config_file="config.yaml")
+        
+        if args.device != "all":
+            nr = nr.filter(name=args.device)
+        
+        if args.username:
+            for host in nr.inventory.hosts.values():
+                host.username = args.username
+        
+        if args.password:
+            for host in nr.inventory.hosts.values():
+                host.password = args.password
+        
+        host_count = len(nr.inventory.hosts)
+        logger.info(f"Starting health check on {host_count} device(s)")
+        
+        results = nr.run(task=health_check)
+        print_result(results)
+        
+        passed = sum(1 for r in results.values() if r[0].ok)
+        failed = sum(1 for r in results.values() if not r[0].ok)
+        logger.info(f"Health check complete: {passed} passed, {failed} failed")
+        
+        return 0 if failed == 0 else 1
+    
     except Exception as e:
-        logger.error(f"Nornir initialization failed: {e}")
+        logger.error(f"Fatal error: {e}")
         return 1
-    
-    if args.device:
-        nr = nr.filter(name=args.device)
-    elif args.group:
-        nr = nr.filter(groups__contains=args.group)
-    
-    if len(nr.inventory.hosts) == 0:
-        logger.error('No devices matched filter criteria')
-        return 1
-    
-    logger.info(f'Auditing NTP on {len(nr.inventory.hosts)} device(s)')
-    
-    results = nr.run(task=audit_ntp)
-    
-    audit_results: List[Dict[str, Any]] = []
-    issues_count = 0
-    
-    for host, task_result in results.items():
-        if task_result:
-            result_data = task_result[0].result
-            audit_results.append(result_data)
-            
-            if result_data.get('errors'):
-                issues_count += 1
-                logger.error(f"{host}: {', '.join(result_data['errors'])}")
-            else:
-                logger.info(f"{host}: NTP synchronized")
-    
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(audit_results, f, indent=2)
-        logger.info(f'Audit results saved to {args.output}')
-    else:
-        print(json.dumps(audit_results, indent=2))
-    
-    summary = {
-        'total_devices': len(audit_results),
-        'synchronized': len(audit_results) - issues_count,
-        'with_issues': issues_count,
-        'timestamp': datetime.now().isoformat()
-    }
-    logger.info(f"Summary: {summary}")
-    
-    if args.strict and issues_count > 0:
-        return 1
-    
-    return 0
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    exit(main())
 ```
