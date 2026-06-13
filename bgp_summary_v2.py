@@ -1,40 +1,31 @@
 ```python
 """
-Network device health monitoring using Nornir.
+Device health and system status collector using Nornir.
 
 Purpose:
-    Connects to network devices, gathers health metrics (uptime, OS version,
-    interface status), and generates a health report with problem identification.
+  Collects and reports health metrics from network devices including
+  system uptime, environmental sensors, and device reachability status.
 
 Usage:
-    python device_health.py --inventory hosts.yaml --username admin --password pass
-    python device_health.py -i hosts.yaml -u admin -p pass --device-filter core*
+  python 011_device_health_check.py --devices all
+  python 011_device_health_check.py --devices site1 --output json
 
 Prerequisites:
-    - Nornir installed with nornir_netmiko/nornir_napalm
-    - Inventory file in YAML format with device definitions
-    - Device credentials with read access
-    - Supported platforms: ios, eos, junos, nxos
-
-Inventory format (hosts.yaml):
-    ---
-    all:
-      children:
-        routers:
-          hosts:
-            router1:
-              hostname: 192.168.1.1
-              username: admin
-              password: secret
-              platform: ios
+  - Nornir with NAPALM plugin configured
+  - SSH access to all devices
+  - Inventory properly configured with hosts.yaml and groups.yaml
 """
 
-import logging
 import argparse
+import json
+import logging
+from datetime import datetime
+
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import napalm_get
 from nornir.core.filter import F
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,127 +34,155 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def check_device_health(task: Task) -> Result:
+def collect_health(task: Task) -> Result:
     """Gather device health metrics using NAPALM."""
-    health_data = {
-        "name": task.host.name,
-        "reachable": False,
-        "facts": {},
-        "problem_interfaces": [],
-        "errors": []
-    }
-
     try:
+        logger.info(f"Collecting health from {task.host.name}...")
+        
         facts_result = task.run(napalm_get, getters=["facts"])
-        health_data["facts"] = facts_result[0].result.get("facts", {})
-
-        interfaces_result = task.run(napalm_get, getters=["interfaces"])
-        all_interfaces = interfaces_result[0].result.get("interfaces", {})
-
-        for iface_name, iface_data in all_interfaces.items():
-            if not iface_data.get("is_up"):
-                health_data["problem_interfaces"].append(iface_name)
-
-        health_data["reachable"] = True
-
+        env_result = task.run(napalm_get, getters=["environment"])
+        
+        facts = facts_result[0].result.get("facts", {})
+        environment = env_result[0].result.get("environment", {})
+        
+        status = "HEALTHY"
+        uptime = facts.get("uptime_seconds", 0)
+        
+        if uptime < 3600:
+            status = "CRITICAL"
+        
+        for psu_name, psu_data in environment.get("power", {}).items():
+            if isinstance(psu_data, dict) and not psu_data.get("status", True):
+                status = "CRITICAL"
+        
+        for fan_name, fan_data in environment.get("fans", {}).items():
+            if isinstance(fan_data, dict) and not fan_data.get("status", True):
+                status = "WARNING"
+        
+        return Result(
+            host=task.host,
+            result={
+                "device": task.host.name,
+                "reachable": True,
+                "status": status,
+                "uptime_seconds": uptime,
+                "model": facts.get("model", "Unknown"),
+                "os_version": facts.get("os_version", "Unknown"),
+                "serial_number": facts.get("serial_number", "Unknown"),
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+    
     except Exception as e:
-        health_data["errors"].append(str(e))
-        logger.warning(f"Error querying {task.host.name}: {e}")
+        logger.error(f"Failed to collect health from {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={
+                "device": task.host.name,
+                "reachable": False,
+                "status": "UNREACHABLE",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+            },
+            failed=True,
+        )
 
-    return Result(host=task.host, result=health_data)
 
-
-def format_uptime(seconds):
-    """Convert uptime seconds to human-readable format."""
-    if not seconds:
-        return "N/A"
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
+def format_text_report(results):
+    """Format results as human-readable text."""
+    lines = ["=" * 70, "DEVICE HEALTH REPORT", "=" * 70]
+    
+    healthy_count = unreachable_count = warning_count = critical_count = 0
+    
+    for host_name, multi_result in sorted(results.items()):
+        data = multi_result[0].result
+        status = data.get("status", "UNKNOWN")
+        
+        if status == "HEALTHY":
+            healthy_count += 1
+            symbol = "✓"
+        elif status == "CRITICAL":
+            critical_count += 1
+            symbol = "✗"
+        elif status == "WARNING":
+            warning_count += 1
+            symbol = "⚠"
+        else:
+            unreachable_count += 1
+            symbol = "○"
+        
+        lines.append(f"\n{symbol} {host_name}: {status}")
+        
+        if data.get("reachable"):
+            lines.append(f"  Model: {data.get('model')}")
+            lines.append(f"  OS: {data.get('os_version')}")
+            lines.append(f"  Uptime: {data.get('uptime_seconds')} seconds")
+        else:
+            lines.append(f"  Error: {data.get('error')}")
+    
+    lines.extend([
+        "\n" + "=" * 70,
+        f"Summary: {healthy_count} healthy, {warning_count} warning, "
+        f"{critical_count} critical, {unreachable_count} unreachable",
+    ])
+    
+    return "\n".join(lines)
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Monitor network device health and generate report"
+        description="Collect device health and status metrics"
     )
     parser.add_argument(
-        "-i", "--inventory",
-        default="hosts.yaml",
-        help="Path to Nornir inventory file"
+        "--devices",
+        default="all",
+        help="Device or group filter (default: all)",
     )
     parser.add_argument(
-        "-u", "--username",
-        required=True,
-        help="Username for device authentication"
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format",
     )
     parser.add_argument(
-        "-p", "--password",
-        required=True,
-        help="Password for device authentication"
-    )
-    parser.add_argument(
-        "-f", "--device-filter",
-        help="Filter devices by name pattern"
+        "--output-file",
+        help="Write output to file",
     )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable verbose logging"
+        help="Enable verbose logging",
     )
-
+    
     args = parser.parse_args()
-
+    
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    try:
-        nr = InitNornir(config_file=args.inventory)
-
-        if args.device_filter:
-            nr = nr.filter(F(name__contains=args.device_filter))
-
-        logger.info(f"Starting health check on {len(nr.inventory.hosts)} device(s)")
-
-        results = nr.run(task=check_device_health)
-
-        print("\n" + "=" * 80)
-        print("NETWORK DEVICE HEALTH REPORT")
-        print("=" * 80)
-
-        healthy_count = 0
-        for host_name in sorted(results.keys()):
-            multi_result = results[host_name]
-            health = multi_result[0].result
-
-            if health["reachable"]:
-                healthy_count += 1
-                facts = health["facts"]
-                has_issues = len(health["problem_interfaces"]) > 0
-                status = "⚠ ISSUES" if has_issues else "✓ HEALTHY"
-
-                print(f"\n[{status}] {host_name}")
-                print(f"  OS Version: {facts.get('os_version', 'N/A')}")
-                print(f"  Uptime:     {format_uptime(facts.get('uptime_seconds'))}")
-                print(f"  Vendor:     {facts.get('vendor', 'N/A')}")
-
-                if health["problem_interfaces"]:
-                    print(f"  Down Interfaces: {', '.join(health['problem_interfaces'])}")
-            else:
-                print(f"\n[✗ UNREACHABLE] {host_name}")
-                for error in health["errors"]:
-                    print(f"  Error: {error}")
-
-        print("\n" + "=" * 80)
-        print(f"Summary: {healthy_count}/{len(nr.inventory.hosts)} devices reachable")
-        print("=" * 80 + "\n")
-
-    except FileNotFoundError as e:
-        logger.error(f"Inventory file not found: {args.inventory}")
-        raise
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
-        raise
+        logger.setLevel(logging.DEBUG)
+    
+    logger.info("Initializing Nornir...")
+    nr = InitNornir(config_file="config.yaml")
+    
+    if args.devices != "all":
+        nr = nr.filter(F(groups__contains=args.devices) | F(name=args.devices))
+    
+    logger.info(f"Collecting health from {len(nr.inventory.hosts)} device(s)...")
+    results = nr.run(task=collect_health)
+    
+    if args.output == "json":
+        output = json.dumps(
+            {h: r[0].result for h, r in results.items()},
+            indent=2
+        )
+    else:
+        output = format_text_report(results)
+    
+    print(output)
+    
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            f.write(output)
+        logger.info(f"Output written to {args.output_file}")
 
 
 if __name__ == "__main__":
