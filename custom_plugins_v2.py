@@ -1,236 +1,222 @@
 ```python
+#!/usr/bin/env python3
 """
-Device Health Monitor
-
-Gathers and reports health metrics from network devices using Nornir.
+Device Reachability and Basic Facts Collector
 
 Purpose:
-    Monitor device connectivity, reachability, and basic health across the
-    network inventory. Collects device information and validates SSH/Netmiko
-    connectivity. Useful for identifying unreachable devices and basic health
-    status before running operational tasks.
+  Validates device reachability and collects basic facts (hostname, model,
+  version, serial number) from network devices. Useful for asset inventory,
+  device health monitoring, and network discovery tasks.
 
 Usage:
-    python device_health_monitor.py --devices all
-    python device_health_monitor.py --devices rtr-core-01,rtr-core-02
-    python device_health_monitor.py --devices all --format json
-    python device_health_monitor.py --devices all --verbose
+  python3 010_device_facts_collector.py --target-group core --username admin
+  python3 010_device_facts_collector.py --device router1 --username admin --password secret
 
 Prerequisites:
-    - Nornir installed with netmiko connection plugin
-    - config.yaml with inventory settings
-    - hosts.yaml with device definitions
-    - SSH credentials configured (username/password in group_vars or env)
-    - Network connectivity to target devices
+  - Nornir installed with netmiko transport
+  - Devices support 'show version' command (Cisco IOS/IOS-XE preferred)
+  - Inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
+  - SSH access to devices
+
+Example:
+  $ python3 010_device_facts_collector.py --target-group access --username netadmin
+  Device: switch1
+    Status: REACHABLE
+    Model: Cisco Catalyst 2960X
+    Version: 15.2(4)E6
+    Serial: ABC123456789
+  
+  Device: switch2
+    Status: UNREACHABLE
+    Error: Connection timeout
 """
 
 import argparse
-import json
 import logging
-import sys
-from typing import Any, Dict
-
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
+from nornir.plugins.tasks.networking import netmiko_send_command
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+def setup_logging(verbose: bool) -> logging.Logger:
+    """Configure logging."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    return logging.getLogger(__name__)
 
 
-def check_device_health(task: Task) -> Result:
-    """Check device connectivity and gather basic health information."""
-    health_data = {
-        "device": task.host.name,
-        "hostname": task.host.hostname,
-        "platform": task.host.get("platform", "unknown"),
-        "status": "unknown",
+def extract_version_info(output: str, platform: str) -> dict:
+    """Extract device info from show version output."""
+    info = {"model": "Unknown", "version": "Unknown", "serial": "Unknown"}
+    
+    lines = output.split("\n")
+    for line in lines:
+        if "Model Number" in line or "Chassis Type" in line:
+            info["model"] = line.split()[-1].rstrip(",")
+        elif "Software Version" in line or ("Version" in line and "IOS" in line):
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if "Version" in part and i + 1 < len(parts):
+                    info["version"] = parts[i + 1].rstrip(",")
+        elif "Processor board ID" in line or "System Serial Number" in line:
+            info["serial"] = line.split()[-1].rstrip(",")
+    
+    return info
+
+
+def collect_device_facts(task, **kwargs):
+    """Gather device facts via netmiko."""
+    device_name = task.host.name
+    platform = task.host.platform or "unknown"
+    
+    result = {
+        "device": device_name,
+        "status": "UNKNOWN",
+        "model": "N/A",
+        "version": "N/A",
+        "serial": "N/A",
+        "error": None,
     }
-
+    
     try:
-        cmd = task.host.get("health_check_cmd", "show version")
-        output = task.host.send_command(cmd)
-
-        if output and len(output) > 0:
-            health_data["status"] = "healthy"
-            health_data["connected"] = True
-            health_data["response_length"] = len(output)
-
-            if "uptime" in output.lower():
-                health_data["uptime_available"] = True
+        cmd_result = task.run(
+            netmiko_send_command,
+            command_string="show version",
+        )
+        
+        if cmd_result[0].failed:
+            result["status"] = "FAILED"
+            result["error"] = "Command execution failed"
         else:
-            health_data["status"] = "degraded"
-            health_data["connected"] = True
-            health_data["response_length"] = 0
-
-        return Result(host=task.host, result=health_data)
-
+            version_output = cmd_result[0].result
+            info = extract_version_info(version_output, platform)
+            result.update({
+                "status": "REACHABLE",
+                "model": info["model"],
+                "version": info["version"],
+                "serial": info["serial"],
+            })
     except Exception as e:
-        health_data["status"] = "unreachable"
-        health_data["connected"] = False
-        health_data["error"] = str(e)
-        logger.warning(f"Device {task.host.name} unreachable: {e}")
-        return Result(host=task.host, result=health_data, failed=True)
+        result["status"] = "UNREACHABLE"
+        result["error"] = str(e)
+    
+    return result
 
 
-def validate_device_config(task: Task) -> Result:
-    """Validate device has required attributes for operation."""
-    validation = {
-        "device": task.host.name,
-        "valid": True,
-        "issues": [],
-    }
+def print_results(results: dict) -> None:
+    """Print formatted results."""
+    print("\n" + "=" * 70)
+    print("DEVICE FACTS COLLECTION REPORT")
+    print("=" * 70)
+    
+    reachable = 0
+    unreachable = 0
+    
+    for hostname, task_result in results.items():
+        if task_result.result is None:
+            continue
+        
+        data = task_result.result
+        status_ok = data["status"] == "REACHABLE"
+        symbol = "✓" if status_ok else "✗"
+        
+        print(f"\n{symbol} Device: {data['device']}")
+        print(f"  Status: {data['status']}")
+        print(f"  Model: {data['model']}")
+        print(f"  Version: {data['version']}")
+        print(f"  Serial: {data['serial']}")
+        
+        if data["error"]:
+            print(f"  Error: {data['error']}")
+        
+        if status_ok:
+            reachable += 1
+        else:
+            unreachable += 1
+    
+    print("\n" + "=" * 70)
+    print(f"Summary: {reachable} reachable, {unreachable} unreachable")
+    print("=" * 70 + "\n")
 
-    if not task.host.hostname:
-        validation["valid"] = False
-        validation["issues"].append("Missing hostname")
 
-    if not task.host.get("platform"):
-        validation["valid"] = False
-        validation["issues"].append("Missing platform definition")
-
-    return Result(host=task.host, result=validation)
-
-
-def parse_arguments() -> argparse.Namespace:
-    """Parse CLI arguments."""
+def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Check health and connectivity of network devices",
+        description="Collect device facts and validate reachability"
     )
     parser.add_argument(
-        "--devices",
+        "--target-group",
         type=str,
-        default="all",
-        help="Device(s) to check: 'all' or comma-separated names",
+        help="Target group name from inventory",
     )
     parser.add_argument(
-        "--format",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (text or json)",
+        "--device",
+        type=str,
+        help="Single device hostname to check",
+    )
+    parser.add_argument(
+        "--username",
+        type=str,
+        required=True,
+        help="Network device username",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        help="Network device password",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Connection timeout in seconds (default: 30)",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable debug logging",
+        help="Enable verbose logging",
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="Nornir config file path",
-    )
-
-    return parser.parse_args()
-
-
-def format_text_report(results: Dict[str, Any]) -> str:
-    """Format results as text report."""
-    lines = [
-        "\n" + "=" * 80,
-        "DEVICE HEALTH CHECK REPORT",
-        "=" * 80,
-        f"{'Device':<25} {'Platform':<15} {'Status':<12} {'Error':<30}",
-        "-" * 80,
-    ]
-
-    for device_name in sorted(results.keys()):
-        for task_result in results[device_name]:
-            if task_result.result:
-                device = task_result.result.get("device", device_name)
-                platform = task_result.result.get("platform", "N/A")
-                status = task_result.result.get("status", "unknown")
-                error = task_result.result.get("error", "")
-
-                lines.append(
-                    f"{device:<25} {platform:<15} {status:<12} {error:<30}",
-                )
-
-    lines.append("=" * 80 + "\n")
-    return "\n".join(lines)
-
-
-def format_json_report(results: Dict[str, Any]) -> str:
-    """Format results as JSON."""
-    output = {}
-
-    for device_name in results.keys():
-        for task_result in results[device_name]:
-            if task_result.result:
-                output[device_name] = task_result.result
-
-    return json.dumps(output, indent=2)
-
-
-def main():
-    """Main execution function."""
-    args = parse_arguments()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
-
+    
+    args = parser.parse_args()
+    logger = setup_logging(args.verbose)
+    
     try:
-        logger.info(f"Loading Nornir configuration from {args.config}")
-        nr = InitNornir(config_file=args.config)
-
-    except FileNotFoundError as e:
-        logger.error(f"Configuration file not found: {args.config}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to initialize Nornir: {e}")
-        sys.exit(1)
-
-    try:
-        if args.devices != "all":
-            device_list = [d.strip() for d in args.devices.split(",")]
-            logger.info(f"Filtering to devices: {device_list}")
-            nr = nr.filter(F(name__any=device_list))
-
-        if len(nr.inventory.hosts) == 0:
-            logger.error("No devices matched the filter")
-            sys.exit(1)
-
-        logger.info(f"Starting health check on {len(nr.inventory.hosts)} devices")
-
-        results = nr.run(task=check_device_health)
-
-        healthy = sum(
-            1
-            for device_results in results.values()
-            for task_result in device_results
-            if task_result.result and task_result.result.get("status") == "healthy"
-        )
-        unreachable = sum(
-            1
-            for device_results in results.values()
-            for task_result in device_results
-            if task_result.result and task_result.result.get("status") == "unreachable"
-        )
-
-        if args.format == "json":
-            output = format_json_report(results)
+        nr = InitNornir(config_file="config.yaml")
+        
+        if args.device:
+            nr = nr.filter(name=args.device)
+        elif args.target_group:
+            nr = nr.filter(F(groups__contains=args.target_group))
         else:
-            output = format_text_report(results)
-
-        print(output)
-
-        logger.info(
-            f"Health check complete: {healthy} healthy, {unreachable} unreachable",
-        )
-
-        if unreachable > 0:
-            sys.exit(1)
-
+            logger.error("Must specify --device or --target-group")
+            return 1
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices matched filter criteria")
+            return 1
+        
+        for host in nr.inventory.hosts.values():
+            host.username = args.username
+            if args.password:
+                host.password = args.password
+            host.conn_timeout = args.timeout
+        
+        logger.info(f"Collecting facts from {len(nr.inventory.hosts)} device(s)")
+        
+        results = nr.run(task=collect_device_facts)
+        
+        print_results(results)
+        
+        return 0
+        
     except Exception as e:
-        logger.error(f"Health check failed: {e}", exc_info=args.verbose)
-        sys.exit(1)
+        logger.error(f"Fatal error: {e}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
