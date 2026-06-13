@@ -1,223 +1,210 @@
 ```python
+#!/usr/bin/env python3
 """
-routing_snapshot.py - Network Routing Table Snapshot and Analysis
+Device Health Monitor - Network device CPU, memory, and uptime tracking.
 
-Purpose:
-    Collect routing tables from network devices using Nornir, group results
-    by device group, and produce a summary showing route counts by protocol
-    (static, OSPF, BGP, EIGRP, connected) with optional prefix search.
+Monitors critical health metrics across network devices and generates health
+reports with threshold-based alerting for operational compliance.
 
 Usage:
-    python routing_snapshot.py
-    python routing_snapshot.py --groups core,distribution --search 10.0.0.0/8
-    python routing_snapshot.py --platform ios --vrf MGMT --output snapshot.json
+    python device_health_monitor.py --inventory inventory.yaml --threshold-cpu 80
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-    Nornir inventory files: hosts.yaml, groups.yaml, defaults.yaml
-    SSH access to target devices with credentials in inventory or via CLI flags
+    - nornir installed with netmiko plugin
+    - Device inventory configured with device_type (ios, eos, junos, etc.)
+    - Device credentials in environment or inventory
+
+Output:
+    - Console report with health status per device
+    - Exit code 1 if thresholds exceeded, 0 if healthy
 """
 
 import argparse
-import json
 import logging
 import sys
-from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, Any
 
 from nornir import InitNornir
-from nornir.core import Nornir
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
+from nornir.core.task import Task, Result
+from nornir.tasks.networking import netmiko_send_command
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-PROTOCOL_CODES = {
-    "S": "static",
-    "O": "ospf",
-    "B": "bgp",
-    "D": "eigrp",
-    "C": "connected",
-    "L": "local",
-    "i": "isis",
-    "R": "rip",
-}
-
-
-def collect_routing_table(task: Task, vrf: str = "default") -> Result:
-    cmd = "show ip route" if vrf == "default" else f"show ip route vrf {vrf}"
-    result = task.run(task=netmiko_send_command, command_string=cmd)
-    return Result(host=task.host, result=result.result)
-
-
-def parse_route_counts(output: str) -> Dict[str, int]:
-    counts: Dict[str, int] = defaultdict(int)
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("Codes", "Gateway", "#")):
-            continue
-        proto = PROTOCOL_CODES.get(stripped[0])
-        if proto:
-            counts[proto] += 1
-    return dict(counts)
-
-
-def find_prefix_matches(output: str, prefix: str) -> List[str]:
-    return [line.strip() for line in output.splitlines() if prefix in line]
-
-
-def init_nornir(
-    inventory: str,
-    groups_file: str,
-    defaults_file: str,
-    username: Optional[str],
-    password: Optional[str],
-    groups_filter: Optional[List[str]],
-    platform_filter: Optional[str],
-) -> Nornir:
-    nr = InitNornir(
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": inventory,
-                "group_file": groups_file,
-                "defaults_file": defaults_file,
-            },
-        },
-        logging={"enabled": False},
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    if username:
-        nr.inventory.defaults.username = username
-    if password:
-        nr.inventory.defaults.password = password
-    if groups_filter:
-        nr = nr.filter(lambda h: any(g in h.groups for g in groups_filter))
-    if platform_filter:
-        nr = nr.filter(platform=platform_filter)
-    return nr
 
 
-def print_summary(summary: Dict[str, dict], vrf: str, search: Optional[str]) -> None:
-    print(f"\n{'='*65}")
-    print(f"Routing Table Summary — VRF: {vrf}")
-    print(f"{'='*65}")
-
-    by_group: Dict[str, List[str]] = defaultdict(list)
-    for hostname, data in summary.items():
-        for grp in data.get("groups") or ["(ungrouped)"]:
-            by_group[grp].append(hostname)
-
-    header = f"  {'Host':<25} {'Total':>7}  {'Connected':>10}  {'OSPF':>6}  {'BGP':>5}  {'Static':>7}"
-    divider = f"  {'-'*25} {'-'*7}  {'-'*10}  {'-'*6}  {'-'*5}  {'-'*7}"
-
-    for group in sorted(by_group):
-        print(f"\nGroup: {group}")
-        print(header)
-        print(divider)
-        for hostname in by_group[group]:
-            d = summary[hostname]
-            rc = d["route_counts"]
-            print(
-                f"  {hostname:<25} {d['total_routes']:>7}"
-                f"  {rc.get('connected', 0):>10}"
-                f"  {rc.get('ospf', 0):>6}"
-                f"  {rc.get('bgp', 0):>5}"
-                f"  {rc.get('static', 0):>7}"
-            )
-            if search and "prefix_search" in d:
-                ps = d["prefix_search"]
-                status = "FOUND" if ps["found"] else "not found"
-                print(f"    [{search}] {status}")
-                for match in ps["matches"]:
-                    print(f"      {match}")
+def parse_metrics(device_type: str, show_version: str, show_cpu: str) -> Dict[str, Any]:
+    """Extract CPU, memory, and uptime from device output."""
+    metrics = {"cpu": None, "memory": None, "uptime": None}
+    
+    combined = show_version + "\n" + show_cpu
+    for line in combined.split("\n"):
+        if "uptime is" in line.lower():
+            metrics["uptime"] = line.strip()
+        
+        if "cpu" in line.lower() and "%" in line:
+            parts = line.split()
+            for part in parts:
+                if "%" in part:
+                    try:
+                        metrics["cpu"] = float(part.rstrip("%"))
+                        break
+                    except ValueError:
+                        pass
+        
+        if "memory" in line.lower() and "%" in line:
+            parts = line.split()
+            for part in parts:
+                if "%" in part:
+                    try:
+                        metrics["memory"] = float(part.rstrip("%"))
+                        break
+                    except ValueError:
+                        pass
+    
+    return metrics
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Collect and analyze routing tables across network devices"
-    )
-    parser.add_argument("--inventory", default="hosts.yaml")
-    parser.add_argument("--groups-file", default="groups.yaml")
-    parser.add_argument("--defaults-file", default="defaults.yaml")
-    parser.add_argument("--username", help="Override inventory username")
-    parser.add_argument("--password", help="Override inventory password")
-    parser.add_argument("--groups", help="Comma-separated Nornir groups to target")
-    parser.add_argument("--platform", help="Filter by platform (e.g. ios, eos)")
-    parser.add_argument("--vrf", default="default", help="VRF to query")
-    parser.add_argument("--search", metavar="PREFIX", help="Search for a prefix in results")
-    parser.add_argument("--output", help="Write full results to JSON file")
-    parser.add_argument("--verbose", action="store_true", help="Include raw output in JSON")
-    args = parser.parse_args()
-
-    groups_filter = [g.strip() for g in args.groups.split(",")] if args.groups else None
-
+def collect_health(task: Task, cpu_threshold: float, mem_threshold: float) -> Result:
+    """Collect health metrics from device."""
+    host = task.host
+    
     try:
-        nr = init_nornir(
-            inventory=args.inventory,
-            groups_file=args.groups_file,
-            defaults_file=args.defaults_file,
-            username=args.username,
-            password=args.password,
-            groups_filter=groups_filter,
-            platform_filter=args.platform,
+        version_resp = task.run(netmiko_send_command, command_string="show version")
+        version_out = version_resp[0].result if version_resp else ""
+        
+        cpu_cmd = (
+            "show processes cpu | include CPU utilization"
+            if "ios" in host.device_type.lower()
+            else "show system resources | grep -i cpu"
         )
-    except Exception as exc:
-        logger.error("Failed to initialize inventory: %s", exc)
-        sys.exit(1)
+        
+        cpu_resp = task.run(netmiko_send_command, command_string=cpu_cmd)
+        cpu_out = cpu_resp[0].result if cpu_resp else ""
+        
+        metrics = parse_metrics(host.device_type, version_out, cpu_out)
+        
+        alerts = []
+        if metrics["cpu"] is not None and metrics["cpu"] > cpu_threshold:
+            alerts.append(f"CPU: {metrics['cpu']:.1f}% (threshold: {cpu_threshold}%)")
+        if metrics["memory"] is not None and metrics["memory"] > mem_threshold:
+            alerts.append(f"Memory: {metrics['memory']:.1f}% (threshold: {mem_threshold}%)")
+        
+        return Result(
+            host=host,
+            result={
+                "hostname": host.name,
+                "device_type": host.device_type,
+                "cpu": metrics["cpu"],
+                "memory": metrics["memory"],
+                "uptime": metrics["uptime"],
+                "status": "CRITICAL" if alerts else "HEALTHY",
+                "alerts": alerts,
+            },
+        )
+    except Exception as e:
+        logging.error(f"Error collecting health for {host.name}: {e}")
+        return Result(
+            host=host,
+            result={"hostname": host.name, "status": "ERROR", "error": str(e)},
+            failed=True,
+        )
 
-    if not nr.inventory.hosts:
-        logger.error("No hosts matched the specified filters.")
-        sys.exit(1)
 
-    logger.info("Targeting %d host(s)", len(nr.inventory.hosts))
-    results = nr.run(task=collect_routing_table, vrf=args.vrf)
-
-    summary: Dict[str, dict] = {}
-    failed: List[str] = []
-
-    for hostname, multi_result in results.items():
-        if multi_result.failed:
-            logger.warning("Collection failed for %s: %s", hostname, multi_result[0].exception)
-            failed.append(hostname)
-            continue
-
-        raw = multi_result[0].result
-        route_counts = parse_route_counts(raw)
-        host_data: Dict = {
-            "groups": [str(g) for g in nr.inventory.hosts[hostname].groups],
-            "platform": nr.inventory.hosts[hostname].platform,
-            "route_counts": route_counts,
-            "total_routes": sum(route_counts.values()),
-        }
-        if args.search:
-            matches = find_prefix_matches(raw, args.search)
-            host_data["prefix_search"] = {"query": args.search, "matches": matches, "found": bool(matches)}
-        if args.verbose:
-            host_data["raw_output"] = raw
-        summary[hostname] = host_data
-
-    print_summary(summary, args.vrf, args.search)
-
-    print(f"\n{'='*65}")
-    print(f"Total: {len(summary)} succeeded, {len(failed)} failed")
-    if failed:
-        print(f"Failed hosts: {', '.join(failed)}")
-
-    if args.output:
-        try:
-            with open(args.output, "w") as fh:
-                json.dump(summary, fh, indent=2)
-            logger.info("Results written to %s", args.output)
-        except OSError as exc:
-            logger.error("Could not write output file: %s", exc)
-            sys.exit(1)
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Monitor network device health metrics",
+    )
+    parser.add_argument(
+        "--inventory",
+        default="inventory.yaml",
+        help="Path to nornir inventory file",
+    )
+    parser.add_argument(
+        "--threshold-cpu",
+        type=float,
+        default=80.0,
+        help="CPU threshold percentage (default: 80)",
+    )
+    parser.add_argument(
+        "--threshold-memory",
+        type=float,
+        default=85.0,
+        help="Memory threshold percentage (default: 85)",
+    )
+    parser.add_argument(
+        "--group",
+        help="Filter devices by inventory group",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Verbose logging",
+    )
+    
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+    logger = logging.getLogger(__name__)
+    
+    try:
+        nr = InitNornir(config_file=args.inventory)
+        if args.group:
+            nr = nr.filter(group=args.group)
+        
+        logger.info(f"Monitoring {len(nr.inventory.hosts)} devices")
+        
+        results = nr.run(
+            task=collect_health,
+            cpu_threshold=args.threshold_cpu,
+            mem_threshold=args.threshold_memory,
+            num_workers=4,
+        )
+        
+        print("\n" + "=" * 80)
+        print("DEVICE HEALTH REPORT")
+        print("=" * 80)
+        
+        critical = error = 0
+        
+        for host in sorted(results.keys()):
+            data = results[host][0].result
+            status = data.get("status", "UNKNOWN")
+            
+            if status == "ERROR":
+                error += 1
+                print(f"\n{host}: ERROR - {data.get('error')}")
+            else:
+                if status == "CRITICAL":
+                    critical += 1
+                
+                print(f"\n{host}: {status}")
+                print(f"  Device Type: {data.get('device_type')}")
+                
+                if data.get("cpu") is not None:
+                    print(f"  CPU: {data['cpu']:.1f}%")
+                if data.get("memory") is not None:
+                    print(f"  Memory: {data['memory']:.1f}%")
+                if data.get("uptime"):
+                    print(f"  Uptime: {data['uptime']}")
+                
+                for alert in data.get("alerts", []):
+                    print(f"  ALERT: {alert}")
+        
+        print("\n" + "=" * 80)
+        print(f"Summary: {critical} critical, {error} errors out of {len(nr.inventory.hosts)} devices")
+        print("=" * 80)
+        
+        return 1 if (critical > 0 or error > 0) else 0
+    
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
