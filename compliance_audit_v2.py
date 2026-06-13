@@ -1,180 +1,162 @@
 ```python
 """
-Device Facts Collector - Network Automation Portfolio Script
+Network Topology Discovery using LLDP/CDP.
 
 Purpose:
-    Collects and reports device facts (OS version, uptime, serial number, model)
-    from network devices using nornir and NAPALM. Useful for inventory audits,
-    capacity planning, and firmware management tracking.
+    Discovers network device neighbors using LLDP or CDP protocol and generates
+    a topology map showing device interconnections. Useful for understanding
+    network structure and identifying potential connectivity issues.
 
 Usage:
-    python device_facts.py -i inventory/ [-d "device1,device2"] [-f json]
+    python topology_discovery.py --inventory inventory.yaml
+    python topology_discovery.py --devices "core|dist" --output topology.json
 
 Prerequisites:
-    - nornir and napalm installed
-    - Inventory directory with hosts.yaml and defaults.yaml configured
-    - Device SSH credentials accessible via environment or inventory
-    - NAPALM driver support for target device types
-
-Output:
-    Generates device facts report in text, JSON, or CSV format.
+    - Nornir installed: pip install nornir nornir-netmiko napalm
+    - Devices accessible via SSH
+    - LLDP or CDP enabled on network devices
 """
 
 import argparse
 import json
 import logging
-from pathlib import Path
+from typing import Dict, List, Any
+
 from nornir import InitNornir
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.core.task import Result, Task
+from nornir.tasks.networking import napalm_get
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
-def get_device_facts(task):
-    """Retrieve device facts using NAPALM get_facts."""
-    task.run(task=napalm_get, getters=["facts"])
-
-
-def collect_facts(nr):
-    """Execute facts collection across inventory."""
-    results = nr.run(task=get_device_facts)
-    facts_data = {}
-
-    for host, result in results.items():
-        if result.failed:
-            facts_data[host] = {"error": str(result[0].exception)}
-            logger.warning(f"Failed to collect facts from {host}")
-        else:
-            try:
-                facts = result[0].result["facts"]
-                facts_data[host] = {
-                    "vendor": facts.get("vendor", "N/A"),
-                    "model": facts.get("model", "N/A"),
-                    "os_version": facts.get("os_version", "N/A"),
-                    "serial_number": facts.get("serial_number", "N/A"),
-                    "uptime_seconds": facts.get("uptime_seconds", 0),
-                    "hostname": facts.get("hostname", host),
+def discover_neighbors(task: Task) -> Result:
+    """
+    Discover LLDP neighbors for a device.
+    
+    Args:
+        task: Nornir task object
+    
+    Returns:
+        Result object containing neighbor information
+    """
+    try:
+        lldp_result = task.run(napalm_get, getters=["lldp_neighbors"])
+        neighbors = lldp_result[0].result.get("lldp_neighbors", {})
+        
+        parsed_neighbors = {}
+        for local_port, remote_devices in neighbors.items():
+            for remote_device in remote_devices:
+                parsed_neighbors[local_port] = {
+                    "remote_device": remote_device.get("hostname", "unknown"),
+                    "remote_port": remote_device.get("port", "unknown"),
                 }
-            except (KeyError, TypeError) as e:
-                facts_data[host] = {"error": f"Parse error: {str(e)}"}
-                logger.warning(f"Error parsing facts from {host}: {e}")
+        
+        return Result(host=task.host, result=parsed_neighbors)
+    
+    except Exception as e:
+        logger.warning(f"LLDP discovery failed on {task.host}: {e}")
+        return Result(host=task.host, result={})
 
-    return facts_data
+
+def build_topology_map(results: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
+    """Build network topology from discovered neighbors."""
+    topology = {}
+    
+    for host, result in results.items():
+        if result[0].result:
+            topology[host] = []
+            for local_port, neighbor_info in result[0].result.items():
+                topology[host].append({
+                    "local_port": local_port,
+                    "remote_host": neighbor_info["remote_device"],
+                    "remote_port": neighbor_info["remote_port"]
+                })
+    
+    return topology
 
 
-def format_text(facts_data):
-    """Format facts as human-readable text."""
-    lines = ["\nDevice Facts Report", "=" * 70]
-    for host, data in facts_data.items():
-        lines.append(f"\n{host}")
-        if "error" in data:
-            lines.append(f"  ERROR: {data['error']}")
+def print_topology(topology: Dict[str, List[Dict[str, str]]]) -> None:
+    """Print formatted topology report."""
+    print("\n" + "=" * 80)
+    print("NETWORK TOPOLOGY MAP")
+    print("=" * 80 + "\n")
+    
+    if not topology:
+        print("No neighbor relationships discovered\n")
+        return
+    
+    for device in sorted(topology.keys()):
+        neighbors = topology[device]
+        if neighbors:
+            print(f"{device}:")
+            for link in neighbors:
+                print(f"  {link['local_port']:12} → "
+                      f"{link['remote_host']:20} {link['remote_port']}")
         else:
-            for key, value in data.items():
-                if key != "hostname":
-                    label = key.replace("_", " ").title()
-                    lines.append(f"  {label}: {value}")
-    return "\n".join(lines)
-
-
-def format_json(facts_data):
-    """Format facts as JSON."""
-    return json.dumps(facts_data, indent=2)
-
-
-def format_csv(facts_data):
-    """Format facts as CSV."""
-    headers = ["Host", "Vendor", "Model", "OS Version", "Serial Number"]
-    lines = [",".join(headers)]
-
-    for host, data in facts_data.items():
-        if "error" in data:
-            lines.append(f"{host},ERROR,{data['error']},,,")
-        else:
-            lines.append(
-                f"{host},{data['vendor']},{data['model']},"
-                f"{data['os_version']},{data['serial_number']}"
-            )
-    return "\n".join(lines)
+            print(f"{device}: (no LLDP neighbors)")
+        print()
+    
+    print("=" * 80)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect device facts from network devices via NAPALM"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "-i", "--inventory",
-        default="inventory",
-        help="Path to nornir inventory directory (default: inventory)"
+        "--inventory",
+        default="inventory.yaml",
+        help="Path to Nornir inventory file (default: inventory.yaml)"
     )
     parser.add_argument(
-        "-d", "--devices",
-        help="Comma-separated list of target devices (all if omitted)"
+        "--devices",
+        help="Regex filter for device hostnames (e.g., 'core|dist')"
     )
     parser.add_argument(
-        "-f", "--format",
-        choices=["text", "json", "csv"],
-        default="text",
-        help="Output format (default: text)"
+        "--output",
+        help="Output JSON file for topology data"
     )
-    parser.add_argument(
-        "-o", "--output",
-        help="Output file path (stdout if omitted)"
-    )
-
+    
     args = parser.parse_args()
-
-    inv_path = Path(args.inventory)
-    if not inv_path.exists():
-        logger.error(f"Inventory path not found: {args.inventory}")
-        return 1
-
+    
     try:
-        nr = InitNornir(config_file=str(inv_path / "config.yaml"))
+        nr = InitNornir(config_file=args.inventory)
+        
+        if args.devices:
+            nr = nr.filter(name__regex=args.devices)
+        
+        if not nr.inventory.hosts:
+            logger.warning("No devices matched the filter criteria")
+            return
+        
+        logger.info(f"Discovering neighbors from {len(nr.inventory.hosts)} "
+                    f"device(s)")
+        
+        results = nr.run(task=discover_neighbors)
+        topology = build_topology_map(dict(results))
+        
+        print_topology(topology)
+        
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(topology, f, indent=2)
+            logger.info(f"Topology exported to {args.output}")
+        
+        successful = sum(1 for r in results.values() if r[0].result)
+        logger.info(f"Successfully discovered neighbors from {successful} "
+                    f"device(s)")
+    
     except Exception as e:
-        logger.error(f"Failed to initialize nornir: {e}")
-        return 1
-
-    if args.devices:
-        device_list = [d.strip() for d in args.devices.split(",")]
-        nr = nr.filter(name__in=device_list)
-
-    if not nr.inventory.hosts:
-        logger.error("No devices found in inventory")
-        return 1
-
-    logger.info(f"Collecting facts from {len(nr.inventory.hosts)} device(s)")
-
-    try:
-        facts_data = collect_facts(nr)
-    except Exception as e:
-        logger.error(f"Task execution failed: {e}")
-        return 1
-
-    if args.format == "json":
-        output = format_json(facts_data)
-    elif args.format == "csv":
-        output = format_csv(facts_data)
-    else:
-        output = format_text(facts_data)
-
-    if args.output:
-        try:
-            Path(args.output).write_text(output)
-            logger.info(f"Report written to {args.output}")
-        except IOError as e:
-            logger.error(f"Failed to write output file: {e}")
-            return 1
-    else:
-        print(output)
-
-    return 0
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
