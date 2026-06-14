@@ -1,219 +1,252 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Reachability and Basic Facts Collector
+Device Configuration Comparison Tool - Compares current vs backed-up device configs.
 
 Purpose:
-  Validates device reachability and collects basic facts (hostname, model,
-  version, serial number) from network devices. Useful for asset inventory,
-  device health monitoring, and network discovery tasks.
+    Retrieves device running configurations and compares them against previously
+    backed-up versions. Reports configuration drift and changes between versions.
+    Useful for change tracking, compliance auditing, and troubleshooting.
 
 Usage:
-  python3 010_device_facts_collector.py --target-group core --username admin
-  python3 010_device_facts_collector.py --device router1 --username admin --password secret
+    python config_compare.py --inventory inventory.yml --backup-dir ./backups
 
 Prerequisites:
-  - Nornir installed with netmiko transport
-  - Devices support 'show version' command (Cisco IOS/IOS-XE preferred)
-  - Inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
-  - SSH access to devices
+    - Nornir installed with netmiko plugin
+    - Network device SSH access
+    - Device credentials in inventory
+    - Previously backed-up config files (or will create baseline)
 
-Example:
-  $ python3 010_device_facts_collector.py --target-group access --username netadmin
-  Device: switch1
-    Status: REACHABLE
-    Model: Cisco Catalyst 2960X
-    Version: 15.2(4)E6
-    Serial: ABC123456789
-  
-  Device: switch2
-    Status: UNREACHABLE
-    Error: Connection timeout
+Examples:
+    python config_compare.py --inventory inventory.yml --backup-dir ./backups
+    python config_compare.py --inventory inventory.yml --backup-dir ./backups --devices router1,router2
+    python config_compare.py --inventory inventory.yml --backup-dir ./backups --save-backup
 """
 
-import argparse
+import json
 import logging
+import argparse
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Tuple
+from difflib import unified_diff
+
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.networking import netmiko_send_command
+from nornir_netmiko.tasks import netmiko_send_command
 
 
-def setup_logging(verbose: bool) -> logging.Logger:
-    """Configure logging."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    return logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-def extract_version_info(output: str, platform: str) -> dict:
-    """Extract device info from show version output."""
-    info = {"model": "Unknown", "version": "Unknown", "serial": "Unknown"}
-    
-    lines = output.split("\n")
-    for line in lines:
-        if "Model Number" in line or "Chassis Type" in line:
-            info["model"] = line.split()[-1].rstrip(",")
-        elif "Software Version" in line or ("Version" in line and "IOS" in line):
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if "Version" in part and i + 1 < len(parts):
-                    info["version"] = parts[i + 1].rstrip(",")
-        elif "Processor board ID" in line or "System Serial Number" in line:
-            info["serial"] = line.split()[-1].rstrip(",")
-    
-    return info
-
-
-def collect_device_facts(task, **kwargs):
-    """Gather device facts via netmiko."""
-    device_name = task.host.name
-    platform = task.host.platform or "unknown"
-    
-    result = {
-        "device": device_name,
-        "status": "UNKNOWN",
-        "model": "N/A",
-        "version": "N/A",
-        "serial": "N/A",
-        "error": None,
-    }
-    
+def get_running_config(task) -> str:
+    """Retrieve running configuration from device."""
     try:
-        cmd_result = task.run(
-            netmiko_send_command,
-            command_string="show version",
-        )
-        
-        if cmd_result[0].failed:
-            result["status"] = "FAILED"
-            result["error"] = "Command execution failed"
+        if "iosxr" in task.host.platform.lower():
+            cmd = "show running-config"
+        elif "eos" in task.host.platform.lower():
+            cmd = "show running-config"
         else:
-            version_output = cmd_result[0].result
-            info = extract_version_info(version_output, platform)
-            result.update({
-                "status": "REACHABLE",
-                "model": info["model"],
-                "version": info["version"],
-                "serial": info["serial"],
-            })
+            cmd = "show running-config"
+        
+        result = task.run(netmiko_send_command, command_string=cmd)
+        return result[0].result if result else ""
     except Exception as e:
-        result["status"] = "UNREACHABLE"
-        result["error"] = str(e)
+        logger.error(f"Failed to get config from {task.host.name}: {e}")
+        raise
+
+
+def load_backup_config(backup_path: Path) -> str:
+    """Load previously backed-up configuration."""
+    try:
+        with open(backup_path, 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.warning(f"Backup not found: {backup_path}")
+        return ""
+
+
+def save_config_backup(device_name: str, config: str, backup_dir: Path) -> None:
+    """Save configuration to backup file."""
+    backup_file = backup_dir / f"{device_name}.cfg"
+    try:
+        with open(backup_file, 'w') as f:
+            f.write(config)
+        logger.info(f"Backed up config for {device_name}")
+    except Exception as e:
+        logger.error(f"Failed to save backup for {device_name}: {e}")
+
+
+def compare_configs(device_name: str, current: str, backup: str) -> Dict[str, Any]:
+    """Compare current and backed-up configurations."""
+    has_backup = bool(backup.strip())
     
-    return result
+    if not has_backup:
+        return {
+            "device": device_name,
+            "timestamp": datetime.now().isoformat(),
+            "status": "no_baseline",
+            "message": "No previous backup to compare",
+            "lines_changed": 0,
+            "differences": []
+        }
+    
+    current_lines = current.splitlines(keepends=True)
+    backup_lines = backup.splitlines(keepends=True)
+    
+    diff = list(unified_diff(
+        backup_lines, current_lines,
+        fromfile='backup', tofile='current',
+        lineterm=''
+    ))
+    
+    changed = len(diff) > 0
+    
+    return {
+        "device": device_name,
+        "timestamp": datetime.now().isoformat(),
+        "status": "changed" if changed else "unchanged",
+        "message": f"{len(diff)} line(s) different" if changed else "Configuration unchanged",
+        "lines_changed": len(diff),
+        "differences": diff[:50]
+    }
 
 
-def print_results(results: dict) -> None:
-    """Print formatted results."""
+def analyze_devices(nr, backup_dir: Path, save_backup: bool = False, 
+                   device_filter: List[str] = None) -> List[Dict[str, Any]]:
+    """Analyze configuration changes across devices."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    
+    if device_filter:
+        devices = nr.filter(F(name__in=device_filter))
+    else:
+        devices = nr
+    
+    for device_name, device in devices.inventory.hosts.items():
+        result = {
+            "device": device_name,
+            "timestamp": datetime.now().isoformat(),
+            "status": "error",
+            "message": "Unknown error"
+        }
+        
+        try:
+            current_config = get_running_config(None)
+            backup_config = load_backup_config(backup_dir / f"{device_name}.cfg")
+            
+            result = compare_configs(device_name, current_config, backup_config)
+            
+            if save_backup:
+                save_config_backup(device_name, current_config, backup_dir)
+            
+            status_icon = "✓" if result["status"] == "unchanged" else "⚠"
+            logger.info(f"{status_icon} {device_name:20s} {result['message']}")
+        
+        except Exception as e:
+            result["message"] = str(e)
+            logger.error(f"✗ {device_name:20s} Error: {str(e)}")
+        
+        results.append(result)
+    
+    return results
+
+
+def print_comparison_report(results: List[Dict[str, Any]]) -> None:
+    """Print formatted comparison report."""
+    unchanged = sum(1 for r in results if r["status"] == "unchanged")
+    changed = sum(1 for r in results if r["status"] == "changed")
+    errors = sum(1 for r in results if r["status"] == "error")
+    
     print("\n" + "=" * 70)
-    print("DEVICE FACTS COLLECTION REPORT")
+    print("Configuration Comparison Report")
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
     
-    reachable = 0
-    unreachable = 0
-    
-    for hostname, task_result in results.items():
-        if task_result.result is None:
-            continue
+    for result in results:
+        status_icon = "✓" if result["status"] == "unchanged" else "⚠"
+        if result["status"] == "error":
+            status_icon = "✗"
         
-        data = task_result.result
-        status_ok = data["status"] == "REACHABLE"
-        symbol = "✓" if status_ok else "✗"
+        print(f"\n[{status_icon}] {result['device']:20s} {result['message']}")
         
-        print(f"\n{symbol} Device: {data['device']}")
-        print(f"  Status: {data['status']}")
-        print(f"  Model: {data['model']}")
-        print(f"  Version: {data['version']}")
-        print(f"  Serial: {data['serial']}")
-        
-        if data["error"]:
-            print(f"  Error: {data['error']}")
-        
-        if status_ok:
-            reachable += 1
-        else:
-            unreachable += 1
+        if result["status"] == "changed" and result.get("differences"):
+            print(f"     First few changes (showing up to 10 lines):")
+            for line in result["differences"][:10]:
+                line_str = line.rstrip()
+                if line_str.startswith('-'):
+                    print(f"     - {line_str[1:]}")
+                elif line_str.startswith('+'):
+                    print(f"     + {line_str[1:]}")
     
     print("\n" + "=" * 70)
-    print(f"Summary: {reachable} reachable, {unreachable} unreachable")
+    print(f"Summary: {unchanged} unchanged, {changed} changed, {errors} errors")
     print("=" * 70 + "\n")
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Collect device facts and validate reachability"
+        description="Compare device configurations against backups"
     )
     parser.add_argument(
-        "--target-group",
-        type=str,
-        help="Target group name from inventory",
+        "--inventory",
+        default="inventory.yml",
+        help="Path to Nornir inventory file"
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        help="Single device hostname to check",
+        "--backup-dir",
+        default="./config_backups",
+        help="Directory for configuration backups"
     )
     parser.add_argument(
-        "--username",
-        type=str,
-        required=True,
-        help="Network device username",
+        "--devices",
+        help="Comma-separated device names to check"
     )
     parser.add_argument(
-        "--password",
-        type=str,
-        help="Network device password",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="Connection timeout in seconds (default: 30)",
-    )
-    parser.add_argument(
-        "--verbose",
+        "--save-backup",
         action="store_true",
-        help="Enable verbose logging",
+        help="Save current configs as new backups"
+    )
+    parser.add_argument(
+        "--output",
+        help="Save results to JSON file"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
     )
     
     args = parser.parse_args()
-    logger = setup_logging(args.verbose)
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        nr = InitNornir(config_file="config.yaml")
+        logger.info(f"Loading inventory from {args.inventory}")
+        nr = InitNornir(config_file=args.inventory)
         
-        if args.device:
-            nr = nr.filter(name=args.device)
-        elif args.target_group:
-            nr = nr.filter(F(groups__contains=args.target_group))
-        else:
-            logger.error("Must specify --device or --target-group")
-            return 1
+        backup_dir = Path(args.backup_dir)
+        device_list = args.devices.split(",") if args.devices else None
         
-        if not nr.inventory.hosts:
-            logger.error("No devices matched filter criteria")
-            return 1
+        logger.info("Comparing device configurations...")
+        results = analyze_devices(nr, backup_dir, args.save_backup, device_list)
         
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            if args.password:
-                host.password = args.password
-            host.conn_timeout = args.timeout
+        print_comparison_report(results)
         
-        logger.info(f"Collecting facts from {len(nr.inventory.hosts)} device(s)")
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"Results saved to {args.output}")
         
-        results = nr.run(task=collect_device_facts)
-        
-        print_results(results)
-        
-        return 0
-        
+        changed_count = sum(1 for r in results if r["status"] == "changed")
+        return 0 if changed_count == 0 else 1
+    
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {str(e)}", exc_info=args.verbose)
         return 1
 
 
