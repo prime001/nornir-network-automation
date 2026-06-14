@@ -1,209 +1,256 @@
-Interface Error Counter Monitor
-================================
-Collects input/output error counters from network device interfaces and
-flags those exceeding configurable thresholds. Useful for identifying
-degraded links, duplex mismatches, and layer-1 physical problems.
+```python
+#!/usr/bin/env python3
+"""
+Route Analysis Report - Analyzes and reports on device routing tables.
+
+This script gathers routing information from network devices using nornir,
+analyzes route distributions, identifies anomalies, and generates a comprehensive
+routing report. Useful for network validation, troubleshooting, and topology
+verification.
 
 Usage:
-    # Single device
-    python interface_error_monitor.py --host 192.168.1.1 --username admin --password secret
-
-    # Inventory file, flag interfaces with >10 CRC errors
-    python interface_error_monitor.py --inventory hosts.yaml --crc 10
-
-    # All thresholds, multiple groups
-    python interface_error_monitor.py --inventory hosts.yaml --groups core dist \
-        --input-errors 100 --output-errors 50 --crc 5 --resets 10
+    python route_analysis_report.py --hosts all --username admin --password secret
+    python route_analysis_report.py --hosts router1,router2 --username admin --password secret
+    python route_analysis_report.py --hosts all --username admin --password secret --format json
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils
-
-Exit code 0 = all interfaces within thresholds; 1 = violations found.
+    - nornir and nornir-netmiko installed
+    - Devices configured in inventory (hosts.yaml/groups.yaml)
+    - SSH access to target devices with enable/privilege access
 """
 
 import argparse
+import json
 import logging
-import re
 import sys
+from typing import Dict, List, Any
+from collections import defaultdict
 
 from nornir import InitNornir
-from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
+from nornir.core.filter import F
 from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def _extract_int(text: str, pattern: str) -> int:
-    m = re.search(pattern, text, re.IGNORECASE)
-    return int(m.group(1)) if m else 0
-
-
-def parse_errors(output: str) -> list:
-    interfaces = []
-    for block in re.split(r'\n(?=\S)', output.strip()):
-        lines = block.strip().splitlines()
-        if not lines:
-            continue
-        m = re.match(r'^(\S+)\s+is\s+(\w+)', lines[0])
-        if not m:
-            continue
-        text = '\n'.join(lines)
-        interfaces.append({
-            'name': m.group(1),
-            'status': m.group(2),
-            'input_errors': _extract_int(text, r'(\d+) input errors'),
-            'output_errors': _extract_int(text, r'(\d+) output errors'),
-            'crc': _extract_int(text, r'(\d+) CRC'),
-            'resets': _extract_int(text, r'(\d+) interface resets'),
+def gather_routes(task: Task) -> Result:
+    """Gather routing information from devices using NAPALM."""
+    try:
+        from nornir_napalm.plugins.tasks import napalm_get
+        
+        result = task.run(napalm_get, getters=["route_info"])
+        routes_data = result[0].result.get("route_info", {})
+        
+        analysis = analyze_routes(routes_data)
+        
+        return Result(host=task.host, result={
+            "raw_routes": routes_data,
+            "analysis": analysis
         })
-    return interfaces
+    
+    except Exception as e:
+        logger.error(f"Failed to gather routes for {task.host}: {str(e)}")
+        return Result(host=task.host, result={"error": str(e)}, failed=True)
 
 
-def check_interface_errors(task: Task, thresholds: dict) -> Result:
-    cmd = task.run(task=netmiko_send_command, command_string='show interfaces')
-    interfaces = parse_errors(cmd[0].result)
-
-    flagged = []
-    for intf in interfaces:
-        violations = [
-            f"{k}={intf[k]}"
-            for k in ('input_errors', 'output_errors', 'crc', 'resets')
-            if intf[k] > thresholds[k]
-        ]
-        if violations:
-            flagged.append({**intf, 'violations': violations})
-
-    return Result(
-        host=task.host,
-        result={'total': len(interfaces), 'flagged': flagged},
-        failed=bool(flagged),
-    )
-
-
-def _build_single_inventory(host, username, password, platform, port):
-    return Inventory(
-        hosts=Hosts({host: Host(
-            name=host, hostname=host, username=username,
-            password=password, platform=platform, port=port,
-        )}),
-        groups=Groups(),
-        defaults=Defaults(),
-    )
-
-
-def print_report(results, thresholds: dict) -> bool:
-    any_violations = False
-    sep = '=' * 62
-    print(f"\n{sep}")
-    print("INTERFACE ERROR COUNTER REPORT")
-    thresh_str = '  '.join(f"{k}>{v}" for k, v in thresholds.items() if v >= 0)
-    print(f"Thresholds: {thresh_str}")
-    print(f"{sep}\n")
-
-    for hostname, multi in results.items():
-        host_result = multi[0]
-        if host_result.exception:
-            print(f"[{hostname}] ERROR: {host_result.exception}\n")
-            continue
-
-        data = host_result.result or {}
-        flagged = data.get('flagged', [])
-        total = data.get('total', 0)
-
-        print(f"Host: {hostname}")
-        print(f"  Interfaces checked : {total}")
-        print(f"  Interfaces flagged : {len(flagged)}")
-
-        if flagged:
-            any_violations = True
-            print(f"\n  {'Interface':<26} {'Status':<9} Violations")
-            print(f"  {'-'*58}")
-            for intf in flagged:
-                print(f"  {intf['name']:<26} {intf['status']:<9} "
-                      f"{', '.join(intf['violations'])}")
-        else:
-            print("  All interfaces within thresholds.")
-        print()
-
-    return any_violations
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description='Flag network interfaces with elevated error counters',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument('--host', help='Single device hostname or IP')
-    source.add_argument('--inventory', metavar='FILE',
-                        help='Nornir SimpleInventory hosts YAML file')
-
-    parser.add_argument('--username', '-u', default='admin')
-    parser.add_argument('--password', '-p', default='admin')
-    parser.add_argument('--platform', default='cisco_ios')
-    parser.add_argument('--port', type=int, default=22)
-    parser.add_argument('--groups', nargs='+',
-                        help='Inventory groups to target (inventory mode only)')
-    parser.add_argument('--workers', type=int, default=10)
-    parser.add_argument('--debug', action='store_true')
-
-    t = parser.add_argument_group('error thresholds (flag interfaces ABOVE these values)')
-    t.add_argument('--input-errors', dest='input_errors', type=int, default=0)
-    t.add_argument('--output-errors', dest='output_errors', type=int, default=0)
-    t.add_argument('--crc', type=int, default=0)
-    t.add_argument('--resets', type=int, default=0)
-
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.WARNING,
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-    )
-
-    thresholds = {
-        'input_errors': args.input_errors,
-        'output_errors': args.output_errors,
-        'crc': args.crc,
-        'resets': args.resets,
+def analyze_routes(routes_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Analyze routing table for statistics and anomalies."""
+    analysis = {
+        "total_routes": 0,
+        "by_protocol": defaultdict(int),
+        "by_prefix_length": defaultdict(int),
+        "default_routes": [],
+        "static_routes": 0,
+        "ospf_routes": 0,
+        "bgp_routes": 0,
+        "connected_routes": 0,
     }
+    
+    if not routes_data:
+        return analysis
+    
+    for vrf, prefixes in routes_data.items():
+        if not isinstance(prefixes, dict):
+            continue
+            
+        for prefix, route_info in prefixes.items():
+            analysis["total_routes"] += 1
+            
+            if prefix == "0.0.0.0/0":
+                analysis["default_routes"].append({
+                    "vrf": vrf,
+                    "nexthops": route_info.get("next_hops", [])
+                })
+            
+            protocol = route_info.get("protocol", "unknown")
+            analysis["by_protocol"][protocol] += 1
+            
+            if protocol == "static":
+                analysis["static_routes"] += 1
+            elif protocol == "ospf":
+                analysis["ospf_routes"] += 1
+            elif protocol == "bgp":
+                analysis["bgp_routes"] += 1
+            elif protocol == "connected":
+                analysis["connected_routes"] += 1
+            
+            prefix_len = int(prefix.split("/")[-1]) if "/" in prefix else 0
+            analysis["by_prefix_length"][prefix_len] += 1
+    
+    analysis["by_protocol"] = dict(analysis["by_protocol"])
+    analysis["by_prefix_length"] = dict(sorted(analysis["by_prefix_length"].items()))
+    
+    return analysis
 
-    runner_cfg = {'plugin': 'threaded', 'options': {'num_workers': args.workers}}
 
-    if args.host:
-        nr = InitNornir(
-            runner=runner_cfg,
-            inventory={'plugin': 'SimpleInventory'},
-            logging={'enabled': False},
-        )
-        nr.inventory = _build_single_inventory(
-            args.host, args.username, args.password, args.platform, args.port
-        )
-    else:
-        nr = InitNornir(
-            runner=runner_cfg,
-            inventory={
-                'plugin': 'SimpleInventory',
-                'options': {'host_file': args.inventory},
-            },
-            logging={'enabled': False},
-        )
-        if args.groups:
-            nr = nr.filter(lambda h: any(g in h.groups for g in args.groups))
+def format_results_text(results: Dict[str, Any]) -> None:
+    """Format results as human-readable text."""
+    print("\n" + "="*100)
+    print(f"{'Device':<20} {'Total':<10} {'BGP':<10} {'OSPF':<10} {'Static':<10} {'Connected':<15}")
+    print("="*100)
+    
+    for host, result in results.items():
+        if isinstance(result, list) and result and not result[0].failed:
+            analysis = result[0].result.get("analysis", {})
+            total = analysis.get("total_routes", 0)
+            bgp = analysis.get("bgp_routes", 0)
+            ospf = analysis.get("ospf_routes", 0)
+            static = analysis.get("static_routes", 0)
+            connected = analysis.get("connected_routes", 0)
+            
+            print(f"{host:<20} {total:<10} {bgp:<10} {ospf:<10} {static:<10} {connected:<15}")
+        else:
+            print(f"{host:<20} {'ERROR':<10}")
+    
+    print("="*100)
+    
+    for host, result in results.items():
+        if isinstance(result, list) and result and not result[0].failed:
+            analysis = result[0].result.get("analysis", {})
+            
+            print(f"\n{host} - Route Analysis:")
+            print(f"  Total Routes: {analysis.get('total_routes', 0)}")
+            
+            by_protocol = analysis.get("by_protocol", {})
+            if by_protocol:
+                print("  Routes by Protocol:")
+                for protocol, count in sorted(by_protocol.items()):
+                    print(f"    {protocol}: {count}")
+            
+            defaults = analysis.get("default_routes", [])
+            if defaults:
+                print(f"  Default Routes: {len(defaults)}")
+                for default in defaults:
+                    print(f"    VRF: {default['vrf']}, Nexthops: {default['nexthops']}")
+            else:
+                print("  Default Routes: None")
+            
+            prefix_lens = analysis.get("by_prefix_length", {})
+            if prefix_lens:
+                print("  Top 5 Prefix Lengths:")
+                for length, count in sorted(prefix_lens.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    print(f"    /{length}: {count} routes")
 
-    if not nr.inventory.hosts:
-        print("No hosts matched. Check --inventory/--groups arguments.", file=sys.stderr)
-        return 2
 
-    logger.info("Polling %d host(s)", len(nr.inventory.hosts))
-    results = nr.run(
-        task=check_interface_errors,
-        thresholds=thresholds,
-        name='interface_error_monitor',
+def format_results_json(results: Dict[str, Any]) -> None:
+    """Format results as JSON."""
+    output = {}
+    
+    for host, result in results.items():
+        if isinstance(result, list) and result:
+            if result[0].failed:
+                output[host] = {"error": result[0].result.get("error")}
+            else:
+                output[host] = result[0].result.get("analysis", {})
+        else:
+            output[host] = {"error": "No result"}
+    
+    print(json.dumps(output, indent=2, default=str))
+
+
+def main():
+    """Main execution function."""
+    parser = argparse.ArgumentParser(
+        description="Analyze and report on network device routing tables"
     )
+    parser.add_argument(
+        "--hosts",
+        type=str,
+        default="all",
+        help="Comma-separated list of hosts or 'all' (default: all)"
+    )
+    parser.add_argument(
+        "--username",
+        type=str,
+        required=True,
+        help="Username for device authentication"
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        required=True,
+        help="Password for device authentication"
+    )
+    parser.add_argument(
+        "--inventory",
+        type=str,
+        default="./inventory",
+        help="Path to nornir inventory directory (default: ./inventory)"
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
+    )
+    parser.add_argument(
+        "--loglevel",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level (default: INFO)"
+    )
+    
+    args = parser.parse_args()
+    logger.setLevel(getattr(logging, args.loglevel))
+    
+    try:
+        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        
+        if args.hosts != "all":
+            hosts = [h.strip() for h in args.hosts.split(",")]
+            nr = nr.filter(F(name__in=hosts))
+        
+        if len(nr.inventory.hosts) == 0:
+            logger.error("No hosts found matching the filter")
+            sys.exit(1)
+        
+        logger.info(f"Running route analysis on {len(nr.inventory.hosts)} device(s)")
+        
+        results = nr.run(task=gather_routes)
+        
+        failed_count = sum(1 for r in results.values() if r[0].failed)
+        logger.info(f"Route analysis completed: {len(results) - failed_count} successful, {failed_count} failed")
+        
+        if args.format == "json":
+            format_results_json(dict(results))
+        else:
+            format_results_text(dict(results))
+        
+        if failed_count > 0:
+            sys.exit(1)
+    
+    except Exception as e:
+        logger.error(f"Failed to run route analysis: {str(e)}")
+        sys.exit(1)
 
-    return 1 if print_report(results, thresholds) else 0
 
-
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
+```
