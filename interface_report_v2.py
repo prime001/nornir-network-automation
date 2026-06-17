@@ -1,256 +1,198 @@
 ```python
 #!/usr/bin/env python3
 """
-Route Analysis Report - Analyzes and reports on device routing tables.
+Device Uptime Reporter - Collects and reports device uptime statistics.
 
-This script gathers routing information from network devices using nornir,
-analyzes route distributions, identifies anomalies, and generates a comprehensive
-routing report. Useful for network validation, troubleshooting, and topology
-verification.
+Purpose:
+    Gathers uptime information from network devices and generates reports
+    showing device uptime, identifying devices with recent reboots or issues.
 
 Usage:
-    python route_analysis_report.py --hosts all --username admin --password secret
-    python route_analysis_report.py --hosts router1,router2 --username admin --password secret
-    python route_analysis_report.py --hosts all --username admin --password secret --format json
+    python device_uptime_report.py --warn-hours 168 --format text
+    python device_uptime_report.py --group edge --sort-by uptime
 
 Prerequisites:
-    - nornir and nornir-netmiko installed
-    - Devices configured in inventory (hosts.yaml/groups.yaml)
-    - SSH access to target devices with enable/privilege access
+    - nornir inventory configured with device connectivity parameters
+    - SSH/Telnet access with appropriate credentials
+    - Devices supporting 'show version' or 'show system uptime' commands
 """
 
+import logging
 import argparse
 import json
-import logging
-import sys
-from typing import Dict, List, Any
-from collections import defaultdict
-
+import re
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Result, Task
+from nornir.core.task import Task, Result
+from nornir_utils.plugins.tasks.networking import netmiko_send_command
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-def gather_routes(task: Task) -> Result:
-    """Gather routing information from devices using NAPALM."""
-    try:
-        from nornir_napalm.plugins.tasks import napalm_get
-        
-        result = task.run(napalm_get, getters=["route_info"])
-        routes_data = result[0].result.get("route_info", {})
-        
-        analysis = analyze_routes(routes_data)
-        
-        return Result(host=task.host, result={
-            "raw_routes": routes_data,
-            "analysis": analysis
-        })
+def parse_uptime_from_output(output: str) -> int:
+    """Extract uptime in seconds from device output."""
+    patterns = [
+        r"uptime is (\d+)\s+days?,?\s+(\d+)\s+hours?,?\s+(\d+)\s+minutes?",
+        r"(\d+)d(\d+)h(\d+)m",
+        r"up\s+(\d+)\s+days?,?\s+(\d+):(\d+)",
+    ]
     
-    except Exception as e:
-        logger.error(f"Failed to gather routes for {task.host}: {str(e)}")
-        return Result(host=task.host, result={"error": str(e)}, failed=True)
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            days, hours, minutes = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            return days * 86400 + hours * 3600 + minutes * 60
+    
+    return None
 
 
-def analyze_routes(routes_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze routing table for statistics and anomalies."""
-    analysis = {
-        "total_routes": 0,
-        "by_protocol": defaultdict(int),
-        "by_prefix_length": defaultdict(int),
-        "default_routes": [],
-        "static_routes": 0,
-        "ospf_routes": 0,
-        "bgp_routes": 0,
-        "connected_routes": 0,
+def format_uptime(seconds: int) -> str:
+    """Format uptime seconds to human-readable format."""
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
+
+
+def collect_device_uptime(task: Task) -> Result:
+    """Collect uptime information from a device."""
+    uptime_info = {
+        "hostname": task.host.name,
+        "platform": task.host.platform,
+        "uptime_seconds": None,
+        "uptime_human": None,
+        "status": "unknown",
+        "error": None,
     }
     
-    if not routes_data:
-        return analysis
-    
-    for vrf, prefixes in routes_data.items():
-        if not isinstance(prefixes, dict):
-            continue
-            
-        for prefix, route_info in prefixes.items():
-            analysis["total_routes"] += 1
-            
-            if prefix == "0.0.0.0/0":
-                analysis["default_routes"].append({
-                    "vrf": vrf,
-                    "nexthops": route_info.get("next_hops", [])
-                })
-            
-            protocol = route_info.get("protocol", "unknown")
-            analysis["by_protocol"][protocol] += 1
-            
-            if protocol == "static":
-                analysis["static_routes"] += 1
-            elif protocol == "ospf":
-                analysis["ospf_routes"] += 1
-            elif protocol == "bgp":
-                analysis["bgp_routes"] += 1
-            elif protocol == "connected":
-                analysis["connected_routes"] += 1
-            
-            prefix_len = int(prefix.split("/")[-1]) if "/" in prefix else 0
-            analysis["by_prefix_length"][prefix_len] += 1
-    
-    analysis["by_protocol"] = dict(analysis["by_protocol"])
-    analysis["by_prefix_length"] = dict(sorted(analysis["by_prefix_length"].items()))
-    
-    return analysis
-
-
-def format_results_text(results: Dict[str, Any]) -> None:
-    """Format results as human-readable text."""
-    print("\n" + "="*100)
-    print(f"{'Device':<20} {'Total':<10} {'BGP':<10} {'OSPF':<10} {'Static':<10} {'Connected':<15}")
-    print("="*100)
-    
-    for host, result in results.items():
-        if isinstance(result, list) and result and not result[0].failed:
-            analysis = result[0].result.get("analysis", {})
-            total = analysis.get("total_routes", 0)
-            bgp = analysis.get("bgp_routes", 0)
-            ospf = analysis.get("ospf_routes", 0)
-            static = analysis.get("static_routes", 0)
-            connected = analysis.get("connected_routes", 0)
-            
-            print(f"{host:<20} {total:<10} {bgp:<10} {ospf:<10} {static:<10} {connected:<15}")
+    try:
+        cmd = "show version" if "ios" in task.host.platform else "show system uptime"
+        
+        response = task.run(
+            netmiko_send_command,
+            command_string=cmd,
+            use_textfsm=False
+        )
+        
+        output = response[0].result
+        uptime_seconds = parse_uptime_from_output(output)
+        
+        if uptime_seconds is not None:
+            uptime_info["uptime_seconds"] = uptime_seconds
+            uptime_info["uptime_human"] = format_uptime(uptime_seconds)
+            uptime_info["status"] = "success"
         else:
-            print(f"{host:<20} {'ERROR':<10}")
-    
-    print("="*100)
-    
-    for host, result in results.items():
-        if isinstance(result, list) and result and not result[0].failed:
-            analysis = result[0].result.get("analysis", {})
-            
-            print(f"\n{host} - Route Analysis:")
-            print(f"  Total Routes: {analysis.get('total_routes', 0)}")
-            
-            by_protocol = analysis.get("by_protocol", {})
-            if by_protocol:
-                print("  Routes by Protocol:")
-                for protocol, count in sorted(by_protocol.items()):
-                    print(f"    {protocol}: {count}")
-            
-            defaults = analysis.get("default_routes", [])
-            if defaults:
-                print(f"  Default Routes: {len(defaults)}")
-                for default in defaults:
-                    print(f"    VRF: {default['vrf']}, Nexthops: {default['nexthops']}")
-            else:
-                print("  Default Routes: None")
-            
-            prefix_lens = analysis.get("by_prefix_length", {})
-            if prefix_lens:
-                print("  Top 5 Prefix Lengths:")
-                for length, count in sorted(prefix_lens.items(), key=lambda x: x[1], reverse=True)[:5]:
-                    print(f"    /{length}: {count} routes")
-
-
-def format_results_json(results: Dict[str, Any]) -> None:
-    """Format results as JSON."""
-    output = {}
-    
-    for host, result in results.items():
-        if isinstance(result, list) and result:
-            if result[0].failed:
-                output[host] = {"error": result[0].result.get("error")}
-            else:
-                output[host] = result[0].result.get("analysis", {})
-        else:
-            output[host] = {"error": "No result"}
-    
-    print(json.dumps(output, indent=2, default=str))
+            uptime_info["status"] = "parse_error"
+        
+        return Result(host=task.host, result=uptime_info)
+        
+    except Exception as e:
+        uptime_info["status"] = "failed"
+        uptime_info["error"] = str(e)
+        logger.error(f"{task.host.name}: {e}")
+        return Result(host=task.host, result=uptime_info, failed=True)
 
 
 def main():
-    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Analyze and report on network device routing tables"
+        description="Collect and report device uptime across network inventory"
     )
     parser.add_argument(
-        "--hosts",
-        type=str,
-        default="all",
-        help="Comma-separated list of hosts or 'all' (default: all)"
+        "--group",
+        help="Filter devices by inventory group"
     )
     parser.add_argument(
-        "--username",
-        type=str,
-        required=True,
-        help="Username for device authentication"
-    )
-    parser.add_argument(
-        "--password",
-        type=str,
-        required=True,
-        help="Password for device authentication"
-    )
-    parser.add_argument(
-        "--inventory",
-        type=str,
-        default="./inventory",
-        help="Path to nornir inventory directory (default: ./inventory)"
+        "--warn-hours",
+        type=int,
+        default=168,
+        help="Alert threshold if uptime less than N hours"
     )
     parser.add_argument(
         "--format",
-        type=str,
-        choices=["text", "json"],
+        choices=["json", "text"],
         default="text",
-        help="Output format (default: text)"
+        help="Output format"
     )
     parser.add_argument(
-        "--loglevel",
-        type=str,
+        "--sort-by",
+        choices=["uptime", "hostname"],
+        default="uptime",
+        help="Sort results by field"
+    )
+    parser.add_argument(
+        "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level (default: INFO)"
+        default="INFO"
     )
     
     args = parser.parse_args()
-    logger.setLevel(getattr(logging, args.loglevel))
+    
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     
     try:
-        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        nr = InitNornir(config_file="config.yaml")
         
-        if args.hosts != "all":
-            hosts = [h.strip() for h in args.hosts.split(",")]
-            nr = nr.filter(F(name__in=hosts))
+        if args.group:
+            nr = nr.filter(group=args.group)
         
-        if len(nr.inventory.hosts) == 0:
-            logger.error("No hosts found matching the filter")
-            sys.exit(1)
+        device_count = len(nr.inventory.hosts)
+        if device_count == 0:
+            logger.error(f"No devices found matching filter: {args.group}")
+            return 1
         
-        logger.info(f"Running route analysis on {len(nr.inventory.hosts)} device(s)")
+        logger.info(f"Collecting uptime from {device_count} device(s)")
+        results = nr.run(task=collect_device_uptime)
         
-        results = nr.run(task=gather_routes)
+        devices = []
+        for hostname, task_results in results.items():
+            for result in task_results:
+                devices.append(result.result)
         
-        failed_count = sum(1 for r in results.values() if r[0].failed)
-        logger.info(f"Route analysis completed: {len(results) - failed_count} successful, {failed_count} failed")
+        if args.sort_by == "uptime":
+            devices.sort(key=lambda x: x.get("uptime_seconds") or 0)
+        else:
+            devices.sort(key=lambda x: x["hostname"])
         
         if args.format == "json":
-            format_results_json(dict(results))
+            print(json.dumps(devices, indent=2))
         else:
-            format_results_text(dict(results))
+            print("\n" + "=" * 85)
+            print("Device Uptime Report")
+            print("=" * 85)
+            print(f"{'Hostname':<25} {'Uptime':<20} {'Status':<15} {'Alert':<10}")
+            print("-" * 85)
+            
+            warn_seconds = args.warn_hours * 3600
+            alert_count = 0
+            success_count = 0
+            
+            for device in devices:
+                status = device["status"]
+                uptime = device["uptime_human"] or "N/A"
+                alert = ""
+                
+                if status == "success":
+                    success_count += 1
+                    if device.get("uptime_seconds", 0) < warn_seconds:
+                        alert = "⚠ LOW"
+                        alert_count += 1
+                
+                print(f"{device['hostname']:<25} {uptime:<20} {status:<15} {alert:<10}")
+            
+            print("=" * 85)
+            print(f"Summary: {success_count} successful, {alert_count} alerts, "
+                  f"{len(devices) - success_count} failed")
         
-        if failed_count > 0:
-            sys.exit(1)
-    
+        return 0 if alert_count == 0 else 1
+        
     except Exception as e:
-        logger.error(f"Failed to run route analysis: {str(e)}")
-        sys.exit(1)
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
 ```
