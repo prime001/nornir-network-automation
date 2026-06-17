@@ -1,226 +1,219 @@
-The task asks for script output only. Writing the NTP status audit script — a practical inventory-ops script not covered by any existing v1/v2 scripts.
+Writing a route-snapshot-and-drift-detection script — the next unoccupied slot (027) that doesn't overlap any existing script.
 
+```python
 """
-NTP Status Audit — nornir-network-automation
-
+Route Table Snapshot and Drift Detection
+=========================================
 Purpose:
-    Collect NTP synchronization status across a network fleet.
-    Reports stratum, reference server, clock offset, and sync state
-    per device. Identifies unsynchronized nodes that risk log-timestamp
-    skew, certificate validation failures, and compliance gaps.
+    Capture routing table snapshots across network devices and detect route
+    changes between runs. Useful for change-window validation, post-change
+    verification, and detecting unauthorized route advertisements.
 
 Usage:
-    python 017_ntp_status.py --inventory hosts.yaml
-    python 017_ntp_status.py --inventory hosts.yaml --filter-group core_routers
-    python 017_ntp_status.py --inventory hosts.yaml --filter-site dc1 --csv report.csv
-    python 017_ntp_status.py --inventory hosts.yaml --username admin --password secret
+    # Save a baseline snapshot before a maintenance window
+    python 027_route_snapshot.py --save --output-dir ./snapshots
+
+    # Compare current routes against the saved baseline
+    python 027_route_snapshot.py --compare --output-dir ./snapshots
+
+    # Check a specific prefix across all devices
+    python 027_route_snapshot.py --prefix 10.0.0.0/8 --save
+
+    # Target a specific host group
+    python 027_route_snapshot.py --group core --compare
 
 Prerequisites:
     pip install nornir nornir-netmiko nornir-utils
-    Inventory files: hosts.yaml, groups.yaml, defaults.yaml
-    Supported platforms: cisco_ios, cisco_nxos, arista_eos
+    Nornir inventory: config.yaml, hosts.yaml, groups.yaml, defaults.yaml
+    Devices must respond to 'show ip route' or platform equivalent.
+
+Exit codes:
+    0 — success, no changes detected
+    1 — collection or baseline error
+    2 — route drift detected (compare mode)
 """
 
 import argparse
-import csv
+import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Result, Task
+from nornir.core.task import Task, Result
 from nornir_netmiko.tasks import netmiko_send_command
+from nornir_utils.plugins.functions import print_result
 
 logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+ROUTE_COMMANDS = {
+    "cisco_ios": "show ip route",
+    "cisco_nxos": "show ip route",
+    "cisco_xr": "show route ipv4",
+    "juniper_junos": "show route",
+    "arista_eos": "show ip route",
+}
 
-@dataclass
-class NtpStatus:
-    hostname: str
-    synced: bool = False
-    stratum: Optional[int] = None
-    reference: str = ""
-    offset_ms: Optional[float] = None
-    error: str = ""
-
-
-def _parse_ios_ntp(output: str) -> Dict:
-    data: Dict = {"synced": False, "stratum": None, "reference": "", "offset_ms": None}
-    if re.search(r"Clock is synchronized", output, re.IGNORECASE):
-        data["synced"] = True
-    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if m:
-        data["stratum"] = int(m.group(1))
-    m = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        data["reference"] = m.group(1)
-    m = re.search(r"offset\s+([-\d.]+)\s+msec", output, re.IGNORECASE)
-    if m:
-        data["offset_ms"] = float(m.group(1))
-    return data
+# Matches IOS/NX-OS/EOS route lines: protocol prefix ... via nexthop
+_ROUTE_RE = re.compile(
+    r"^[OSBDERICL*\s>]\s*"
+    r"(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)"
+    r".*?(?:via\s+(\d{1,3}(?:\.\d{1,3}){3}))?",
+    re.MULTILINE,
+)
 
 
-def _parse_eos_ntp(output: str) -> Dict:
-    data: Dict = {"synced": False, "stratum": None, "reference": "", "offset_ms": None}
-    if re.search(r"synchronised", output, re.IGNORECASE):
-        data["synced"] = True
-    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if m:
-        data["stratum"] = int(m.group(1))
-    m = re.search(r"reference ID\s+[:\s]+(\S+)", output, re.IGNORECASE)
-    if m:
-        data["reference"] = m.group(1)
-    m = re.search(r"offset\s+([-\d.]+)\s+ms", output, re.IGNORECASE)
-    if m:
-        data["offset_ms"] = float(m.group(1))
-    return data
+def collect_routes(task: Task, prefix_filter: str = None) -> Result:
+    platform = task.host.platform or "cisco_ios"
+    command = ROUTE_COMMANDS.get(platform, "show ip route")
+    if prefix_filter:
+        command = f"{command} {prefix_filter}"
+    result = task.run(task=netmiko_send_command, command_string=command)
+    return Result(host=task.host, result=result.result)
 
 
-def collect_ntp_status(task: Task) -> Result:
-    platform = (task.host.platform or "cisco_ios").lower()
-    try:
-        r = task.run(
-            task=netmiko_send_command,
-            command_string="show ntp status",
-            name="show ntp status",
-        )
-        if "eos" in platform or "arista" in platform:
-            parsed = _parse_eos_ntp(r.result)
-        else:
-            parsed = _parse_ios_ntp(r.result)
-        return Result(host=task.host, result=parsed)
-    except Exception as exc:
-        logger.error("Failed on %s: %s", task.host.name, exc)
-        return Result(host=task.host, result={"error": str(exc)}, failed=True)
+def parse_routes(raw: str) -> dict:
+    routes = {}
+    for m in _ROUTE_RE.finditer(raw):
+        prefix = m.group(1)
+        if "/" not in prefix:
+            prefix += "/32"
+        nexthop = m.group(2) or "directly connected"
+        routes.setdefault(prefix, [])
+        if nexthop not in routes[prefix]:
+            routes[prefix].append(nexthop)
+    return routes
 
 
-def _print_table(statuses: List[NtpStatus]) -> None:
-    col = {"host": 22, "sync": 8, "stratum": 9, "ref": 20, "offset": 12}
-    hdr = (
-        f"{'Host':<{col['host']}} {'Synced':<{col['sync']}} {'Stratum':<{col['stratum']}}"
-        f" {'Reference':<{col['ref']}} {'Offset(ms)':<{col['offset']}} Error"
+def save_snapshot(snapshot_dir: Path, hostname: str, routes: dict) -> None:
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = snapshot_dir / f"{hostname}_{ts}.json"
+    path.write_text(
+        json.dumps({"timestamp": ts, "host": hostname, "routes": routes}, indent=2)
     )
-    print(hdr)
-    print("-" * (len(hdr) + 10))
-    for s in statuses:
-        sync_str = "YES" if s.synced else ("ERR" if s.error else "NO ")
-        stratum_str = str(s.stratum) if s.stratum is not None else "-"
-        offset_str = f"{s.offset_ms:.3f}" if s.offset_ms is not None else "-"
-        print(
-            f"{s.hostname:<{col['host']}} {sync_str:<{col['sync']}} {stratum_str:<{col['stratum']}}"
-            f" {s.reference:<{col['ref']}} {offset_str:<{col['offset']}} {s.error}"
-        )
+    logger.info("Saved %s — %d prefixes", path.name, len(routes))
 
 
-def _write_csv(statuses: List[NtpStatus], path: str) -> None:
-    fields = ["hostname", "synced", "stratum", "reference", "offset_ms", "error"]
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for s in statuses:
-            w.writerow({
-                "hostname": s.hostname,
-                "synced": s.synced,
-                "stratum": s.stratum if s.stratum is not None else "",
-                "reference": s.reference,
-                "offset_ms": s.offset_ms if s.offset_ms is not None else "",
-                "error": s.error,
-            })
+def load_latest_snapshot(snapshot_dir: Path, hostname: str) -> dict | None:
+    candidates = sorted(snapshot_dir.glob(f"{hostname}_*.json"))
+    if not candidates:
+        return None
+    data = json.loads(candidates[-1].read_text())
+    logger.info("Baseline: %s (%d prefixes)", candidates[-1].name, len(data["routes"]))
+    return data
 
 
-def run_audit(nr, csv_path: Optional[str] = None) -> List[NtpStatus]:
-    agg = nr.run(task=collect_ntp_status, name="NTP status")
+def diff_routes(baseline: dict, current: dict) -> dict:
+    return {
+        "added": {p: current[p] for p in current if p not in baseline},
+        "removed": {p: baseline[p] for p in baseline if p not in current},
+        "changed": {
+            p: {"before": baseline[p], "after": current[p]}
+            for p in current
+            if p in baseline and sorted(current[p]) != sorted(baseline[p])
+        },
+    }
 
-    statuses: List[NtpStatus] = []
-    for hostname, multi in agg.items():
-        status = NtpStatus(hostname=hostname)
-        task_result = multi[0]
-        if task_result.failed or isinstance(task_result.result, dict) and task_result.result.get("error"):
-            status.error = str(
-                task_result.exception or
-                (task_result.result.get("error") if isinstance(task_result.result, dict) else "") or
-                "task failed"
-            )
-        elif isinstance(task_result.result, dict):
-            data = task_result.result
-            status.synced = data.get("synced", False)
-            status.stratum = data.get("stratum")
-            status.reference = data.get("reference", "")
-            status.offset_ms = data.get("offset_ms")
-        statuses.sort(key=lambda s: (s.synced, s.hostname))
 
-    statuses.sort(key=lambda s: (s.synced, s.hostname))
-    _print_table(statuses)
-
-    if csv_path:
-        _write_csv(statuses, csv_path)
-        print(f"\nReport saved to {csv_path}")
-
-    total = len(statuses)
-    errored = sum(1 for s in statuses if s.error)
-    synced = sum(1 for s in statuses if s.synced)
-    unsynced = total - synced - errored
-    print(f"\nSummary: {total} devices — {synced} synced, {unsynced} unsynced, {errored} errors")
-    return statuses
+def print_diff(hostname: str, diff: dict) -> None:
+    total = sum(len(v) for v in diff.values())
+    if not total:
+        print(f"  {hostname}: no route changes")
+        return
+    print(f"  {hostname}: {total} change(s)")
+    for prefix, nexthops in diff["added"].items():
+        print(f"    [+] {prefix}  via {', '.join(nexthops)}")
+    for prefix, nexthops in diff["removed"].items():
+        print(f"    [-] {prefix}  via {', '.join(nexthops)}")
+    for prefix, chg in diff["changed"].items():
+        print(f"    [~] {prefix}  {', '.join(chg['before'])} -> {', '.join(chg['after'])}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Audit NTP synchronization status across network devices"
+        description="Snapshot routing tables and detect drift between runs."
     )
-    p.add_argument("--inventory", default="hosts.yaml", help="Nornir hosts file")
-    p.add_argument("--groups-file", default="groups.yaml", help="Nornir groups file")
-    p.add_argument("--defaults-file", default="defaults.yaml", help="Nornir defaults file")
-    p.add_argument("--filter-site", help="Filter hosts by data.site value")
-    p.add_argument("--filter-group", help="Filter hosts by Nornir group membership")
-    p.add_argument("--username", help="Override credential username")
-    p.add_argument("--password", help="Override credential password")
-    p.add_argument("--csv", dest="csv_path", metavar="FILE", help="Write CSV report to FILE")
-    p.add_argument("--workers", type=int, default=20, help="Concurrent workers (default: 20)")
-    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    p.add_argument("--config", default="config.yaml", help="Nornir config file")
+    p.add_argument("--host", help="Limit to a single hostname")
+    p.add_argument("--group", help="Limit to a nornir host group")
+    p.add_argument("--prefix", help="Restrict to a specific prefix (e.g. 10.0.0.0/8)")
+    p.add_argument("--output-dir", default="./route_snapshots", help="Snapshot storage directory")
+    p.add_argument("--username", help="Override inventory username")
+    p.add_argument("--password", help="Override inventory password")
+    p.add_argument("-v", "--verbose", action="store_true")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--save", action="store_true", help="Save a new snapshot")
+    mode.add_argument("--compare", action="store_true", help="Compare against latest snapshot")
     return p
 
 
-if __name__ == "__main__":
+def main() -> None:
     args = build_parser().parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    nr = InitNornir(
-        inventory={
-            "plugin": "SimpleInventory",
-            "options": {
-                "host_file": args.inventory,
-                "group_file": args.groups_file,
-                "defaults_file": args.defaults_file,
-            },
-        },
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-    )
-
-    if args.username or args.password:
-        for host in nr.inventory.hosts.values():
-            if args.username:
-                host.username = args.username
-            if args.password:
-                host.password = args.password
-
-    if args.filter_group:
-        nr = nr.filter(F(groups__contains=args.filter_group))
-    if args.filter_site:
-        nr = nr.filter(F(data__site=args.filter_site))
+    nr = InitNornir(config_file=args.config)
+    if args.host:
+        nr = nr.filter(name=args.host)
+    if args.group:
+        nr = nr.filter(groups=args.group)
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
 
     if not nr.inventory.hosts:
-        print("No hosts matched the filter criteria.", file=sys.stderr)
+        logger.error("No hosts matched filters.")
         sys.exit(1)
 
-    print(f"Running NTP audit against {len(nr.inventory.hosts)} device(s)...\n")
-    run_audit(nr, csv_path=args.csv_path)
+    logger.info("Collecting routes from %d host(s)...", len(nr.inventory.hosts))
+    results = nr.run(task=collect_routes, prefix_filter=args.prefix)
+
+    if args.verbose:
+        print_result(results)
+
+    snapshot_dir = Path(args.output_dir)
+    exit_code = 0
+
+    print(f"\n{'=' * 58}")
+    mode_label = "Snapshot" if args.save else "Comparison"
+    print(f"Route {mode_label}  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 58}")
+
+    for hostname, multi in results.items():
+        if multi.failed:
+            logger.error("%s: collection failed — %s", hostname, multi[0].exception)
+            exit_code = 1
+            continue
+
+        current = parse_routes(multi[0].result)
+
+        if args.save:
+            save_snapshot(snapshot_dir, hostname, current)
+            print(f"  {hostname}: saved {len(current)} prefixes")
+        else:
+            baseline = load_latest_snapshot(snapshot_dir, hostname)
+            if baseline is None:
+                print(f"  {hostname}: no baseline found — run --save first")
+                exit_code = 1
+                continue
+            diff = diff_routes(baseline["routes"], current)
+            print_diff(hostname, diff)
+            if any(diff.values()):
+                exit_code = 2
+
+    print(f"{'=' * 58}\n")
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
+```
