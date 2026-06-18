@@ -1,255 +1,209 @@
 ```python
+#!/usr/bin/env python3
 """
-Device Configuration Comparison Tool - Compares current vs backed-up device configs.
+Device Health Monitor - Collects and reports device health metrics.
 
 Purpose:
-    Retrieves device running configurations and compares them against previously
-    backed-up versions. Reports configuration drift and changes between versions.
-    Useful for change tracking, compliance auditing, and troubleshooting.
+  Monitor device CPU, memory, and disk usage across the network inventory.
+  Generates alerts when metrics exceed configurable thresholds.
 
 Usage:
-    python config_compare.py --inventory inventory.yml --backup-dir ./backups
+  python device_health_monitor.py --threshold-cpu 80 --threshold-memory 85
+  python device_health_monitor.py --device switch01 --verbose
 
 Prerequisites:
-    - Nornir installed with netmiko plugin
-    - Network device SSH access
-    - Device credentials in inventory
-    - Previously backed-up config files (or will create baseline)
-
-Examples:
-    python config_compare.py --inventory inventory.yml --backup-dir ./backups
-    python config_compare.py --inventory inventory.yml --backup-dir ./backups --devices router1,router2
-    python config_compare.py --inventory inventory.yml --backup-dir ./backups --save-backup
+  - Nornir configured with device inventory
+  - Devices reachable via SSH/API
+  - Network connectivity and proper credentials
 """
 
-import json
 import logging
 import argparse
-from pathlib import Path
+import sys
 from datetime import datetime
-from typing import Dict, List, Any, Tuple
-from difflib import unified_diff
-
 from nornir import InitNornir
 from nornir.core.filter import F
+from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
+from nornir_napalm.tasks import napalm_get
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
 
-def get_running_config(task) -> str:
-    """Retrieve running configuration from device."""
+def collect_device_health(
+    task: Task,
+    threshold_cpu: int,
+    threshold_mem: int,
+    threshold_disk: int,
+) -> Result:
+    """Collect health metrics from device using NAPALM."""
     try:
-        if "iosxr" in task.host.platform.lower():
-            cmd = "show running-config"
-        elif "eos" in task.host.platform.lower():
-            cmd = "show running-config"
-        else:
-            cmd = "show running-config"
-        
-        result = task.run(netmiko_send_command, command_string=cmd)
-        return result[0].result if result else ""
-    except Exception as e:
-        logger.error(f"Failed to get config from {task.host.name}: {e}")
-        raise
+        facts_result = task.run(
+            name="gather_facts",
+            task=napalm_get,
+            getters=["facts"],
+        )
 
+        if facts_result[0].failed:
+            return Result(host=task.host, failed=True, result="Failed to retrieve facts")
 
-def load_backup_config(backup_path: Path) -> str:
-    """Load previously backed-up configuration."""
-    try:
-        with open(backup_path, 'r') as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.warning(f"Backup not found: {backup_path}")
-        return ""
+        facts = facts_result[0].result.get("facts", {})
 
-
-def save_config_backup(device_name: str, config: str, backup_dir: Path) -> None:
-    """Save configuration to backup file."""
-    backup_file = backup_dir / f"{device_name}.cfg"
-    try:
-        with open(backup_file, 'w') as f:
-            f.write(config)
-        logger.info(f"Backed up config for {device_name}")
-    except Exception as e:
-        logger.error(f"Failed to save backup for {device_name}: {e}")
-
-
-def compare_configs(device_name: str, current: str, backup: str) -> Dict[str, Any]:
-    """Compare current and backed-up configurations."""
-    has_backup = bool(backup.strip())
-    
-    if not has_backup:
-        return {
-            "device": device_name,
+        health_metrics = {
+            "hostname": task.host.name,
+            "device_type": task.host.platform or "unknown",
+            "model": facts.get("model", "N/A"),
+            "os_version": facts.get("os_version", "N/A"),
+            "uptime_seconds": facts.get("uptime_seconds", 0),
+            "serial_number": facts.get("serial_number", "N/A"),
             "timestamp": datetime.now().isoformat(),
-            "status": "no_baseline",
-            "message": "No previous backup to compare",
-            "lines_changed": 0,
-            "differences": []
         }
-    
-    current_lines = current.splitlines(keepends=True)
-    backup_lines = backup.splitlines(keepends=True)
-    
-    diff = list(unified_diff(
-        backup_lines, current_lines,
-        fromfile='backup', tofile='current',
-        lineterm=''
-    ))
-    
-    changed = len(diff) > 0
-    
-    return {
-        "device": device_name,
-        "timestamp": datetime.now().isoformat(),
-        "status": "changed" if changed else "unchanged",
-        "message": f"{len(diff)} line(s) different" if changed else "Configuration unchanged",
-        "lines_changed": len(diff),
-        "differences": diff[:50]
-    }
+
+        cpu_usage = task.host.get("cpu_usage", 0)
+        memory_usage = task.host.get("memory_usage", 0)
+        disk_usage = task.host.get("disk_usage", 0)
+
+        health_metrics["cpu_usage"] = cpu_usage
+        health_metrics["memory_usage"] = memory_usage
+        health_metrics["disk_usage"] = disk_usage
+
+        alerts = []
+        if cpu_usage > threshold_cpu:
+            alerts.append(f"CPU {cpu_usage}% exceeds {threshold_cpu}%")
+        if memory_usage > threshold_mem:
+            alerts.append(f"Memory {memory_usage}% exceeds {threshold_mem}%")
+        if disk_usage > threshold_disk:
+            alerts.append(f"Disk {disk_usage}% exceeds {threshold_disk}%")
+
+        health_metrics["alerts"] = alerts
+        health_metrics["status"] = "OK" if not alerts else "ALERT"
+
+        return Result(host=task.host, result=health_metrics)
+
+    except Exception as e:
+        logger.error(f"{task.host.name}: Error - {str(e)}")
+        return Result(host=task.host, failed=True, result=str(e))
 
 
-def analyze_devices(nr, backup_dir: Path, save_backup: bool = False, 
-                   device_filter: List[str] = None) -> List[Dict[str, Any]]:
-    """Analyze configuration changes across devices."""
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    results = []
-    
-    if device_filter:
-        devices = nr.filter(F(name__in=device_filter))
-    else:
-        devices = nr
-    
-    for device_name, device in devices.inventory.hosts.items():
-        result = {
-            "device": device_name,
-            "timestamp": datetime.now().isoformat(),
-            "status": "error",
-            "message": "Unknown error"
-        }
-        
-        try:
-            current_config = get_running_config(None)
-            backup_config = load_backup_config(backup_dir / f"{device_name}.cfg")
-            
-            result = compare_configs(device_name, current_config, backup_config)
-            
-            if save_backup:
-                save_config_backup(device_name, current_config, backup_dir)
-            
-            status_icon = "✓" if result["status"] == "unchanged" else "⚠"
-            logger.info(f"{status_icon} {device_name:20s} {result['message']}")
-        
-        except Exception as e:
-            result["message"] = str(e)
-            logger.error(f"✗ {device_name:20s} Error: {str(e)}")
-        
-        results.append(result)
-    
-    return results
-
-
-def print_comparison_report(results: List[Dict[str, Any]]) -> None:
-    """Print formatted comparison report."""
-    unchanged = sum(1 for r in results if r["status"] == "unchanged")
-    changed = sum(1 for r in results if r["status"] == "changed")
-    errors = sum(1 for r in results if r["status"] == "error")
-    
-    print("\n" + "=" * 70)
-    print("Configuration Comparison Report")
-    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-    
-    for result in results:
-        status_icon = "✓" if result["status"] == "unchanged" else "⚠"
-        if result["status"] == "error":
-            status_icon = "✗"
-        
-        print(f"\n[{status_icon}] {result['device']:20s} {result['message']}")
-        
-        if result["status"] == "changed" and result.get("differences"):
-            print(f"     First few changes (showing up to 10 lines):")
-            for line in result["differences"][:10]:
-                line_str = line.rstrip()
-                if line_str.startswith('-'):
-                    print(f"     - {line_str[1:]}")
-                elif line_str.startswith('+'):
-                    print(f"     + {line_str[1:]}")
-    
-    print("\n" + "=" * 70)
-    print(f"Summary: {unchanged} unchanged, {changed} changed, {errors} errors")
-    print("=" * 70 + "\n")
+def format_uptime(seconds: int) -> str:
+    """Convert uptime seconds to human-readable format."""
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare device configurations against backups"
+        description="Monitor device health across network inventory"
     )
     parser.add_argument(
-        "--inventory",
-        default="inventory.yml",
-        help="Path to Nornir inventory file"
+        "--device",
+        help="Target specific device by name",
     )
     parser.add_argument(
-        "--backup-dir",
-        default="./config_backups",
-        help="Directory for configuration backups"
+        "--threshold-cpu",
+        type=int,
+        default=80,
+        help="CPU usage threshold in percent (default: 80)",
     )
     parser.add_argument(
-        "--devices",
-        help="Comma-separated device names to check"
+        "--threshold-memory",
+        type=int,
+        default=85,
+        help="Memory usage threshold in percent (default: 85)",
     )
     parser.add_argument(
-        "--save-backup",
+        "--threshold-disk",
+        type=int,
+        default=90,
+        help="Disk usage threshold in percent (default: 90)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
         action="store_true",
-        help="Save current configs as new backups"
+        help="Enable verbose logging output",
     )
-    parser.add_argument(
-        "--output",
-        help="Save results to JSON file"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
-    
+
     args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
     try:
-        logger.info(f"Loading inventory from {args.inventory}")
-        nr = InitNornir(config_file=args.inventory)
-        
-        backup_dir = Path(args.backup_dir)
-        device_list = args.devices.split(",") if args.devices else None
-        
-        logger.info("Comparing device configurations...")
-        results = analyze_devices(nr, backup_dir, args.save_backup, device_list)
-        
-        print_comparison_report(results)
-        
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(results, f, indent=2)
-            logger.info(f"Results saved to {args.output}")
-        
-        changed_count = sum(1 for r in results if r["status"] == "changed")
-        return 0 if changed_count == 0 else 1
-    
+        logger.info("Initializing Nornir inventory...")
+        nr = InitNornir()
+
+        if args.device:
+            nr = nr.filter(F(name=args.device))
+            if not nr.inventory.hosts:
+                logger.error(f"Device '{args.device}' not found in inventory")
+                sys.exit(1)
+
+        logger.info(f"Starting health check on {len(nr.inventory.hosts)} device(s)...")
+
+        results = nr.run(
+            name="collect_health",
+            task=collect_device_health,
+            threshold_cpu=args.threshold_cpu,
+            threshold_mem=args.threshold_memory,
+            threshold_disk=args.threshold_disk,
+        )
+
+        print("\n" + "=" * 80)
+        print("DEVICE HEALTH REPORT")
+        print("=" * 80)
+
+        summary = {"total": 0, "ok": 0, "alert": 0, "failed": 0}
+
+        for host_name in sorted(results.keys()):
+            host_results = results[host_name]
+            summary["total"] += 1
+
+            if host_results[0].failed:
+                summary["failed"] += 1
+                print(f"\n{host_name:30} [FAILED]")
+                print(f"  Error: {host_results[0].result}")
+                continue
+
+            metrics = host_results[0].result
+            status = metrics["status"]
+            summary[status.lower()] += 1
+
+            status_symbol = "✓" if status == "OK" else "⚠"
+            print(f"\n{host_name:30} [{status}] {status_symbol}")
+            print(f"  Model: {metrics['model']}")
+            print(f"  OS: {metrics['os_version']}")
+            print(f"  Uptime: {format_uptime(metrics['uptime_seconds'])}")
+            print(
+                f"  Resources: CPU {metrics['cpu_usage']}% | "
+                f"Memory {metrics['memory_usage']}% | "
+                f"Disk {metrics['disk_usage']}%"
+            )
+
+            if metrics["alerts"]:
+                for alert in metrics["alerts"]:
+                    print(f"  ⚠ {alert}")
+
+        print("\n" + "=" * 80)
+        print(
+            f"SUMMARY: Total={summary['total']} OK={summary['ok']} "
+            f"ALERT={summary['alert']} FAILED={summary['failed']}"
+        )
+        print("=" * 80 + "\n")
+
+        exit_code = 0 if summary["failed"] == 0 and summary["alert"] == 0 else 1
+        sys.exit(exit_code)
+
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}", exc_info=args.verbose)
-        return 1
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
