@@ -1,214 +1,193 @@
 ```python
 """
-Device Health Status Check
+Interface Statistics Analyzer - Device Network Performance Monitor
 
 Purpose:
-    Collects system metrics from network devices (uptime, CPU, memory, temperature)
-    and generates a health status report. Useful for monitoring device operational
-    health and identifying degraded systems before they cause outages.
+    Gathers and analyzes interface statistics from network devices to identify
+    problematic interfaces with high error rates, drops, or other anomalies.
+    Useful for capacity planning, troubleshooting, and network health monitoring.
 
 Usage:
-    python 022_device_health_check.py --inventory inventory.yaml --group routers \\
-        --output health_report.txt --log-level INFO
+    python interface_stats_analyzer.py --devices all
+    python interface_stats_analyzer.py --devices router1,router2
+    python interface_stats_analyzer.py --threshold-errors 100
+    python interface_stats_analyzer.py --output json
 
 Prerequisites:
-    - Nornir with netmiko/napalm plugins installed
-    - Device inventory configured (YAML format)
-    - Network connectivity to target devices
-    - Device credentials (via env vars or inventory file)
+    - nornir installed (pip install nornir)
+    - nornir inventory file configured
+    - Network devices supporting NAPALM get_interfaces_counters()
+    - Credentials configured in environment or nornir config
+    - paramiko, netmiko, and napalm installed
+
+Author: Network Engineer
 """
 
 import logging
 import argparse
 import json
-from typing import Dict, Any
-from datetime import datetime
+from typing import Dict, List, Any
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.core.task import Result
+from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.filter import F
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging with timestamp and level."""
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging output."""
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
 
-def collect_device_facts(task: Task) -> Result:
-    """Retrieve device facts using NAPALM getter."""
+def gather_interface_stats(task) -> Result:
+    """Gather interface statistics from device."""
     try:
-        facts = task.run(napalm_get, getters=["facts"])
-        return facts
+        result = task.run(napalm_get, getters=['interfaces_counters'])
+        return result
     except Exception as e:
-        logging.error(f"{task.host.name}: Failed to collect facts - {e}")
-        return Result(host=task.host, result={}, failed=True)
+        logger.error(f"{task.host.name}: Failed to gather stats - {e}")
+        return Result(host=task.host, failed=True, exception=e)
 
 
-def evaluate_health(facts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Evaluate device health based on facts.
-    
-    Checks uptime, model, vendor to determine operational status.
-    """
-    if not facts or "facts" not in facts:
-        return {
-            "status": "UNKNOWN",
-            "reason": "No facts collected",
-            "issues": [],
-        }
-    
-    device_facts = facts["facts"]
-    uptime_seconds = device_facts.get("uptime_seconds", 0)
-    uptime_hours = uptime_seconds / 3600
-    
-    issues = []
-    status = "HEALTHY"
-    
-    if uptime_hours < 1:
-        issues.append("Device rebooted in last hour")
-        status = "WARNING"
-    elif uptime_hours < 24:
-        issues.append("Device rebooted within 24 hours")
-    
-    if uptime_hours == 0:
-        status = "CRITICAL"
-        issues.append("Device unreachable or facts unavailable")
-    
-    return {
-        "status": status,
-        "hostname": device_facts.get("hostname", "Unknown"),
-        "vendor": device_facts.get("vendor", "Unknown"),
-        "model": device_facts.get("model", "Unknown"),
-        "os_version": device_facts.get("os_version", "Unknown"),
-        "uptime_hours": round(uptime_hours, 2),
-        "uptime_seconds": uptime_seconds,
-        "issues": issues,
-    }
+def analyze_interfaces(stats: Dict[str, Any],
+                      error_threshold: int = 100,
+                      drop_threshold: int = 50) -> Dict[str, List[str]]:
+    """Analyze interface stats and flag problematic interfaces."""
+    problems = {"errors": [], "drops": [], "disabled": []}
+
+    for iface, counters in stats.items():
+        total_errors = (counters.get("rx_errors", 0) +
+                       counters.get("tx_errors", 0) +
+                       counters.get("rx_crc_errors", 0))
+        total_drops = (counters.get("rx_discards", 0) +
+                      counters.get("tx_discards", 0))
+
+        if total_errors >= error_threshold:
+            problems["errors"].append(
+                f"{iface}: {total_errors} errors"
+            )
+        if total_drops >= drop_threshold:
+            problems["drops"].append(
+                f"{iface}: {total_drops} drops"
+            )
+        if not counters.get("is_up", True):
+            problems["disabled"].append(iface)
+
+    return problems
 
 
-def generate_report(health_data: Dict[str, Dict[str, Any]]) -> str:
-    """Generate formatted health report from collected data."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    lines = [
-        "=" * 90,
-        f"DEVICE HEALTH STATUS REPORT - {timestamp}",
-        "=" * 90,
-        "",
-    ]
-    
-    status_counts = {"HEALTHY": 0, "WARNING": 0, "CRITICAL": 0, "UNKNOWN": 0}
-    
-    for hostname in sorted(health_data.keys()):
-        health = health_data[hostname]
-        status = health.get("status", "UNKNOWN")
-        status_counts[status] = status_counts.get(status, 0) + 1
-        
-        status_symbol = {
-            "HEALTHY": "✓",
-            "WARNING": "⚠",
-            "CRITICAL": "✗",
-            "UNKNOWN": "?",
-        }.get(status, "?")
-        
-        lines.append(f"[{status_symbol}] {hostname}")
-        lines.append(f"    Status: {status:12} | Uptime: {health.get('uptime_hours', 0):>8} hours")
-        lines.append(f"    Vendor: {health.get('vendor', 'N/A'):12} | Model: {health.get('model', 'N/A')}")
-        lines.append(f"    OS: {health.get('os_version', 'N/A')}")
-        
-        if health.get("issues"):
-            lines.append("    Issues:")
-            for issue in health["issues"]:
-                lines.append(f"      • {issue}")
-        
-        lines.append("")
-    
-    lines.extend([
-        "=" * 90,
-        f"Summary: {status_counts['HEALTHY']} Healthy | "
-        f"{status_counts['WARNING']} Warning | "
-        f"{status_counts['CRITICAL']} Critical | "
-        f"{status_counts['UNKNOWN']} Unknown",
-        "=" * 90,
-    ])
-    
-    return "\n".join(lines)
+def format_report(results: Dict, output_format: str = "text") -> str:
+    """Format analysis results for output."""
+    if output_format == "json":
+        return json.dumps(results, indent=2)
+
+    report = "\n=== Interface Statistics Analysis Report ===\n"
+    for device, data in results.items():
+        if data["failed"]:
+            report += f"\n{device}: FAILED - {data['error']}\n"
+        else:
+            problems = data["problems"]
+            report += f"\n{device}:\n"
+            if not any(problems.values()):
+                report += "  Status: OK - No issues detected\n"
+            else:
+                if problems["errors"]:
+                    report += f"  Errors ({len(problems['errors'])}): "
+                    report += ", ".join(problems["errors"][:3])
+                    report += "\n"
+                if problems["drops"]:
+                    report += f"  Drops ({len(problems['drops'])}): "
+                    report += ", ".join(problems["drops"][:3])
+                    report += "\n"
+                if problems["disabled"]:
+                    report += f"  Disabled: {', '.join(problems['disabled'][:5])}\n"
+
+    return report
 
 
-def main() -> int:
+def main():
     """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Collect and evaluate device health status from network inventory"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--inventory",
-        default="inventory.yaml",
-        help="Path to nornir inventory file (default: inventory.yaml)",
-    )
-    parser.add_argument(
-        "--group",
+        "--devices",
         default="all",
-        help="Filter to specific device group (default: all)",
+        help="Comma-separated list of devices or 'all' (default: all)"
+    )
+    parser.add_argument(
+        "--threshold-errors",
+        type=int,
+        default=100,
+        help="Error count threshold (default: 100)"
+    )
+    parser.add_argument(
+        "--threshold-drops",
+        type=int,
+        default=50,
+        help="Drop count threshold (default: 50)"
     )
     parser.add_argument(
         "--output",
-        help="Output file for report (default: stdout)",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
     )
     parser.add_argument(
-        "--json",
+        "-v", "--verbose",
         action="store_true",
-        help="Output results as JSON instead of formatted text",
+        help="Enable verbose logging"
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity (default: INFO)",
-    )
-    
+
     args = parser.parse_args()
-    setup_logging(args.log_level)
-    
+    setup_logging(args.verbose)
+
     try:
-        nr = InitNornir(config_file=args.inventory)
+        nr = InitNornir(config_file="config.yaml")
+
+        if args.devices != "all":
+            devices = args.devices.split(",")
+            nr = nr.filter(F(name__in=devices))
+
+        logger.info(f"Gathering stats from {len(nr.inventory.hosts)} devices")
+        results = nr.run(task=gather_interface_stats)
+
+        analysis = {}
+        for device_name, task_result in results.items():
+            if task_result.failed:
+                analysis[device_name] = {
+                    "failed": True,
+                    "error": str(task_result.exception)
+                }
+            else:
+                stats = task_result[0].result.get("interfaces_counters", {})
+                problems = analyze_interfaces(
+                    stats,
+                    error_threshold=args.threshold_errors,
+                    drop_threshold=args.threshold_drops
+                )
+                analysis[device_name] = {
+                    "failed": False,
+                    "problems": problems,
+                    "interface_count": len(stats)
+                }
+
+        report = format_report(analysis, args.output)
+        print(report)
+
+        logger.info("Analysis complete")
+
     except Exception as e:
-        logging.error(f"Failed to initialize nornir: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
         return 1
-    
-    logging.info(f"Loaded inventory with {len(nr.inventory.hosts)} hosts")
-    
-    if args.group != "all":
-        nr = nr.filter(group=args.group)
-        logging.info(f"Filtered to {len(nr.inventory.hosts)} hosts in group '{args.group}'")
-    
-    logging.info("Collecting device facts...")
-    results = nr.run(task=collect_device_facts)
-    
-    health_data = {}
-    for hostname, task_result in results.items():
-        if task_result[0].result:
-            health_data[hostname] = evaluate_health(task_result[0].result)
-        else:
-            health_data[hostname] = {
-                "status": "CRITICAL",
-                "reason": "Task execution failed",
-                "issues": ["Failed to collect device facts"],
-            }
-    
-    if args.json:
-        output = json.dumps(health_data, indent=2)
-    else:
-        output = generate_report(health_data)
-    
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(output)
-        logging.info(f"Report written to {args.output}")
-    else:
-        print(output)
-    
+
     return 0
 
 
