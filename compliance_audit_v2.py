@@ -1,225 +1,211 @@
-```python
+```
 """
-Device Configuration Compliance Checker
+Management Plane Compliance Audit
 
-Purpose: Validate network device configurations against a defined compliance policy.
-Checks for required configuration items such as NTP, DNS, syslog servers, device
-hostnames, and other critical settings that must be present on all managed devices.
+Purpose:
+    Audits network devices for management plane security compliance, verifying
+    NTP server configuration, syslog destinations, MOTD banner presence,
+    SSH version enforcement, and AAA/TACACS authentication setup against a
+    policy baseline supplied at the command line.
+
+    This complements general compliance_audit.py (which focuses on interface
+    and routing policy) by targeting the out-of-band management control plane.
 
 Usage:
-    python device_config_compliance.py --devices core_routers --policy strict
-    python device_config_compliance.py --devices all --policy standard --format json
+    python 034_compliance_audit.py \
+        --host 192.168.1.1 --username admin --password secret \
+        --platform cisco_ios \
+        --ntp-servers 10.0.0.1 10.0.0.2 \
+        --syslog-servers 10.0.0.10 \
+        --require-banner --require-ssh2 --require-aaa
 
 Prerequisites:
-    - nornir installed with netmiko drivers
-    - Inventory file configured (hosts.yaml, groups.yaml, defaults.yaml)
-    - Network connectivity to target devices
-    - Valid credentials in environment or inventory
+    pip install nornir nornir-netmiko nornir-utils netmiko
 """
 
 import argparse
-import json
 import logging
-from typing import Dict, List
-from nornir import InitNornir
+import sys
+
+from nornir.core import Nornir
+from nornir.core.configuration import Config
+from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
+from nornir.core.plugins.runners import ThreadedRunner
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-COMPLIANCE_POLICIES = {
-    'strict': {
-        'ntp_servers_min': 3,
-        'dns_servers_min': 2,
-        'syslog_servers_min': 1,
-        'hostname_required': True,
-    },
-    'standard': {
-        'ntp_servers_min': 2,
-        'dns_servers_min': 1,
-        'syslog_servers_min': 1,
-        'hostname_required': True,
-    },
-    'minimal': {
-        'ntp_servers_min': 1,
-        'dns_servers_min': 1,
-        'syslog_servers_min': 0,
-        'hostname_required': True,
-    },
+COMMANDS = {
+    "ntp": "show ntp associations",
+    "syslog": "show logging",
+    "banner": "show banner motd",
+    "ssh": "show ip ssh",
+    "aaa": "show aaa servers",
 }
 
 
-def parse_ios_config(config: str) -> Dict[str, List[str]]:
-    """Parse Cisco IOS config for compliance items."""
-    items = {
-        'ntp_servers': [],
-        'dns_servers': [],
-        'syslog_servers': [],
-        'hostname': None,
+def _check_servers(output: str, required: list) -> dict:
+    missing = [s for s in required if s not in output]
+    return {
+        "compliant": not missing,
+        "detail": f"Missing: {missing}" if missing else "All required servers present",
     }
 
-    for line in config.split('\n'):
-        line = line.strip()
-        if line.startswith('hostname '):
-            items['hostname'] = line.split()[-1]
-        elif line.startswith('ntp server '):
-            server = line.split()[-1]
-            if server not in items['ntp_servers']:
-                items['ntp_servers'].append(server)
-        elif line.startswith('ip name-server '):
-            server = line.split()[-1]
-            if server not in items['dns_servers']:
-                items['dns_servers'].append(server)
-        elif line.startswith('logging '):
-            parts = line.split()
-            if len(parts) > 1 and '.' in parts[-1]:
-                if parts[-1] not in items['syslog_servers']:
-                    items['syslog_servers'].append(parts[-1])
 
-    return items
+def _check_banner(output: str) -> dict:
+    present = bool(output.strip()) and len(output.strip()) > 5
+    return {
+        "compliant": present,
+        "detail": "MOTD banner configured" if present else "No MOTD banner found",
+    }
 
 
-def check_compliance(task: Task, policy: str) -> Result:
-    """Check device configuration compliance against policy."""
-    policy_rules = COMPLIANCE_POLICIES.get(policy, COMPLIANCE_POLICIES['standard'])
+def _check_ssh(output: str) -> dict:
+    ok = "SSH Enabled - version 2.0" in output or "version 2.0" in output.lower()
+    return {
+        "compliant": ok,
+        "detail": "SSH v2.0 enforced" if ok else "SSH v2.0 not confirmed — check 'ip ssh version 2'",
+    }
 
-    try:
-        config_result = task.run(
-            task=netmiko_send_command,
-            command_string='show running-config',
-        )
-        config_output = config_result[0].result
 
-        config_items = parse_ios_config(config_output)
+def _check_aaa(output: str) -> dict:
+    ok = any(kw in output.upper() for kw in ("TACACS", "RADIUS")) or len(output.strip()) > 30
+    return {
+        "compliant": ok,
+        "detail": "AAA servers configured" if ok else "No AAA server entries found",
+    }
 
-        violations = []
 
-        if not config_items['hostname']:
-            violations.append('Hostname not configured')
+def mgmt_plane_audit(task: Task, policy: dict) -> Result:
+    checks = {}
+    errors = []
 
-        ntp_count = len(config_items['ntp_servers'])
-        if ntp_count < policy_rules['ntp_servers_min']:
-            violations.append(
-                f"NTP servers: {ntp_count} "
-                f"(required: {policy_rules['ntp_servers_min']})"
+    for key, cmd in COMMANDS.items():
+        try:
+            r = task.run(
+                task=netmiko_send_command,
+                command_string=cmd,
+                name=f"cmd_{key}",
             )
+            output = r.result or ""
+        except Exception as exc:
+            errors.append(f"{key}: {exc}")
+            output = ""
 
-        dns_count = len(config_items['dns_servers'])
-        if dns_count < policy_rules['dns_servers_min']:
-            violations.append(
-                f"DNS servers: {dns_count} "
-                f"(required: {policy_rules['dns_servers_min']})"
-            )
+        if key == "ntp" and policy["ntp_servers"]:
+            checks["ntp_servers"] = _check_servers(output, policy["ntp_servers"])
+        elif key == "syslog" and policy["syslog_servers"]:
+            checks["syslog_servers"] = _check_servers(output, policy["syslog_servers"])
+        elif key == "banner" and policy["require_banner"]:
+            checks["motd_banner"] = _check_banner(output)
+        elif key == "ssh" and policy["require_ssh2"]:
+            checks["ssh_version"] = _check_ssh(output)
+        elif key == "aaa" and policy["require_aaa"]:
+            checks["aaa_servers"] = _check_aaa(output)
 
-        syslog_count = len(config_items['syslog_servers'])
-        if syslog_count < policy_rules['syslog_servers_min']:
-            violations.append(
-                f"Syslog servers: {syslog_count} "
-                f"(required: {policy_rules['syslog_servers_min']})"
-            )
+    if not checks and not errors:
+        errors.append("No policy checks enabled — pass at least one --require-* flag or --ntp/--syslog-servers")
 
-        result = {
-            'hostname': config_items['hostname'],
-            'compliant': len(violations) == 0,
-            'violations': violations,
-            'config_items': config_items,
-        }
-
-        return Result(host=task.host, result=result)
-
-    except Exception as e:
-        logger.error(f'{task.host.name}: {e}')
-        return Result(
-            host=task.host,
-            result={
-                'error': str(e),
-                'compliant': False,
-            },
-            failed=True,
-        )
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Check network device configuration compliance'
-    )
-    parser.add_argument(
-        '--devices',
-        default='all',
-        help='Device group or individual device name (default: all)'
-    )
-    parser.add_argument(
-        '--policy',
-        choices=list(COMPLIANCE_POLICIES.keys()),
-        default='standard',
-        help='Compliance policy to apply (default: standard)'
-    )
-    parser.add_argument(
-        '--format',
-        choices=['table', 'json'],
-        default='table',
-        help='Output format (default: table)'
+    overall = bool(checks) and all(v["compliant"] for v in checks.values())
+    return Result(
+        host=task.host,
+        result={"checks": checks, "compliant": overall, "errors": errors},
     )
 
-    args = parser.parse_args()
 
-    try:
-        nr = InitNornir(config_file='config.yaml')
+def print_report(agg_result) -> int:
+    total = len(agg_result)
+    noncompliant = 0
 
-        if args.devices != 'all':
-            nr = nr.filter(name=args.devices) or nr.filter(group=args.devices)
+    for host, multi_result in agg_result.items():
+        if multi_result.failed:
+            print(f"\n[ERROR] {host}: {multi_result.exception}")
+            noncompliant += 1
+            continue
 
-        if len(nr.inventory.hosts) == 0:
-            logger.warning(f'No devices found: {args.devices}')
-            return
+        data = multi_result[0].result
+        status = "COMPLIANT" if data["compliant"] else "NON-COMPLIANT"
+        bar = "=" * 58
+        print(f"\n{bar}")
+        print(f"  Host : {host}")
+        print(f"  Status: {status}")
+        print(bar)
 
-        logger.info(f'Running compliance check on {len(nr.inventory.hosts)} devices')
-        logger.info(f'Policy: {args.policy}')
+        for check, info in data["checks"].items():
+            mark = "PASS" if info["compliant"] else "FAIL"
+            print(f"  [{mark}] {check:<18} {info['detail']}")
 
-        results = nr.run(
-            task=check_compliance,
-            policy=args.policy,
-            num_workers=4,
-        )
+        for err in data["errors"]:
+            print(f"  [WARN] {err}")
 
-        compliance_results = {}
-        compliant_count = 0
+        if not data["compliant"]:
+            noncompliant += 1
 
-        for host_name, multi_result in results.items():
-            for task_result in multi_result:
-                if task_result.result:
-                    result_data = task_result.result
-                    compliance_results[host_name] = result_data
-                    if result_data.get('compliant'):
-                        compliant_count += 1
-
-        if args.format == 'json':
-            print(json.dumps(compliance_results, indent=2))
-        else:
-            total = len(compliance_results)
-            print(f'\n{"Device":<20} {"Status":<12} {"Violations":<50}')
-            print('-' * 82)
-            for device, data in compliance_results.items():
-                if 'error' in data:
-                    print(f'{device:<20} {"ERROR":<12} {data["error"]:<50}')
-                else:
-                    status = 'COMPLIANT' if data['compliant'] else 'VIOLATION'
-                    violations_str = '; '.join(data['violations'])[:50] if data['violations'] else 'None'
-                    print(f'{device:<20} {status:<12} {violations_str:<50}')
-
-            print(f'\nSummary: {compliant_count}/{total} devices compliant')
-
-        logger.info(f'Compliance check complete: {compliant_count}/{total} compliant')
-
-    except Exception as e:
-        logger.error(f'Compliance check failed: {e}', exc_info=True)
-        raise
+    print(f"\nResult: {total - noncompliant}/{total} hosts compliant\n")
+    return 1 if noncompliant else 0
 
 
-if __name__ == '__main__':
-    main()
+def build_nornir(args: argparse.Namespace) -> Nornir:
+    defaults = Defaults(username=args.username, password=args.password)
+    host = Host(
+        name=args.host,
+        hostname=args.host,
+        port=args.port,
+        platform=args.platform,
+        defaults=defaults,
+    )
+    inventory = Inventory(
+        hosts=Hosts({args.host: host}),
+        groups=Groups(),
+        defaults=defaults,
+    )
+    return Nornir(
+        inventory=inventory,
+        runner=ThreadedRunner(num_workers=1),
+        config=Config(),
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Management plane compliance audit (NTP, syslog, banner, SSH, AAA)"
+    )
+    p.add_argument("--host", required=True, help="Device hostname or IP")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", required=True, help="SSH password")
+    p.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--ntp-servers", nargs="*", default=[], metavar="IP",
+                   help="Required NTP server IPs")
+    p.add_argument("--syslog-servers", nargs="*", default=[], metavar="IP",
+                   help="Required syslog server IPs")
+    p.add_argument("--require-banner", action="store_true",
+                   help="Fail if no MOTD banner is configured")
+    p.add_argument("--require-ssh2", action="store_true",
+                   help="Fail if SSH version 2 is not enforced")
+    p.add_argument("--require-aaa", action="store_true",
+                   help="Fail if no AAA/TACACS/RADIUS servers are configured")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    policy = {
+        "ntp_servers": args.ntp_servers,
+        "syslog_servers": args.syslog_servers,
+        "require_banner": args.require_banner,
+        "require_ssh2": args.require_ssh2,
+        "require_aaa": args.require_aaa,
+    }
+
+    nr = build_nornir(args)
+
+    result = nr.run(task=mgmt_plane_audit, policy=policy)
+    sys.exit(print_report(result))
 ```
