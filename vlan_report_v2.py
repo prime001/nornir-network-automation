@@ -1,179 +1,165 @@
 ```python
 """
-Device Health Reporter
+Device Fact Collection and Inventory Report Generator
 
-Purpose:
-    Gathers and reports system health metrics (uptime, CPU, memory, temperature)
-    from network devices using NAPALM operational methods.
-
-Usage:
-    python device_health_report.py --devices router1,router2 --output json
-    python device_health_report.py --filter os:iosxe --verbose
+Gathers device facts (hardware, OS, serial numbers, uptime) from network devices
+using Nornir and generates formatted inventory reports.
 
 Prerequisites:
-    - nornir with netmiko and napalm plugins installed
-    - inventory.yaml configured with device credentials
-    - devices must support NAPALM get_environment() and get_facts()
-    - SSH/NETCONF connectivity to target devices
+  - Nornir installed and configured
+  - devices.yaml and groups.yaml in inventory directory
+  - Network device access credentials configured
+  - netmiko or napalm drivers available for target device types
+
+Usage:
+  python device_facts.py --devices all --output json --log-level INFO
+  python device_facts.py --devices group:switches --output table
+  python device_facts.py --devices device1,device2
 """
 
 import argparse
 import json
 import logging
-from typing import Dict, List, Any
+import sys
+from pathlib import Path
+from typing import Dict, Any
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.plugins.tasks import networking
 
 
-def setup_logging(verbose: bool = False) -> None:
-    """Configure logging output."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=level
-    )
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 
-def get_device_health(task) -> Dict[str, Any]:
-    """Retrieve health metrics from a single device."""
+def gather_device_facts(task) -> Dict[str, Any]:
+    """Gather facts from a device using NAPALM get_facts."""
     try:
-        facts = task.run(
-            napalm_get,
-            getters=['get_facts', 'get_environment']
+        result = task.run(
+            task=networking.napalm_get,
+            getters=['facts']
         )
-        return facts.result
+        return result[0].result.get('facts', {})
     except Exception as e:
-        logging.error(f"Failed to retrieve health for {task.host.name}: {str(e)}")
-        return None
+        logger.error(f"Failed to gather facts from {task.host.name}: {e}")
+        return {'error': str(e)}
 
 
-def format_health_report(device_name: str, health_data: Dict) -> Dict[str, Any]:
-    """Extract and format relevant health metrics."""
-    if not health_data or 'get_facts' not in health_data:
-        return {
-            'device': device_name,
-            'status': 'failed',
-            'error': 'No data retrieved'
-        }
-
-    facts = health_data.get('get_facts', {})
-    env = health_data.get('get_environment', {})
-
-    report = {
-        'device': device_name,
-        'os_version': facts.get('os_version', 'unknown'),
-        'uptime_seconds': facts.get('uptime_seconds', 0),
-        'serial_number': facts.get('serial_number', 'unknown'),
-    }
-
-    if env:
-        cpu_data = env.get('cpu', {})
-        if isinstance(cpu_data, dict):
-            cpu_util = next(iter(cpu_data.values()), {}).get('%usage', 0)
-            report['cpu_usage_percent'] = cpu_util
-
-        memory_data = env.get('memory', {})
-        if memory_data:
-            report['memory_available_mb'] = memory_data.get('available_ram', 0)
-            report['memory_used_mb'] = memory_data.get('used_ram', 0)
-
-        temp_data = env.get('temperature', {})
-        if temp_data:
-            temps = [v.get('temperature', 0) for v in temp_data.values() if isinstance(v, dict)]
-            if temps:
-                report['max_temp_celsius'] = max(temps)
-
-    report['status'] = 'ok'
-    return report
+def generate_inventory_report(facts: Dict[str, Dict], output_format: str) -> None:
+    """Generate and display inventory report in specified format."""
+    if output_format == 'json':
+        print(json.dumps(facts, indent=2))
+    elif output_format == 'table':
+        print_table_report(facts)
 
 
-def print_text_report(reports: List[Dict]) -> None:
-    """Print human-readable report."""
-    for report in reports:
-        print(f"\n{report['device']} ({report['os_version']})")
-        print(f"  Status: {report['status']}")
-        if report['status'] == 'ok':
-            uptime_hours = report.get('uptime_seconds', 0) // 3600
-            print(f"  Uptime: {uptime_hours} hours")
-            print(f"  CPU Usage: {report.get('cpu_usage_percent', 'N/A')}%")
-            mem_used = report.get('memory_used_mb', 0)
-            mem_avail = report.get('memory_available_mb', 0)
-            print(f"  Memory: {mem_used}/{mem_avail} MB")
-            if 'max_temp_celsius' in report:
-                print(f"  Max Temperature: {report['max_temp_celsius']}°C")
-        else:
-            print(f"  Error: {report.get('error', 'Unknown error')}")
+def print_table_report(facts: Dict[str, Dict]) -> None:
+    """Print facts in table format."""
+    print(f"\n{'Device':<20} {'OS':<15} {'Model':<20} {'Serial':<15} {'Uptime':<10}")
+    print("=" * 80)
+    
+    for device_name, device_facts in facts.items():
+        if 'error' in device_facts:
+            print(f"{device_name:<20} {'ERROR':<15} {device_facts['error']}")
+            continue
+        
+        os_version = str(device_facts.get('os_version', 'N/A'))[:15]
+        model = str(device_facts.get('model', 'N/A'))[:20]
+        serial = str(device_facts.get('serial_number', 'N/A'))[:15]
+        uptime = format_uptime(device_facts.get('uptime', 0))
+        
+        print(f"{device_name:<20} {os_version:<15} {model:<20} {serial:<15} {uptime:<10}")
 
 
-def main() -> int:
-    """Main entry point."""
+def format_uptime(seconds: int) -> str:
+    """Format uptime in seconds to human-readable format."""
+    try:
+        days = int(seconds) // 86400
+        hours = (int(seconds) % 86400) // 3600
+        return f"{days}d {hours}h"
+    except (TypeError, ValueError):
+        return 'N/A'
+
+
+def filter_devices(inventory, filter_spec: str):
+    """Apply filter to device inventory based on filter specification."""
+    if not filter_spec or filter_spec == 'all':
+        return inventory.hosts
+    
+    if filter_spec.startswith('group:'):
+        group_name = filter_spec.split(':', 1)[1]
+        return inventory.filter(F(groups__contains=group_name))
+    
+    if ',' in filter_spec:
+        device_list = [d.strip() for d in filter_spec.split(',')]
+        return inventory.filter(F(name__in=device_list))
+    
+    return inventory.filter(F(name=filter_spec))
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description='Generate device health reports from network inventory'
+        description='Gather and report device facts from network inventory'
     )
     parser.add_argument(
         '--devices',
-        help='Comma-separated list of device names to query'
-    )
-    parser.add_argument(
-        '--filter',
-        help='Filter devices by key:value (e.g., os:iosxe, site:dc1)'
+        default='all',
+        help='Target devices: "all", "group:name", or comma-separated list'
     )
     parser.add_argument(
         '--output',
-        choices=['text', 'json'],
-        default='text',
-        help='Output format (default: text)'
+        choices=['json', 'table'],
+        default='table',
+        help='Output format'
     )
     parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Enable debug logging'
+        '--inventory',
+        default='.',
+        help='Path to Nornir inventory directory'
     )
-
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Logging level'
+    )
+    
     args = parser.parse_args()
-    setup_logging(args.verbose)
-
+    logger.setLevel(getattr(logging, args.log_level))
+    
     try:
-        nr = InitNornir(config_file='config.yaml')
+        nr = InitNornir(config_file=Path(args.inventory) / 'config.yaml')
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
+        
+        filtered_hosts = filter_devices(nr.inventory, args.devices)
+        logger.info(f"Targeting {len(filtered_hosts)} device(s)")
+        
+        if not filtered_hosts:
+            logger.warning("No devices matched filter criteria")
+            return
+        
+        results = nr.run(task=gather_device_facts, hosts=filtered_hosts)
+        
+        inventory_facts = {}
+        for device_name, task_result in results.items():
+            if task_result[0].result:
+                inventory_facts[device_name] = task_result[0].result
+        
+        generate_inventory_report(inventory_facts, args.output)
+        logger.info(f"Successfully gathered facts from {len(inventory_facts)} device(s)")
+        
+    except FileNotFoundError as e:
+        logger.error(f"Configuration file not found: {e}")
+        sys.exit(1)
     except Exception as e:
-        logging.error(f"Failed to initialize Nornir: {str(e)}")
-        return 1
-
-    if args.devices:
-        device_list = [d.strip() for d in args.devices.split(',')]
-        nr = nr.filter(F(name__in=device_list))
-    elif args.filter:
-        try:
-            key, value = args.filter.split(':')
-            nr = nr.filter(**{key: value})
-        except ValueError:
-            logging.error('Filter must be in format key:value')
-            return 1
-
-    if len(nr.inventory.hosts) == 0:
-        logging.warning('No devices matched filter criteria')
-        return 1
-
-    logging.info(f'Querying health metrics for {len(nr.inventory.hosts)} devices')
-
-    results = nr.run(task=get_device_health)
-    reports = []
-
-    for device_name, task_result in results.items():
-        if task_result[0].result:
-            report = format_health_report(device_name, task_result[0].result)
-            reports.append(report)
-
-    if args.output == 'json':
-        print(json.dumps(reports, indent=2))
-    else:
-        print_text_report(reports)
-
-    return 0
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
-    exit(main())
+    main()
 ```
