@@ -1,211 +1,248 @@
+The target repo isn't at `/opt/NetAutoCommitter` — the user wants the script content output directly. Here it is:
+
 ```
 """
-Management Plane Compliance Audit
+NTP Compliance Audit — nornir-network-automation
 
-Purpose:
-    Audits network devices for management plane security compliance, verifying
-    NTP server configuration, syslog destinations, MOTD banner presence,
-    SSH version enforcement, and AAA/TACACS authentication setup against a
-    policy baseline supplied at the command line.
-
-    This complements general compliance_audit.py (which focuses on interface
-    and routing policy) by targeting the out-of-band management control plane.
+Audits NTP configuration and synchronization status across network devices.
+Checks that required NTP servers are configured, the device clock is
+synchronized, and optionally that NTP authentication keys are present.
 
 Usage:
-    python 034_compliance_audit.py \
-        --host 192.168.1.1 --username admin --password secret \
-        --platform cisco_ios \
+    python ntp_compliance_audit.py \
+        --inventory inventory/hosts.yaml \
         --ntp-servers 10.0.0.1 10.0.0.2 \
-        --syslog-servers 10.0.0.10 \
-        --require-banner --require-ssh2 --require-aaa
+        --require-auth \
+        --filter-site dc1
 
 Prerequisites:
-    pip install nornir nornir-netmiko nornir-utils netmiko
+    pip install nornir nornir-netmiko nornir-utils
+    Inventory files in SimpleInventory format (hosts.yaml, groups.yaml, defaults.yaml)
+
+Exit codes: 0 = all devices compliant, 1 = one or more failures or errors.
 """
 
 import argparse
 import logging
 import sys
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
-from nornir.core import Nornir
-from nornir.core.configuration import Config
-from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
-from nornir.core.plugins.runners import ThreadedRunner
+from nornir import InitNornir
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
-
-COMMANDS = {
-    "ntp": "show ntp associations",
-    "syslog": "show logging",
-    "banner": "show banner motd",
-    "ssh": "show ip ssh",
-    "aaa": "show aaa servers",
-}
+log = logging.getLogger(__name__)
 
 
-def _check_servers(output: str, required: list) -> dict:
-    missing = [s for s in required if s not in output]
-    return {
-        "compliant": not missing,
-        "detail": f"Missing: {missing}" if missing else "All required servers present",
-    }
+@dataclass
+class NtpAudit:
+    hostname: str
+    configured_servers: List[str] = field(default_factory=list)
+    synchronized: bool = False
+    auth_configured: bool = False
+    missing_servers: List[str] = field(default_factory=list)
+    compliant: bool = False
+    error: str = ""
 
 
-def _check_banner(output: str) -> dict:
-    present = bool(output.strip()) and len(output.strip()) > 5
-    return {
-        "compliant": present,
-        "detail": "MOTD banner configured" if present else "No MOTD banner found",
-    }
+def _parse_associations(output: str) -> Tuple[List[str], bool]:
+    """Parse 'show ntp associations' into (server_ips, is_synchronized)."""
+    servers: List[str] = []
+    synchronized = False
 
-
-def _check_ssh(output: str) -> dict:
-    ok = "SSH Enabled - version 2.0" in output or "version 2.0" in output.lower()
-    return {
-        "compliant": ok,
-        "detail": "SSH v2.0 enforced" if ok else "SSH v2.0 not confirmed — check 'ip ssh version 2'",
-    }
-
-
-def _check_aaa(output: str) -> dict:
-    ok = any(kw in output.upper() for kw in ("TACACS", "RADIUS")) or len(output.strip()) > 30
-    return {
-        "compliant": ok,
-        "detail": "AAA servers configured" if ok else "No AAA server entries found",
-    }
-
-
-def mgmt_plane_audit(task: Task, policy: dict) -> Result:
-    checks = {}
-    errors = []
-
-    for key, cmd in COMMANDS.items():
-        try:
-            r = task.run(
-                task=netmiko_send_command,
-                command_string=cmd,
-                name=f"cmd_{key}",
-            )
-            output = r.result or ""
-        except Exception as exc:
-            errors.append(f"{key}: {exc}")
-            output = ""
-
-        if key == "ntp" and policy["ntp_servers"]:
-            checks["ntp_servers"] = _check_servers(output, policy["ntp_servers"])
-        elif key == "syslog" and policy["syslog_servers"]:
-            checks["syslog_servers"] = _check_servers(output, policy["syslog_servers"])
-        elif key == "banner" and policy["require_banner"]:
-            checks["motd_banner"] = _check_banner(output)
-        elif key == "ssh" and policy["require_ssh2"]:
-            checks["ssh_version"] = _check_ssh(output)
-        elif key == "aaa" and policy["require_aaa"]:
-            checks["aaa_servers"] = _check_aaa(output)
-
-    if not checks and not errors:
-        errors.append("No policy checks enabled — pass at least one --require-* flag or --ntp/--syslog-servers")
-
-    overall = bool(checks) and all(v["compliant"] for v in checks.values())
-    return Result(
-        host=task.host,
-        result={"checks": checks, "compliant": overall, "errors": errors},
-    )
-
-
-def print_report(agg_result) -> int:
-    total = len(agg_result)
-    noncompliant = 0
-
-    for host, multi_result in agg_result.items():
-        if multi_result.failed:
-            print(f"\n[ERROR] {host}: {multi_result.exception}")
-            noncompliant += 1
+    for line in output.splitlines():
+        raw = line.strip()
+        if not raw or raw.lower().startswith("address"):
             continue
 
-        data = multi_result[0].result
-        status = "COMPLIANT" if data["compliant"] else "NON-COMPLIANT"
-        bar = "=" * 58
-        print(f"\n{bar}")
-        print(f"  Host : {host}")
-        print(f"  Status: {status}")
-        print(bar)
+        synced_candidate = raw.startswith("*")
 
-        for check, info in data["checks"].items():
-            mark = "PASS" if info["compliant"] else "FAIL"
-            print(f"  [{mark}] {check:<18} {info['detail']}")
+        cleaned = raw.lstrip("*+-~ ")
+        if cleaned.startswith("~"):
+            cleaned = cleaned[1:].strip()
 
-        for err in data["errors"]:
-            print(f"  [WARN] {err}")
+        parts = cleaned.split()
+        if not parts:
+            continue
+        ip = parts[0]
 
-        if not data["compliant"]:
-            noncompliant += 1
+        octets = ip.split(".")
+        if len(octets) == 4 and all(o.isdigit() for o in octets):
+            servers.append(ip)
+            if synced_candidate:
+                synchronized = True
 
-    print(f"\nResult: {total - noncompliant}/{total} hosts compliant\n")
-    return 1 if noncompliant else 0
+    return servers, synchronized
 
 
-def build_nornir(args: argparse.Namespace) -> Nornir:
-    defaults = Defaults(username=args.username, password=args.password)
-    host = Host(
-        name=args.host,
-        hostname=args.host,
-        port=args.port,
-        platform=args.platform,
-        defaults=defaults,
+def audit_ntp(task: Task, required_servers: List[str], require_auth: bool) -> Result:
+    """Nornir task: collect NTP data and evaluate per-device compliance."""
+    audit = NtpAudit(hostname=task.host.name)
+
+    try:
+        assoc_r = task.run(
+            task=netmiko_send_command,
+            command_string="show ntp associations",
+            name="ntp-associations",
+        )
+        status_r = task.run(
+            task=netmiko_send_command,
+            command_string="show ntp status",
+            name="ntp-status",
+        )
+        cfg_r = task.run(
+            task=netmiko_send_command,
+            command_string="show running-config | include ntp",
+            name="ntp-config",
+        )
+    except Exception as exc:
+        audit.error = str(exc)
+        log.error("%s: connection failed — %s", task.host.name, exc)
+        return Result(host=task.host, result=audit)
+
+    servers, synced = _parse_associations(assoc_r.result)
+    audit.configured_servers = servers
+    audit.synchronized = synced or "synchronized" in status_r.result.lower()
+
+    cfg_lower = cfg_r.result.lower()
+    audit.auth_configured = "ntp authentication-key" in cfg_lower
+
+    audit.missing_servers = [s for s in required_servers if s not in servers]
+
+    auth_pass = (not require_auth) or audit.auth_configured
+    audit.compliant = (
+        len(audit.missing_servers) == 0 and audit.synchronized and auth_pass
     )
-    inventory = Inventory(
-        hosts=Hosts({args.host: host}),
-        groups=Groups(),
-        defaults=defaults,
+
+    return Result(host=task.host, result=audit)
+
+
+def _failure_reasons(audit: NtpAudit, require_auth: bool) -> List[str]:
+    reasons: List[str] = []
+    if audit.error:
+        return [f"error: {audit.error}"]
+    if audit.missing_servers:
+        reasons.append(f"missing servers: {', '.join(audit.missing_servers)}")
+    if not audit.synchronized:
+        reasons.append("clock not synchronized")
+    if require_auth and not audit.auth_configured:
+        reasons.append("NTP authentication not configured")
+    return reasons or ["unknown"]
+
+
+def print_report(
+    results: dict, required_servers: List[str], require_auth: bool
+) -> int:
+    """Print compliance report; return number of non-compliant/errored devices."""
+    passed: List[NtpAudit] = []
+    failed: List[NtpAudit] = []
+
+    for hostname in results:
+        audit: NtpAudit = results[hostname].result
+        (passed if audit.compliant else failed).append(audit)
+
+    sep = "=" * 62
+    print(f"\n{sep}")
+    print("  NTP COMPLIANCE AUDIT REPORT")
+    print(f"  Required NTP servers : {', '.join(required_servers) or '(any)'}")
+    print(f"  Require authentication: {'yes' if require_auth else 'no'}")
+    print(sep)
+
+    for audit in sorted(passed, key=lambda a: a.hostname):
+        print(f"  PASS  {audit.hostname}")
+        if audit.configured_servers:
+            print(f"        servers: {', '.join(audit.configured_servers)}")
+
+    for audit in sorted(failed, key=lambda a: a.hostname):
+        reasons = _failure_reasons(audit, require_auth)
+        print(f"  FAIL  {audit.hostname}")
+        for reason in reasons:
+            print(f"        - {reason}")
+
+    total = len(passed) + len(failed)
+    print(sep)
+    print(
+        f"  Result: {len(passed)} passed, {len(failed)} failed"
+        f" out of {total} device(s)\n"
     )
-    return Nornir(
-        inventory=inventory,
-        runner=ThreadedRunner(num_workers=1),
-        config=Config(),
-    )
+
+    return len(failed)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Management plane compliance audit (NTP, syslog, banner, SSH, AAA)"
+    parser = argparse.ArgumentParser(
+        description="Audit NTP configuration and sync status across network devices"
     )
-    p.add_argument("--host", required=True, help="Device hostname or IP")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", required=True, help="SSH password")
-    p.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--ntp-servers", nargs="*", default=[], metavar="IP",
-                   help="Required NTP server IPs")
-    p.add_argument("--syslog-servers", nargs="*", default=[], metavar="IP",
-                   help="Required syslog server IPs")
-    p.add_argument("--require-banner", action="store_true",
-                   help="Fail if no MOTD banner is configured")
-    p.add_argument("--require-ssh2", action="store_true",
-                   help="Fail if SSH version 2 is not enforced")
-    p.add_argument("--require-aaa", action="store_true",
-                   help="Fail if no AAA/TACACS/RADIUS servers are configured")
-    return p.parse_args()
+    parser.add_argument(
+        "--inventory", default="inventory/hosts.yaml", help="Path to hosts.yaml"
+    )
+    parser.add_argument(
+        "--groups", default="inventory/groups.yaml", help="Path to groups.yaml"
+    )
+    parser.add_argument(
+        "--defaults", default="inventory/defaults.yaml", help="Path to defaults.yaml"
+    )
+    parser.add_argument(
+        "--ntp-servers",
+        nargs="*",
+        default=[],
+        metavar="IP",
+        help="Required NTP server IPs (space-separated); omit to only check sync",
+    )
+    parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Fail devices with no NTP authentication-key in running config",
+    )
+    parser.add_argument(
+        "--filter-site",
+        metavar="SITE",
+        help="Restrict audit to hosts where site= matches this value",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Concurrent device connections (default: 10)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    policy = {
-        "ntp_servers": args.ntp_servers,
-        "syslog_servers": args.syslog_servers,
-        "require_banner": args.require_banner,
-        "require_ssh2": args.require_ssh2,
-        "require_aaa": args.require_aaa,
-    }
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    nr = build_nornir(args)
+    nr = InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
+        inventory={
+            "plugin": "SimpleInventory",
+            "options": {
+                "host_file": args.inventory,
+                "group_file": args.groups,
+                "defaults_file": args.defaults,
+            },
+        },
+    )
 
-    result = nr.run(task=mgmt_plane_audit, policy=policy)
-    sys.exit(print_report(result))
+    if args.filter_site:
+        nr = nr.filter(site=args.filter_site)
+
+    log.info("Starting NTP audit on %d device(s)", len(nr.inventory.hosts))
+
+    nornir_results = nr.run(
+        task=audit_ntp,
+        required_servers=args.ntp_servers,
+        require_auth=args.require_auth,
+    )
+
+    failures = print_report(nornir_results, args.ntp_servers, args.require_auth)
+    sys.exit(1 if failures else 0)
 ```
