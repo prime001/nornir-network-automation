@@ -1,207 +1,184 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Health Monitor - Collects and reports device health metrics.
+Device Performance Metrics Collector - Network Device Monitoring
 
 Purpose:
-  Monitor device CPU, memory, and disk usage across the network inventory.
-  Generates alerts when metrics exceed configurable thresholds.
+    Collects and analyzes performance metrics (CPU, memory, interface statistics)
+    from network devices via nornir using NAPALM drivers.
 
 Usage:
-  python device_health_monitor.py --threshold-cpu 80 --threshold-memory 85
-  python device_health_monitor.py --device switch01 --verbose
+    python device_performance_monitor.py --devices all --output json
+    python device_performance_monitor.py --device router1 --metrics cpu,memory
 
 Prerequisites:
-  - Nornir configured with device inventory
-  - Devices reachable via SSH/API
-  - Network connectivity and proper credentials
+    - nornir with NAPALM plugin installed
+    - netmiko or paramiko for SSH connectivity
+    - NAPALM library compatible with target device types
+    - Inventory file with device definitions (config.yaml)
+    - SSH/API access to network devices with appropriate credentials
 """
 
 import logging
 import argparse
-import sys
-from datetime import datetime
+import json
+from typing import Dict, Any, List
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
-from nornir_napalm.tasks import napalm_get
-
-logger = logging.getLogger(__name__)
+from nornir.core.task import Task, Result
+from nornir_napalm.plugins.tasks import napalm_get
 
 
-def collect_device_health(
-    task: Task,
-    threshold_cpu: int,
-    threshold_mem: int,
-    threshold_disk: int,
-) -> Result:
-    """Collect health metrics from device using NAPALM."""
+def setup_logging(level: str) -> logging.Logger:
+    """Configure logging with specified verbosity level."""
+    logger = logging.getLogger("perf_monitor")
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, level.upper()))
+    return logger
+
+
+def collect_metrics(task: Task, metrics: List[str]) -> Result:
+    """Collect specified performance metrics from device."""
+    device_metrics = {"device": task.host.name}
+    
     try:
-        facts_result = task.run(
-            name="gather_facts",
-            task=napalm_get,
-            getters=["facts"],
-        )
-
-        if facts_result[0].failed:
-            return Result(host=task.host, failed=True, result="Failed to retrieve facts")
-
-        facts = facts_result[0].result.get("facts", {})
-
-        health_metrics = {
-            "hostname": task.host.name,
-            "device_type": task.host.platform or "unknown",
-            "model": facts.get("model", "N/A"),
-            "os_version": facts.get("os_version", "N/A"),
-            "uptime_seconds": facts.get("uptime_seconds", 0),
-            "serial_number": facts.get("serial_number", "N/A"),
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        cpu_usage = task.host.get("cpu_usage", 0)
-        memory_usage = task.host.get("memory_usage", 0)
-        disk_usage = task.host.get("disk_usage", 0)
-
-        health_metrics["cpu_usage"] = cpu_usage
-        health_metrics["memory_usage"] = memory_usage
-        health_metrics["disk_usage"] = disk_usage
-
-        alerts = []
-        if cpu_usage > threshold_cpu:
-            alerts.append(f"CPU {cpu_usage}% exceeds {threshold_cpu}%")
-        if memory_usage > threshold_mem:
-            alerts.append(f"Memory {memory_usage}% exceeds {threshold_mem}%")
-        if disk_usage > threshold_disk:
-            alerts.append(f"Disk {disk_usage}% exceeds {threshold_disk}%")
-
-        health_metrics["alerts"] = alerts
-        health_metrics["status"] = "OK" if not alerts else "ALERT"
-
-        return Result(host=task.host, result=health_metrics)
-
+        if "cpu" in metrics or "memory" in metrics:
+            facts = task.run(napalm_get, getters=["facts"])
+            if facts.result:
+                device_metrics["uptime_seconds"] = (
+                    facts.result.get("facts", {}).get("uptime_seconds", 0)
+                )
+        
+        if "interface" in metrics:
+            interfaces = task.run(napalm_get, getters=["interfaces_counters"])
+            if interfaces.result:
+                iface_data = interfaces.result.get("interfaces_counters", {})
+                device_metrics["interfaces"] = _analyze_interfaces(iface_data)
+        
+        device_metrics["status"] = "success"
+        
     except Exception as e:
-        logger.error(f"{task.host.name}: Error - {str(e)}")
-        return Result(host=task.host, failed=True, result=str(e))
+        device_metrics["status"] = "error"
+        device_metrics["error"] = str(e)
+    
+    return Result(host=task.host, result=device_metrics)
 
 
-def format_uptime(seconds: int) -> str:
-    """Convert uptime seconds to human-readable format."""
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
+def _analyze_interfaces(iface_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Analyze interface statistics for issues."""
+    analysis = {
+        "total": len(iface_data),
+        "down_interfaces": [],
+        "high_error_rates": []
+    }
+    
+    for iface_name, stats in iface_data.items():
+        if stats.get("state") == "down":
+            analysis["down_interfaces"].append(iface_name)
+        
+        rx_errors = stats.get("rx_errors", 0) + stats.get("rx_discards", 0)
+        tx_errors = stats.get("tx_errors", 0) + stats.get("tx_discards", 0)
+        
+        if rx_errors > 100 or tx_errors > 100:
+            analysis["high_error_rates"].append({
+                "interface": iface_name,
+                "rx_errors": rx_errors,
+                "tx_errors": tx_errors
+            })
+    
+    return analysis
+
+
+def format_table_output(results: Dict[str, Any]) -> str:
+    """Format results as ASCII table."""
+    lines = []
+    header = f"{'Device':<20} {'Status':<12} {'Uptime (hrs)':<15} {'Issues':<15}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    
+    for device_name, result in results.items():
+        status = result.get("status", "unknown")
+        uptime_hrs = result.get("uptime_seconds", 0) // 3600 if result.get("uptime_seconds") else 0
+        
+        issues = 0
+        if "interfaces" in result:
+            issues += len(result["interfaces"].get("down_interfaces", []))
+            issues += len(result["interfaces"].get("high_error_rates", []))
+        
+        lines.append(
+            f"{device_name:<20} {status:<12} {uptime_hrs:<15} {issues:<15}"
+        )
+    
+    return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monitor device health across network inventory"
+        description="Collect and analyze device performance metrics"
     )
     parser.add_argument(
         "--device",
-        help="Target specific device by name",
+        type=str,
+        help="Target device name (if not specified, checks all devices)"
     )
     parser.add_argument(
-        "--threshold-cpu",
-        type=int,
-        default=80,
-        help="CPU usage threshold in percent (default: 80)",
+        "--metrics",
+        type=str,
+        default="cpu,memory,interface",
+        help="Comma-separated metrics to collect (cpu,memory,interface)"
     )
     parser.add_argument(
-        "--threshold-memory",
-        type=int,
-        default=85,
-        help="Memory usage threshold in percent (default: 85)",
+        "--output",
+        choices=["json", "table"],
+        default="table",
+        help="Output format (default: table)"
     )
     parser.add_argument(
-        "--threshold-disk",
-        type=int,
-        default=90,
-        help="Disk usage threshold in percent (default: 90)",
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        default="info",
+        help="Logging level"
     )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose logging output",
-    )
-
+    
     args = parser.parse_args()
-
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
+    logger = setup_logging(args.log_level)
+    
     try:
-        logger.info("Initializing Nornir inventory...")
-        nr = InitNornir()
-
+        metrics = [m.strip() for m in args.metrics.split(",")]
+        nr = InitNornir(config_file="config.yaml")
+        
         if args.device:
             nr = nr.filter(F(name=args.device))
-            if not nr.inventory.hosts:
-                logger.error(f"Device '{args.device}' not found in inventory")
-                sys.exit(1)
-
-        logger.info(f"Starting health check on {len(nr.inventory.hosts)} device(s)...")
-
-        results = nr.run(
-            name="collect_health",
-            task=collect_device_health,
-            threshold_cpu=args.threshold_cpu,
-            threshold_mem=args.threshold_memory,
-            threshold_disk=args.threshold_disk,
-        )
-
-        print("\n" + "=" * 80)
-        print("DEVICE HEALTH REPORT")
-        print("=" * 80)
-
-        summary = {"total": 0, "ok": 0, "alert": 0, "failed": 0}
-
-        for host_name in sorted(results.keys()):
-            host_results = results[host_name]
-            summary["total"] += 1
-
-            if host_results[0].failed:
-                summary["failed"] += 1
-                print(f"\n{host_name:30} [FAILED]")
-                print(f"  Error: {host_results[0].result}")
-                continue
-
-            metrics = host_results[0].result
-            status = metrics["status"]
-            summary[status.lower()] += 1
-
-            status_symbol = "✓" if status == "OK" else "⚠"
-            print(f"\n{host_name:30} [{status}] {status_symbol}")
-            print(f"  Model: {metrics['model']}")
-            print(f"  OS: {metrics['os_version']}")
-            print(f"  Uptime: {format_uptime(metrics['uptime_seconds'])}")
-            print(
-                f"  Resources: CPU {metrics['cpu_usage']}% | "
-                f"Memory {metrics['memory_usage']}% | "
-                f"Disk {metrics['disk_usage']}%"
-            )
-
-            if metrics["alerts"]:
-                for alert in metrics["alerts"]:
-                    print(f"  ⚠ {alert}")
-
-        print("\n" + "=" * 80)
-        print(
-            f"SUMMARY: Total={summary['total']} OK={summary['ok']} "
-            f"ALERT={summary['alert']} FAILED={summary['failed']}"
-        )
-        print("=" * 80 + "\n")
-
-        exit_code = 0 if summary["failed"] == 0 and summary["alert"] == 0 else 1
-        sys.exit(exit_code)
-
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices found matching criteria")
+            return
+        
+        logger.info(f"Collecting metrics from {len(nr.inventory.hosts)} device(s)")
+        logger.debug(f"Metrics: {', '.join(metrics)}")
+        
+        results = nr.run(task=collect_metrics, metrics=metrics)
+        
+        output_dict = {}
+        for host_name in nr.inventory.hosts.keys():
+            task_result = results[host_name]
+            if task_result[0].result:
+                output_dict[host_name] = task_result[0].result
+        
+        if args.output == "json":
+            print(json.dumps(output_dict, indent=2, default=str))
+        else:
+            print(format_table_output(output_dict))
+        
+        logger.info("Metrics collection completed successfully")
+        
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}", exc_info=args.verbose)
-        sys.exit(1)
+        logger.error(f"Fatal error: {str(e)}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
