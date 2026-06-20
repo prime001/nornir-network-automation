@@ -1,208 +1,265 @@
 ```python
 """
-Device Health Monitor - Collects and reports device health metrics.
+BGP Advertised Prefix Auditor
 
-This script connects to network devices using Nornir and collects health
-metrics such as uptime, CPU utilization, memory usage, and temperature
-(when available via NAPALM get_environment()).
+Connects to routers via Nornir and audits which prefixes are being advertised
+to each BGP neighbor, comparing against an expected prefix policy file. Reports
+unexpected advertisements and missing required prefixes per neighbor.
 
 Usage:
-    python device_health_monitor.py --devices core-routers
-    python device_health_monitor.py --device r1.lab.local
-    python device_health_monitor.py --devices all --format json
+    python 043_bgp_prefix_audit.py --hosts router1,router2 --policy policy.yaml
+    python 043_bgp_prefix_audit.py --hosts router1 --neighbor 10.0.0.1 --output json
+    python 043_bgp_prefix_audit.py --inventory hosts.yaml --output csv
 
 Prerequisites:
-    - Nornir installation with NAPALM plugin
-    - hosts.yml and defaults.yml configured
-    - Device credentials in environment or nornir config
-    - Devices must support NAPALM get_facts() and get_environment()
+    pip install nornir nornir-netmiko nornir-utils netmiko pyyaml
+    A Nornir inventory file (hosts.yaml / groups.yaml) or use --hosts for ad-hoc.
+    Optional: a policy YAML file with allowed_prefixes per neighbor IP.
 
-The script produces a summary report with key health indicators and flags
-warnings/errors for unhealthy devices.
+Policy file format (policy.yaml):
+    neighbors:
+      "10.0.0.1":
+        allowed_prefixes:
+          - "192.168.1.0/24"
+          - "10.1.0.0/16"
+      default:
+        allowed_prefixes: []   # empty = allow all
 """
 
 import argparse
+import csv
 import json
 import logging
+import re
 import sys
-from typing import Dict, Any
+from typing import Optional
 
+import yaml
 from nornir import InitNornir
+from nornir.core import Nornir
+from nornir.core.inventory import (
+    Defaults,
+    Groups,
+    Host,
+    Hosts,
+    Inventory,
+)
 from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import napalm_get
+from nornir_netmiko.tasks import netmiko_send_command
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-def get_device_health(task: Task) -> Result:
-    """Collect device health metrics including facts and environment data."""
+def load_policy(policy_path: Optional[str]) -> dict:
+    if not policy_path:
+        return {}
     try:
-        facts_result = task.run(
-            napalm_get,
-            getters=["get_facts", "get_environment"],
-        )
-        
-        facts_data = facts_result[0].result
-        facts = facts_data.get("get_facts", {})
-        environment = facts_data.get("get_environment", {})
-        
-        uptime_seconds = facts.get("uptime_seconds", 0)
-        uptime_days = uptime_seconds // 86400
-        uptime_hours = (uptime_seconds % 86400) // 3600
-        
-        cpu_percent = None
-        if environment.get("cpu") and len(environment["cpu"]) > 0:
-            cpu_percent = environment["cpu"][0].get("%usage")
-        
-        memory_percent = None
-        if environment.get("memory"):
-            mem = environment["memory"]
-            available = mem.get("available_ram", 0)
-            used = mem.get("used_ram", 0)
-            total = available + used
-            if total > 0:
-                memory_percent = round((used / total) * 100, 1)
-        
-        max_temp = None
-        temp_status = "normal"
-        if environment.get("temperature"):
-            temps = []
-            for sensor, data in environment["temperature"].items():
-                if isinstance(data, dict):
-                    current = data.get("current_temperature")
-                    if current:
-                        temps.append(current)
-                        critical = data.get("critical_threshold", 100)
-                        if current > critical:
-                            temp_status = "critical"
-                        elif current > critical * 0.9:
-                            temp_status = "warning"
-            if temps:
-                max_temp = max(temps)
-        
-        health_status = "healthy"
-        warnings = []
-        
-        if uptime_days < 1:
-            warnings.append(f"uptime_low ({uptime_hours}h)")
-            health_status = "warning"
-        
-        if cpu_percent and cpu_percent > 80:
-            warnings.append(f"cpu_high ({cpu_percent}%)")
-            health_status = "warning"
-        
-        if memory_percent and memory_percent > 85:
-            warnings.append(f"memory_high ({memory_percent}%)")
-            health_status = "warning"
-        
-        if temp_status == "critical":
-            warnings.append(f"temp_critical ({max_temp}C)")
-            health_status = "critical"
-        elif temp_status == "warning":
-            warnings.append(f"temp_warning ({max_temp}C)")
-            if health_status != "critical":
-                health_status = "warning"
-        
-        return Result(
-            host=task.host,
-            result={
-                "device": task.host.name,
-                "status": health_status,
-                "model": facts.get("model"),
-                "version": facts.get("os_version"),
-                "uptime_days": uptime_days,
-                "uptime_hours": uptime_hours,
-                "cpu_percent": cpu_percent,
-                "memory_percent": memory_percent,
-                "max_temperature": max_temp,
-                "warnings": warnings,
-            },
-        )
-    
-    except Exception as e:
-        logger.error(f"Error collecting health for {task.host.name}: {e}")
-        return Result(
-            host=task.host,
-            result={
-                "device": task.host.name,
-                "status": "error",
-                "error": str(e),
-            },
-            failed=True,
-        )
-
-
-def print_table_report(health_data: list) -> None:
-    """Print device health data in tabular format."""
-    print("\n" + "=" * 120)
-    print("DEVICE HEALTH MONITOR")
-    print("=" * 120)
-    print(f"{'Device':<20} {'Status':<12} {'Model':<20} {'Uptime':<12} {'CPU':<8} {'Memory':<10} {'Temp':<10}")
-    print("-" * 120)
-    
-    for device in health_data:
-        name = device.get("device", "unknown")[:19]
-        status = device.get("status", "unknown").upper()[:11]
-        model = (device.get("model") or "unknown")[:19]
-        
-        if device.get("error"):
-            print(f"{name:<20} {status:<12} ERROR: {device['error']}")
-        else:
-            uptime = f"{device['uptime_days']}d {device['uptime_hours']}h"
-            cpu = f"{device.get('cpu_percent', '-')}%"
-            mem = f"{device.get('memory_percent', '-')}%"
-            temp = f"{device.get('max_temperature', '-')}C"
-            
-            print(f"{name:<20} {status:<12} {model:<20} {uptime:<12} {cpu:<8} {mem:<10} {temp:<10}")
-            
-            if device.get("warnings"):
-                print(f"  └─ Warnings: {', '.join(device['warnings'])}")
-    
-    print("=" * 120 + "\n")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Monitor network device health metrics.")
-    parser.add_argument("--devices", default="all", help="Device group or comma-separated list")
-    parser.add_argument("--device", help="Single device hostname")
-    parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
-    parser.add_argument("--config", default="~/.nornir/config.yaml", help="Nornir config file path")
-    
-    args = parser.parse_args()
-    
-    try:
-        nr = InitNornir(config_file=args.config)
-    except Exception as e:
-        logger.error(f"Failed to initialize Nornir: {e}")
+        with open(policy_path) as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.error("Failed to load policy file %s: %s", policy_path, exc)
         sys.exit(1)
-    
-    if args.device:
-        nr = nr.filter(name=args.device)
-    elif args.devices != "all":
-        device_list = [d.strip() for d in args.devices.split(",")]
-        nr = nr.filter(lambda h: h.name in device_list)
-    
-    if not nr.inventory.hosts:
-        logger.error("No devices matched the filter criteria")
-        sys.exit(1)
-    
-    logger.info(f"Running health check on {len(nr.inventory.hosts)} device(s)")
-    
-    results = nr.run(task=get_device_health)
-    
-    health_data = [task_result[0].result for task_result in results.values()]
-    
-    if args.format == "json":
-        print(json.dumps(health_data, indent=2))
+
+
+def parse_advertised_routes(output: str) -> list:
+    prefixes = []
+    for line in output.splitlines():
+        # IOS: status codes then network, e.g. "*> 192.168.1.0/24  ..."
+        match = re.match(
+            r"^\s*[*idshrSDb>i ]{1,5}\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)", line
+        )
+        if match:
+            prefix = match.group(1)
+            if "/" not in prefix:
+                prefix += "/32"
+            prefixes.append(prefix)
+    return list(set(prefixes))
+
+
+def collect_bgp_neighbors(task: Task) -> Result:
+    r = task.run(
+        task=netmiko_send_command, command_string="show ip bgp summary"
+    )
+    neighbors = []
+    in_table = False
+    for line in r.result.splitlines():
+        if re.match(r"^Neighbor\s+V\s+AS", line):
+            in_table = True
+            continue
+        if in_table:
+            m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s", line)
+            if m:
+                neighbors.append(m.group(1))
+    return Result(host=task.host, result=neighbors)
+
+
+def audit_neighbor(task: Task, neighbor_ip: str, policy: dict) -> Result:
+    cmd = f"show ip bgp neighbors {neighbor_ip} advertised-routes"
+    r = task.run(task=netmiko_send_command, command_string=cmd)
+    advertised = parse_advertised_routes(r.result)
+
+    nbr_policy = (
+        policy.get("neighbors", {}).get(neighbor_ip)
+        or policy.get("neighbors", {}).get("default")
+        or {}
+    )
+    allowed = set(nbr_policy.get("allowed_prefixes", []))
+
+    if allowed:
+        unexpected = sorted(set(advertised) - allowed)
+        missing = sorted(allowed - set(advertised))
     else:
-        print_table_report(health_data)
-    
-    failed_count = sum(1 for d in health_data if d.get("status") in ("error", "critical"))
-    sys.exit(0 if failed_count == 0 else 1)
+        unexpected = []
+        missing = []
+
+    return Result(
+        host=task.host,
+        result={
+            "host": task.host.name,
+            "neighbor": neighbor_ip,
+            "advertised_count": len(advertised),
+            "advertised": sorted(advertised),
+            "unexpected": unexpected,
+            "missing": missing,
+            "compliant": not unexpected and not missing,
+        },
+    )
+
+
+def build_adhoc_nornir(
+    hosts: list, username: str, password: str, platform: str
+) -> Nornir:
+    host_objects = {
+        h: Host(
+            name=h,
+            hostname=h,
+            username=username,
+            password=password,
+            platform=platform,
+            data={},
+            groups=[],
+            defaults=Defaults(),
+            connection_options={},
+        )
+        for h in hosts
+    }
+    inv = Inventory(
+        hosts=Hosts(host_objects), groups=Groups(), defaults=Defaults()
+    )
+    return Nornir(inventory=inv, runner=None, processors=[], data={}, config=None)
+
+
+def render_table(audits: list, has_policy: bool) -> None:
+    for a in audits:
+        status = "PASS" if a["compliant"] else "FAIL"
+        print(f"\n[{status}] {a['host']} -> neighbor {a['neighbor']}")
+        print(f"  Advertised: {a['advertised_count']} prefixes")
+        if a["unexpected"]:
+            print(f"  UNEXPECTED ({len(a['unexpected'])}):")
+            for p in a["unexpected"]:
+                print(f"    - {p}")
+        if a["missing"]:
+            print(f"  MISSING ({len(a['missing'])}):")
+            for p in a["missing"]:
+                print(f"    - {p}")
+        if not has_policy and a["advertised"]:
+            sample = a["advertised"][:6]
+            tail = " ..." if len(a["advertised"]) > 6 else ""
+            print(f"  Sample: {', '.join(sample)}{tail}")
+
+
+def render_csv(audits: list) -> None:
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        ["host", "neighbor", "advertised_count", "compliant", "unexpected", "missing"]
+    )
+    for a in audits:
+        writer.writerow([
+            a["host"],
+            a["neighbor"],
+            a["advertised_count"],
+            a["compliant"],
+            "; ".join(a["unexpected"]),
+            "; ".join(a["missing"]),
+        ])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Audit BGP advertised prefixes against a policy file."
+    )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--hosts", help="Comma-separated list of router IPs or hostnames"
+    )
+    src.add_argument("--inventory", help="Nornir config YAML pointing to inventory")
+    parser.add_argument("--username", "-u", default="admin")
+    parser.add_argument("--password", "-p", default="admin")
+    parser.add_argument(
+        "--platform", default="cisco_ios", help="Netmiko platform string"
+    )
+    parser.add_argument(
+        "--neighbor", help="Audit only this neighbor IP (skips auto-discovery)"
+    )
+    parser.add_argument("--policy", help="YAML policy file with allowed prefixes")
+    parser.add_argument(
+        "--output", choices=["table", "json", "csv"], default="table"
+    )
+    parser.add_argument("--workers", type=int, default=5)
+    args = parser.parse_args()
+
+    policy = load_policy(args.policy)
+
+    if args.inventory:
+        nr = InitNornir(config_file=args.inventory)
+    else:
+        host_list = [h.strip() for h in args.hosts.split(",")]
+        nr = build_adhoc_nornir(
+            host_list, args.username, args.password, args.platform
+        )
+
+    from nornir.core.plugins.runners import ThreadedRunner
+
+    nr.runner = ThreadedRunner(num_workers=args.workers)
+
+    all_audits = []
+
+    for hostname in nr.inventory.hosts:
+        host_nr = nr.filter(name=hostname)
+
+        if args.neighbor:
+            neighbor_list = [args.neighbor]
+        else:
+            nbr_result = host_nr.run(task=collect_bgp_neighbors)
+            neighbor_list = nbr_result[hostname][0].result or []
+
+        if not neighbor_list:
+            logger.warning("No BGP neighbors found on %s", hostname)
+            continue
+
+        for nbr_ip in neighbor_list:
+            result = host_nr.run(
+                task=audit_neighbor, neighbor_ip=nbr_ip, policy=policy
+            )
+            audit = result[hostname][0].result
+            if isinstance(audit, dict):
+                all_audits.append(audit)
+
+    if args.output == "json":
+        print(json.dumps(all_audits, indent=2))
+    elif args.output == "csv":
+        render_csv(all_audits)
+    else:
+        render_table(all_audits, bool(policy))
+
+    failures = [a for a in all_audits if not a["compliant"]]
+    if failures:
+        logger.warning("%d neighbor(s) failed policy audit", len(failures))
+        sys.exit(2)
 
 
 if __name__ == "__main__":
