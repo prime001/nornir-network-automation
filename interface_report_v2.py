@@ -1,198 +1,216 @@
-```python
-#!/usr/bin/env python3
+```
 """
-Device Uptime Reporter - Collects and reports device uptime statistics.
-
+Interface Error Counter Analyzer
+=================================
 Purpose:
-    Gathers uptime information from network devices and generates reports
-    showing device uptime, identifying devices with recent reboots or issues.
+    Collects interface error counters from IOS/IOS-XE/NX-OS devices via
+    Nornir and reports interfaces exceeding configurable thresholds. Useful
+    for catching degraded physical links (CRC storms, excessive drops) before
+    they cause service-impacting outages.
 
 Usage:
-    python device_uptime_report.py --warn-hours 168 --format text
-    python device_uptime_report.py --group edge --sort-by uptime
+    python 042_interface_error_counters.py --host core-sw1 --username admin --password secret
+    python 042_interface_error_counters.py --group access --threshold 100 --csv errors.csv
+    python 042_interface_error_counters.py --host rtr1 --all-interfaces
 
 Prerequisites:
-    - nornir inventory configured with device connectivity parameters
-    - SSH/Telnet access with appropriate credentials
-    - Devices supporting 'show version' or 'show system uptime' commands
+    pip install nornir nornir-netmiko nornir-utils
+    Inventory files: hosts.yaml, groups.yaml, defaults.yaml
 """
 
-import logging
 import argparse
-import json
+import csv
+import logging
 import re
+import sys
+from dataclasses import dataclass
+from typing import Dict, List
+
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir_utils.plugins.tasks.networking import netmiko_send_command
+from nornir.core.filter import F
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
 
-
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
-def parse_uptime_from_output(output: str) -> int:
-    """Extract uptime in seconds from device output."""
-    patterns = [
-        r"uptime is (\d+)\s+days?,?\s+(\d+)\s+hours?,?\s+(\d+)\s+minutes?",
-        r"(\d+)d(\d+)h(\d+)m",
-        r"up\s+(\d+)\s+days?,?\s+(\d+):(\d+)",
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, output, re.IGNORECASE)
-        if match:
-            days, hours, minutes = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            return days * 86400 + hours * 3600 + minutes * 60
-    
-    return None
+@dataclass
+class InterfaceErrors:
+    name: str
+    input_errors: int = 0
+    output_drops: int = 0
+    crc_errors: int = 0
+    runts: int = 0
+    giants: int = 0
+
+    def total(self) -> int:
+        return self.input_errors + self.output_drops + self.crc_errors + self.runts + self.giants
 
 
-def format_uptime(seconds: int) -> str:
-    """Format uptime seconds to human-readable format."""
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
+def parse_ios_errors(output: str) -> List[InterfaceErrors]:
+    interfaces: List[InterfaceErrors] = []
+    current = None
+
+    for line in output.splitlines():
+        m = re.match(r"^(\S+) is", line)
+        if m:
+            if current:
+                interfaces.append(current)
+            current = InterfaceErrors(name=m.group(1))
+            continue
+
+        if current is None:
+            continue
+
+        for pattern, attr in [
+            (r"(\d+)\s+input errors", "input_errors"),
+            (r"(\d+)\s+CRC", "crc_errors"),
+            (r"(\d+)\s+output drops", "output_drops"),
+            (r"(\d+)\s+runts", "runts"),
+            (r"(\d+)\s+giants", "giants"),
+        ]:
+            m = re.search(pattern, line)
+            if m:
+                setattr(current, attr, int(m.group(1)))
+
+    if current:
+        interfaces.append(current)
+    return interfaces
 
 
-def collect_device_uptime(task: Task) -> Result:
-    """Collect uptime information from a device."""
-    uptime_info = {
-        "hostname": task.host.name,
-        "platform": task.host.platform,
-        "uptime_seconds": None,
-        "uptime_human": None,
-        "status": "unknown",
-        "error": None,
-    }
-    
-    try:
-        cmd = "show version" if "ios" in task.host.platform else "show system uptime"
-        
-        response = task.run(
-            netmiko_send_command,
-            command_string=cmd,
-            use_textfsm=False
-        )
-        
-        output = response[0].result
-        uptime_seconds = parse_uptime_from_output(output)
-        
-        if uptime_seconds is not None:
-            uptime_info["uptime_seconds"] = uptime_seconds
-            uptime_info["uptime_human"] = format_uptime(uptime_seconds)
-            uptime_info["status"] = "success"
-        else:
-            uptime_info["status"] = "parse_error"
-        
-        return Result(host=task.host, result=uptime_info)
-        
-    except Exception as e:
-        uptime_info["status"] = "failed"
-        uptime_info["error"] = str(e)
-        logger.error(f"{task.host.name}: {e}")
-        return Result(host=task.host, result=uptime_info, failed=True)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Collect and report device uptime across network inventory"
+def collect_errors(task: Task) -> Result:
+    r = task.run(
+        task=netmiko_send_command,
+        command_string="show interfaces",
+        use_textfsm=False,
     )
-    parser.add_argument(
-        "--group",
-        help="Filter devices by inventory group"
+    return Result(host=task.host, result=parse_ios_errors(r.result))
+
+
+def write_csv(rows: List[Dict], path: str) -> None:
+    if not rows:
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Report interfaces exceeding error counter thresholds"
     )
-    parser.add_argument(
-        "--warn-hours",
+    p.add_argument("--host", help="Target a specific host from inventory")
+    p.add_argument("--group", help="Target a device group from inventory")
+    p.add_argument("--username", help="Override inventory username")
+    p.add_argument("--password", help="Override inventory password")
+    p.add_argument(
+        "--threshold",
         type=int,
-        default=168,
-        help="Alert threshold if uptime less than N hours"
+        default=0,
+        help="Minimum total errors to report (default: 0 = any errors)",
     )
-    parser.add_argument(
-        "--format",
-        choices=["json", "text"],
-        default="text",
-        help="Output format"
+    p.add_argument(
+        "--all-interfaces",
+        action="store_true",
+        help="Include zero-error interfaces",
     )
-    parser.add_argument(
-        "--sort-by",
-        choices=["uptime", "hostname"],
-        default="uptime",
-        help="Sort results by field"
+    p.add_argument("--csv", metavar="FILE", help="Write results to CSV")
+    p.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Nornir config file (default: config.yaml)",
     )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO"
-    )
-    
-    args = parser.parse_args()
-    
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
-    
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     try:
-        nr = InitNornir(config_file="config.yaml")
-        
-        if args.group:
-            nr = nr.filter(group=args.group)
-        
-        device_count = len(nr.inventory.hosts)
-        if device_count == 0:
-            logger.error(f"No devices found matching filter: {args.group}")
-            return 1
-        
-        logger.info(f"Collecting uptime from {device_count} device(s)")
-        results = nr.run(task=collect_device_uptime)
-        
-        devices = []
-        for hostname, task_results in results.items():
-            for result in task_results:
-                devices.append(result.result)
-        
-        if args.sort_by == "uptime":
-            devices.sort(key=lambda x: x.get("uptime_seconds") or 0)
-        else:
-            devices.sort(key=lambda x: x["hostname"])
-        
-        if args.format == "json":
-            print(json.dumps(devices, indent=2))
-        else:
-            print("\n" + "=" * 85)
-            print("Device Uptime Report")
-            print("=" * 85)
-            print(f"{'Hostname':<25} {'Uptime':<20} {'Status':<15} {'Alert':<10}")
-            print("-" * 85)
-            
-            warn_seconds = args.warn_hours * 3600
-            alert_count = 0
-            success_count = 0
-            
-            for device in devices:
-                status = device["status"]
-                uptime = device["uptime_human"] or "N/A"
-                alert = ""
-                
-                if status == "success":
-                    success_count += 1
-                    if device.get("uptime_seconds", 0) < warn_seconds:
-                        alert = "⚠ LOW"
-                        alert_count += 1
-                
-                print(f"{device['hostname']:<25} {uptime:<20} {status:<15} {alert:<10}")
-            
-            print("=" * 85)
-            print(f"Summary: {success_count} successful, {alert_count} alerts, "
-                  f"{len(devices) - success_count} failed")
-        
-        return 0 if alert_count == 0 else 1
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        return 1
+        nr = InitNornir(config_file=args.config)
+    except Exception as exc:
+        logger.error("Nornir init failed: %s", exc)
+        sys.exit(1)
+
+    if args.username:
+        nr.inventory.defaults.username = args.username
+    if args.password:
+        nr.inventory.defaults.password = args.password
+
+    if args.host:
+        nr = nr.filter(F(name=args.host))
+    elif args.group:
+        nr = nr.filter(F(groups__contains=args.group))
+
+    if not nr.inventory.hosts:
+        print("No hosts matched.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Polling {len(nr.inventory.hosts)} host(s)...")
+    results = nr.run(task=collect_errors, name="collect_errors")
+
+    csv_rows: List[Dict] = []
+    total_flagged = 0
+
+    for host, multi in results.items():
+        if multi.failed:
+            print(f"[ERROR] {host}: {multi.exception}")
+            continue
+
+        ifaces: List[InterfaceErrors] = multi[0].result
+        flagged = [
+            i for i in ifaces
+            if args.all_interfaces or i.total() > args.threshold
+        ]
+
+        if not flagged:
+            print(f"{host}: no interfaces above threshold")
+            continue
+
+        print(f"\n{'=' * 70}")
+        print(f"Host: {host}  ({len(flagged)} interface(s))")
+        print(f"{'=' * 70}")
+        print(
+            f"{'Interface':<32} {'InErr':>7} {'CRC':>7} {'OutDrop':>8}"
+            f" {'Runts':>6} {'Giants':>7} {'Total':>7}"
+        )
+        print("-" * 76)
+
+        for i in sorted(flagged, key=lambda x: x.total(), reverse=True):
+            print(
+                f"{i.name:<32} {i.input_errors:>7} {i.crc_errors:>7}"
+                f" {i.output_drops:>8} {i.runts:>6} {i.giants:>7} {i.total():>7}"
+            )
+            csv_rows.append(
+                {
+                    "host": host,
+                    "interface": i.name,
+                    "input_errors": i.input_errors,
+                    "crc_errors": i.crc_errors,
+                    "output_drops": i.output_drops,
+                    "runts": i.runts,
+                    "giants": i.giants,
+                    "total_errors": i.total(),
+                }
+            )
+            total_flagged += 1
+
+    print(f"\nTotal interfaces reported: {total_flagged}")
+
+    if args.csv:
+        write_csv(csv_rows, args.csv)
+        print(f"Results saved to {args.csv}")
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
 ```
