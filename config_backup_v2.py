@@ -1,190 +1,277 @@
-Startup vs Running Config Drift Detector
+```python
+"""
+Device Reachability and Latency Monitor
 
-Compares startup-config against running-config on each device to identify
-unsaved changes. In production networks, untracked running-config changes
-are lost on reload — this script surfaces those devices before it matters.
+Performs reachability checks and measures response latency to network devices.
+Identifies unreachable hosts, analyzes response times, and generates connectivity
+reports for network diagnostic and monitoring purposes.
 
 Usage:
-    python 035_config_backup.py --hosts router1,router2 --username admin --password secret
-    python 035_config_backup.py --hosts router1 -u admin -p secret --save-diffs --diff-dir /tmp/diffs
-    python 035_config_backup.py --hosts router1 -u admin -p secret --platform cisco_nxos
+    python device_reachability.py --devices router1,router2 --count 4
+    python device_reachability.py --group access-layer --output csv
+    python device_reachability.py --timeout 5 --verbose
 
 Prerequisites:
-    pip install nornir nornir-netmiko netmiko
+    - Nornir configured with inventory (hosts.yaml, groups.yaml, defaults.yaml)
+    - ICMP (ping) access to target devices
+    - Network connectivity to all target devices
+    - netmiko or paramiko for device connectivity (for DNS resolution fallback)
+
+Output:
+    Generates a reachability report in JSON or CSV format with:
+    - Device IP and hostname
+    - Reachability status (up/down)
+    - Average, min, max latency
+    - Packet loss percentage
+    - Last check timestamp
 """
 
 import argparse
-import difflib
+import csv
+import json
 import logging
-import os
+import statistics
+import subprocess
 import sys
 from datetime import datetime
-from typing import Optional
+from io import StringIO
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from nornir import InitNornir
-from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
-from nornir.core.task import Result, Task
-from nornir_netmiko import netmiko_send_command
+from nornir.core.filter import F
+from nornir.core.task import Task, Result
+
 
 logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 
-PLATFORM_COMMANDS = {
-    "cisco_ios": ("show startup-config", "show running-config"),
-    "cisco_nxos": ("show startup-config", "show running-config"),
-    "cisco_xr": ("show running-config", "show running-config committed"),
-    "arista_eos": ("show startup-config", "show running-config"),
-    "juniper_junos": ("show configuration", "show configuration | compare rollback 0"),
-}
-
-
-def build_inventory(hosts: list[str], username: str, password: str, platform: str) -> Inventory:
-    host_dict = {}
-    for host in hosts:
-        host_dict[host] = Host(
-            name=host,
-            hostname=host,
-            username=username,
-            password=password,
-            platform=platform,
-            groups=[],
+def ping_host(host: str, count: int = 4, timeout: int = 3) -> Dict[str, Any]:
+    """
+    Ping a host and collect latency metrics.
+    
+    Args:
+        host: IP address or hostname to ping
+        count: Number of ping packets to send
+        timeout: Timeout in seconds per packet
+    
+    Returns:
+        Dictionary with reachability status and latency metrics
+    """
+    try:
+        cmd = ["ping", "-c", str(count), "-W", str(timeout * 1000), host]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout * count + 5
         )
-    return Inventory(hosts=Hosts(host_dict), groups=Groups({}), defaults=Defaults())
+        
+        if result.returncode != 0:
+            return {
+                "host": host,
+                "reachable": False,
+                "packet_loss": 100.0,
+                "avg_latency_ms": None,
+                "min_latency_ms": None,
+                "max_latency_ms": None,
+            }
+        
+        lines = result.stdout.split("\n")
+        stats_line = next((l for l in lines if "min/avg/max" in l), None)
+        
+        if not stats_line:
+            return {
+                "host": host,
+                "reachable": True,
+                "packet_loss": 0.0,
+                "avg_latency_ms": 0,
+                "min_latency_ms": 0,
+                "max_latency_ms": 0,
+            }
+        
+        parts = stats_line.split("=")[1].split("/")
+        latencies = [float(p.strip()) for p in parts[:3]]
+        
+        return {
+            "host": host,
+            "reachable": True,
+            "packet_loss": 0.0,
+            "avg_latency_ms": round(latencies[1], 2),
+            "min_latency_ms": round(latencies[0], 2),
+            "max_latency_ms": round(latencies[2], 2),
+        }
+    
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Ping timeout for {host}")
+        return {
+            "host": host,
+            "reachable": False,
+            "packet_loss": 100.0,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+        }
+    except Exception as e:
+        logger.error(f"Error pinging {host}: {e}")
+        return {
+            "host": host,
+            "reachable": False,
+            "packet_loss": 100.0,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "error": str(e),
+        }
 
 
-def check_config_drift(task: Task, platform: str) -> Result:
-    if platform not in PLATFORM_COMMANDS:
-        return Result(host=task.host, result=None, failed=True,
-                      exception=ValueError(f"Unsupported platform: {platform}"))
-
-    startup_cmd, running_cmd = PLATFORM_COMMANDS[platform]
-
-    startup_result = task.run(task=netmiko_send_command, command_string=startup_cmd,
-                              name="startup-config")
-    running_result = task.run(task=netmiko_send_command, command_string=running_cmd,
-                              name="running-config")
-
-    startup = startup_result[0].result or ""
-    running = running_result[0].result or ""
-
-    startup_lines = startup.splitlines(keepends=True)
-    running_lines = running.splitlines(keepends=True)
-
-    diff = list(difflib.unified_diff(
-        startup_lines,
-        running_lines,
-        fromfile="startup-config",
-        tofile="running-config",
-        lineterm="",
-    ))
-
-    return Result(
-        host=task.host,
-        result={
-            "has_drift": len(diff) > 0,
-            "diff_lines": diff,
-            "startup_lines": len(startup_lines),
-            "running_lines": len(running_lines),
-        },
-    )
+def check_reachability(task: Task, count: int, timeout: int) -> Result:
+    """Nornir task to check device reachability."""
+    host_ip = task.host.get("host", task.host.name)
+    
+    logger.debug(f"Checking reachability for {task.host.name} ({host_ip})")
+    
+    metrics = ping_host(host_ip, count, timeout)
+    metrics["device"] = task.host.name
+    metrics["timestamp"] = datetime.now().isoformat()
+    
+    return Result(host=task.host, result=metrics)
 
 
-def save_diff(host: str, diff_lines: list[str], diff_dir: str) -> Optional[str]:
-    os.makedirs(diff_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(diff_dir, f"{host}_drift_{ts}.diff")
-    with open(path, "w") as f:
-        f.writelines(diff_lines)
-    return path
+def format_output(results: List[Dict[str, Any]], format_type: str) -> str:
+    """Format results as JSON, CSV, or text."""
+    if not results:
+        return "No results available"
+    
+    if format_type == "json":
+        return json.dumps(results, indent=2, default=str)
+    
+    elif format_type == "csv":
+        output = StringIO()
+        if results:
+            fieldnames = list(results[0].keys())
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        return output.getvalue()
+    
+    else:
+        lines = []
+        for r in results:
+            lines.append(f"\nDevice: {r.get('device')}")
+            lines.append(f"  Host: {r.get('host')}")
+            lines.append(f"  Reachable: {r.get('reachable')}")
+            
+            if r.get("reachable"):
+                lines.append(f"  Avg Latency: {r.get('avg_latency_ms')} ms")
+                lines.append(f"  Min/Max: {r.get('min_latency_ms')}/{r.get('max_latency_ms')} ms")
+            else:
+                lines.append(f"  Status: UNREACHABLE")
+                if "error" in r:
+                    lines.append(f"  Error: {r.get('error')}")
+        
+        return "\n".join(lines)
 
 
-def parse_args() -> argparse.Namespace:
+def main():
     parser = argparse.ArgumentParser(
-        description="Detect unsaved config changes (startup vs running drift)",
+        description="Check network device reachability and measure latency"
     )
-    parser.add_argument("--hosts", required=True,
-                        help="Comma-separated list of device hostnames/IPs")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--platform", default="cisco_ios",
-                        choices=list(PLATFORM_COMMANDS.keys()),
-                        help="Netmiko platform type (default: cisco_ios)")
-    parser.add_argument("--workers", type=int, default=10,
-                        help="Parallel worker threads (default: 10)")
-    parser.add_argument("--save-diffs", action="store_true",
-                        help="Write unified diffs to files")
-    parser.add_argument("--diff-dir", default="./config_diffs",
-                        help="Directory for diff output (default: ./config_diffs)")
-    parser.add_argument("--show-diff", action="store_true",
-                        help="Print diffs to stdout")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
+    parser.add_argument(
+        "--devices",
+        type=str,
+        help="Comma-separated list of device names"
+    )
+    parser.add_argument(
+        "--group",
+        type=str,
+        help="Filter devices by group name"
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=4,
+        help="Number of ping packets per device (default: 4)"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=3,
+        help="Timeout per packet in seconds (default: 3)"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="reachability_report.json",
+        help="Output file path (default: reachability_report.json)"
+    )
+    parser.add_argument(
+        "--format",
+        choices=["json", "csv", "text"],
+        default="json",
+        help="Output format (default: json)"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    args = parser.parse_args()
+    
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-
-    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-    if not hosts:
-        print("ERROR: no valid hosts provided", file=sys.stderr)
-        sys.exit(1)
-
-    inventory = build_inventory(hosts, args.username, args.password, args.platform)
-    nr = InitNornir(
-        runner={"plugin": "threaded", "options": {"num_workers": args.workers}},
-        inventory={"plugin": "SimpleInventory"},
-        logging={"enabled": False},
-    )
-    nr.inventory = inventory
-
-    print(f"Checking config drift on {len(hosts)} device(s) [{args.platform}]...\n")
-    results = nr.run(task=check_config_drift, platform=args.platform)
-
-    drifted, clean, failed = [], [], []
-
-    for host, multi_result in results.items():
-        if multi_result.failed:
-            failed.append(host)
-            logger.error("Failed on %s: %s", host, multi_result.exception)
-            continue
-
-        data = multi_result[0].result
-        if data is None:
-            failed.append(host)
-            continue
-
-        if data["has_drift"]:
-            drifted.append(host)
-            changed = sum(1 for l in data["diff_lines"] if l.startswith(("+", "-"))
-                          and not l.startswith(("+++", "---")))
-            print(f"  [DRIFT]  {host}  ({changed} changed lines)")
-            if args.show_diff:
-                print("".join(data["diff_lines"][:60]))
-                if len(data["diff_lines"]) > 60:
-                    print(f"  ... ({len(data['diff_lines']) - 60} more lines)")
-            if args.save_diffs:
-                path = save_diff(host, data["diff_lines"], args.diff_dir)
-                print(f"           diff saved: {path}")
-        else:
-            clean.append(host)
-            print(f"  [clean]  {host}")
-
-    print(f"\nSummary: {len(drifted)} drifted / {len(clean)} clean / {len(failed)} failed")
-
-    if drifted:
-        print("\nDevices with unsaved changes (reboot risk):")
-        for h in drifted:
-            print(f"  - {h}")
-
-    sys.exit(1 if drifted or failed else 0)
+    
+    try:
+        nr = InitNornir()
+        logger.info(f"Initialized Nornir with {len(nr.inventory.hosts)} hosts")
+        
+        if args.devices:
+            device_list = [d.strip() for d in args.devices.split(",")]
+            nr = nr.filter(F(name__in=device_list))
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} specified devices")
+        
+        if args.group:
+            nr = nr.filter(F(groups__contains=args.group))
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices in group '{args.group}'")
+        
+        if not nr.inventory.hosts:
+            logger.error("No devices found matching filters")
+            return 1
+        
+        results = []
+        for hostname, host_obj in nr.inventory.hosts.items():
+            task_result = check_reachability(
+                type('Task', (), {'host': host_obj})(),
+                args.count,
+                args.timeout
+            )
+            results.append(task_result.result)
+        
+        output = format_output(results, args.format)
+        
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output)
+        
+        logger.info(f"Reachability report written to {output_path}")
+        print(output)
+        
+        reachable = sum(1 for r in results if r.get("reachable"))
+        total = len(results)
+        logger.info(f"Summary: {reachable}/{total} devices reachable")
+        
+        return 0 if reachable == total else 1
+    
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+```
