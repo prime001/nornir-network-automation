@@ -1,203 +1,261 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Reachability and Interface Health Check
+Device Software Inventory and Version Audit Tool.
 
 Purpose:
-    Validates device connectivity and gathers interface statistics to identify
-    network health issues. Detects unreachable devices, interface errors, and
-    link problems across a network inventory.
+    Audits software versions and OS information across network devices.
+    Identifies devices running outdated or non-standard OS versions
+    and generates a compliance report.
 
 Usage:
-    python device_health_check.py --inventory inventory.yaml --device 192.168.1.1
-    python device_health_check.py --inventory inventory.yaml --device all --format json
-    python device_health_check.py --inventory inventory.yaml --threshold 20
+    python software_audit.py -i inventory.yaml -u admin -p password
+    python software_audit.py -i inventory.yaml -u admin -p password --output versions.csv
+    python software_audit.py -i inventory.yaml -u admin -p password --min-version 15.2
 
 Prerequisites:
-    - nornir, nornir-napalm, and netaddr installed
-    - Valid inventory file with device credentials
-    - Network connectivity to target devices
-    - NAPALM support for device OS platforms
+    - nornir with network device connectivity
+    - SSH access to managed devices
+    - Device inventory in YAML format
+    - NAPALM or netmiko for device interaction
+
+Environment Variables:
+    NORNIR_INVENTORY: Path to inventory file
 """
 
 import argparse
-import json
+import csv
 import logging
-from typing import Any, Dict
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.task import Result, Task
+from nornir.plugins.tasks.napalm_utils import napalm_get_facts
 
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def gather_interface_health(task: Any, error_threshold: int = 10) -> Dict[str, Any]:
-    """
-    Collect interface statistics and identify problematic interfaces.
-    
-    Args:
-        task: Nornir task object
-        error_threshold: Error/discard count threshold for alerting
-    
-    Returns:
-        Dictionary containing device health metrics
-    """
-    health_data = {
-        "device": task.host.name,
-        "reachable": False,
-        "status": "unreachable",
-        "total_interfaces": 0,
-        "problem_count": 0,
-        "problems": [],
-    }
-    
+def extract_version(version_string: str) -> Optional[tuple]:
+    """Extract version numbers from version string."""
     try:
-        result = task.run(
-            napalm_get,
-            getters=["interfaces", "interfaces_counters"],
-            name="gather_stats",
+        parts = version_string.split('.')
+        return tuple(int(p) for p in parts[:3])
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+def audit_device_software(task: Task, min_version: str = None) -> Result:
+    """Audit device software version and OS information."""
+    device = task.host
+    audit_data = {
+        'device': device.name,
+        'ip': device.host,
+        'device_type': device.get('device_type', 'unknown'),
+        'os_version': None,
+        'os': None,
+        'model': None,
+        'uptime_seconds': None,
+        'compliant': True,
+        'compliance_notes': [],
+        'error': None,
+        'timestamp': datetime.now().isoformat()
+    }
+
+    try:
+        facts_result = task.run(
+            napalm_get_facts,
+            name='get_facts'
         )
-        
-        interfaces = result[0].result.get("interfaces", {})
-        counters = result[0].result.get("interfaces_counters", {})
-        
-        health_data["reachable"] = True
-        health_data["total_interfaces"] = len(interfaces)
-        
-        for iface_name, iface_info in interfaces.items():
-            iface_counts = counters.get(iface_name, {})
-            
-            error_count = (
-                iface_counts.get("rx_errors", 0) +
-                iface_counts.get("tx_errors", 0)
+
+        if facts_result[0].result:
+            facts = facts_result[0].result
+            audit_data['os_version'] = facts.get('os_version')
+            audit_data['os'] = facts.get('os')
+            audit_data['model'] = facts.get('model')
+            audit_data['uptime_seconds'] = facts.get('uptime_seconds')
+
+            # Version compliance check
+            if min_version and audit_data['os_version']:
+                device_version = extract_version(audit_data['os_version'])
+                min_ver = extract_version(min_version)
+
+                if device_version and min_ver:
+                    if device_version < min_ver:
+                        audit_data['compliant'] = False
+                        audit_data['compliance_notes'].append(
+                            f"Version {audit_data['os_version']} < "
+                            f"minimum {min_version}"
+                        )
+                        logger.warning(
+                            f"{device.name} running outdated version: "
+                            f"{audit_data['os_version']}"
+                        )
+
+            logger.info(
+                f"Device {device.name}: {audit_data['os']} "
+                f"{audit_data['os_version']}"
             )
-            discard_count = (
-                iface_counts.get("rx_discards", 0) +
-                iface_counts.get("tx_discards", 0)
-            )
-            
-            has_problems = (
-                not iface_info.get("is_up") or
-                error_count > error_threshold or
-                discard_count > error_threshold
-            )
-            
-            if has_problems:
-                health_data["problems"].append({
-                    "interface": iface_name,
-                    "is_up": iface_info.get("is_up"),
-                    "errors": error_count,
-                    "discards": discard_count,
-                    "speed": iface_info.get("speed"),
-                })
-                health_data["problem_count"] += 1
-        
-        health_data["status"] = "healthy" if health_data["problem_count"] == 0 else "degraded"
-        
+
     except Exception as e:
-        logger.error(f"Error on {task.host.name}: {str(e)}")
-        health_data["error"] = str(e)
-    
-    return health_data
+        audit_data['error'] = str(e)
+        logger.error(
+            f"Failed to audit {device.name}: {str(e)[:80]}"
+        )
+
+    return Result(host=task.host, result=audit_data)
 
 
-def format_table_output(results: list) -> None:
-    print("\n" + "=" * 90)
-    print(f"{'Device':<20} {'Status':<15} {'Reachable':<12} {'Interfaces':<12} {'Problems':<12}")
-    print("=" * 90)
-    
-    for device in results:
-        status = device.get("status", "unknown")
-        reachable = "Yes" if device.get("reachable") else "No"
-        total = device.get("total_interfaces", 0)
-        problems = device.get("problem_count", 0)
-        
-        print(f"{device['device']:<20} {status:<15} {reachable:<12} {total:<12} {problems:<12}")
-        
-        if device.get("problems"):
-            for prob in device["problems"]:
-                status_str = "UP" if prob["is_up"] else "DOWN"
-                print(f"  └─ {prob['interface']}: {status_str} "
-                      f"(errors: {prob['errors']}, discards: {prob['discards']})")
-    
-    print("=" * 90)
+def generate_report(
+    results: Dict,
+    output_file: Optional[str] = None
+) -> List[Dict]:
+    """Generate software audit report from results."""
+    report_data = []
+
+    for device_name, task_results in results.items():
+        for task_name, task_result in task_results.items():
+            if task_result.result:
+                report_data.append(task_result.result)
+
+    if output_file:
+        try:
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                if report_data:
+                    fieldnames = report_data[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(report_data)
+            logger.info(f"Report written to {output_file}")
+        except IOError as e:
+            logger.error(f"Failed to write report: {e}")
+
+    return report_data
 
 
-def main() -> None:
+def print_summary(report_data: List[Dict]) -> None:
+    """Print audit summary to console."""
+    if not report_data:
+        print("No audit data available")
+        return
+
+    print("\n" + "=" * 80)
+    print("SOFTWARE INVENTORY AND VERSION AUDIT")
+    print("=" * 80)
+
+    compliant = sum(1 for r in report_data if r['compliant'])
+    non_compliant = len(report_data) - compliant
+
+    print(
+        f"Total Devices: {len(report_data)} | "
+        f"Compliant: {compliant} | Non-Compliant: {non_compliant}"
+    )
+    print("=" * 80)
+
+    print(f"\n{'Device':<20} {'IP':<15} {'OS':<12} {'Version':<12} {'Status':<10}")
+    print("-" * 80)
+
+    for item in sorted(report_data, key=lambda x: x['device']):
+        status = "✓ OK" if item['compliant'] else "✗ FAIL"
+        os_type = item['os'][:10] if item['os'] else "Unknown"
+        version = item['os_version'][:10] if item['os_version'] else "Unknown"
+
+        print(
+            f"{item['device']:<20} {item['ip']:<15} "
+            f"{os_type:<12} {version:<12} {status:<10}"
+        )
+
+        if item['compliance_notes']:
+            for note in item['compliance_notes']:
+                print(f"  └─ {note}")
+
+        if item['error']:
+            print(f"  └─ ERROR: {item['error'][:60]}")
+
+    print("=" * 80 + "\n")
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Check device health and interface status across network"
+        description='Audit software versions across network devices'
     )
     parser.add_argument(
-        "--inventory",
+        '-i', '--inventory',
         required=True,
-        help="Path to nornir inventory configuration file",
+        help='Path to nornir inventory file'
     )
     parser.add_argument(
-        "--device",
-        default="all",
-        help="Target device name or 'all'",
+        '-u', '--username',
+        required=True,
+        help='Device username'
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=10,
-        help="Error/discard count threshold for alerting",
+        '-p', '--password',
+        required=True,
+        help='Device password'
     )
     parser.add_argument(
-        "--format",
-        choices=["table", "json"],
-        default="table",
-        help="Output format",
+        '--min-version',
+        help='Minimum required OS version (e.g., 15.2.4)'
     )
-    
+    parser.add_argument(
+        '-o', '--output',
+        help='Output CSV file for detailed report'
+    )
+    parser.add_argument(
+        '-d', '--devices',
+        help='Comma-separated device names to audit'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable debug logging'
+    )
+
     args = parser.parse_args()
-    
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if not Path(args.inventory).exists():
+        logger.error(f"Inventory file not found: {args.inventory}")
+        sys.exit(1)
+
     try:
         nr = InitNornir(config_file=args.inventory)
-        
-        if args.device != "all":
-            nr = nr.filter(F(name=args.device))
-        
-        if not nr.inventory.hosts:
-            logger.error(f"No devices matching filter: {args.device}")
-            return
-        
-        logger.info(f"Scanning {len(nr.inventory.hosts)} device(s)...")
-        
-        results = nr.run(
-            task=gather_interface_health,
-            error_threshold=args.threshold,
+
+        if args.devices:
+            device_list = [d.strip() for d in args.devices.split(',')]
+            nr = nr.filter(name__in=device_list)
+
+        for host in nr.inventory.hosts.values():
+            host.username = args.username
+            host.password = args.password
+
+        logger.info(
+            f"Auditing software on {len(nr.inventory.hosts)} devices"
         )
-        
-        health_report = [
-            task_results[0].result
-            for task_results in results.values()
-            if task_results[0].result
-        ]
-        
-        if args.format == "json":
-            print(json.dumps(health_report, indent=2))
-        else:
-            format_table_output(health_report)
-            
-            degraded_count = sum(1 for d in health_report if d["status"] == "degraded")
-            unreachable_count = sum(1 for d in health_report if not d["reachable"])
-            
-            if degraded_count > 0 or unreachable_count > 0:
-                logger.warning(
-                    f"Issues detected: {unreachable_count} unreachable, "
-                    f"{degraded_count} degraded"
-                )
-    
+
+        results = nr.run(
+            task=audit_device_software,
+            min_version=args.min_version
+        )
+
+        report_data = generate_report(results, args.output)
+        print_summary(report_data)
+
+        non_compliant = sum(1 for r in report_data if not r['compliant'])
+        sys.exit(1 if non_compliant > 0 else 0)
+
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        return
+        logger.exception(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
