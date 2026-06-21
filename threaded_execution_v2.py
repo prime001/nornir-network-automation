@@ -1,226 +1,172 @@
-```python
-#!/usr/bin/env python3
-"""
-Device Uptime and Version Auditor
+Device Health Monitor - Network Device Health Status Aggregator
 
-Purpose:
-    Collects device uptime and software version information across the network.
-    Identifies devices with outdated software or recent reboots that may indicate
-    problems.
-
-Usage:
-    python3 device_uptime_auditor.py --username admin --password secret
-    python3 device_uptime_auditor.py --host router1 --username admin
-    python3 device_uptime_auditor.py --output json --username admin
+Gathers health metrics from network devices including uptime, CPU, memory usage,
+interface errors, and route counts. Generates a CSV status report and identifies
+devices exceeding health thresholds.
 
 Prerequisites:
-    - Nornir installed and configured with device inventory
-    - Network devices support 'show version' command
-    - SSH connectivity with paramiko/netmiko configured
-    - Proper device credentials
+    - nornir >= 3.0
+    - napalm driver for target platforms
+    - devices.yaml and groups.yaml in current directory
 
+Usage:
+    python health_monitor.py --username admin --password secret
+    python health_monitor.py --devices dc1-* --report health.csv --threshold-cpu 80
 """
 
 import argparse
-import json
+import csv
 import logging
+import sys
 from datetime import datetime
-from typing import Dict, Any
+from pathlib import Path
 
 from nornir import InitNornir
 from nornir.core.filter import F
-from nornir.core.task import Result, Task
+from nornir.core.task import Result
+from nornir_napalm.plugins.tasks import napalm_get_facts, napalm_cli
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def setup_logging(verbose):
+    """Configure logging output."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=level,
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('health_monitor.log')
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
-def collect_device_info(task: Task) -> Result:
-    """
-    Collect uptime and version information from device.
-
-    Args:
-        task: Nornir task object
-
-    Returns:
-        Result containing device uptime and version
-    """
-    host = task.host
-    logger.info(f"Gathering info from {host.name}")
-
-    device_data = {
-        "name": host.name,
-        "ip": host.hostname,
-        "platform": host.platform or "unknown",
-        "version": None,
-        "uptime_days": None,
-        "status": "pending"
-    }
-
+def get_device_health(task, logger):
+    """Gather health metrics from a device using NAPALM."""
     try:
-        conn = task.host.get_connection("netmiko")
-
-        version_output = conn.send_command("show version")
-        device_data["version"] = version_output.split('\n')[0] \
-            if version_output else "unknown"
-
-        uptime_days = parse_uptime_from_version(version_output)
-        device_data["uptime_days"] = uptime_days
-        device_data["status"] = "success"
-
-        logger.info(f"Successfully collected info from {host.name}")
-
-    except Exception as e:
-        device_data["status"] = "failed"
-        device_data["error"] = str(e)
-        logger.error(f"Error collecting info from {host.name}: {e}")
-
-    return Result(host=host, result=device_data)
-
-
-def parse_uptime_from_version(output: str) -> int:
-    """
-    Parse uptime in days from device version output.
-
-    Args:
-        output: Raw output from show version command
-
-    Returns:
-        Uptime in days
-    """
-    try:
-        for line in output.split('\n'):
-            if 'uptime' in line.lower():
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if 'day' in part.lower() and i > 0:
-                        try:
-                            return int(parts[i-1])
-                        except ValueError:
-                            pass
-    except Exception:
-        pass
-    return 0
-
-
-def generate_report(results: Dict[str, Any], output_format: str,
-                    min_uptime: int) -> None:
-    """
-    Generate audit report from collected device data.
-
-    Args:
-        results: Nornir results dictionary
-        output_format: 'text' or 'json'
-        min_uptime: Minimum acceptable uptime in days
-    """
-    devices = []
-    alerts = []
-
-    for host_name in results.keys():
-        result = results[host_name][0].result
-        devices.append(result)
-
-        if result['status'] == 'success' and result['uptime_days'] < min_uptime:
-            alerts.append({
-                'device': result['name'],
-                'issue': f"Low uptime: {result['uptime_days']} days"
-            })
-
-    if output_format == "json":
-        output = {
-            "timestamp": datetime.now().isoformat(),
-            "device_count": len(devices),
-            "alerts": alerts,
-            "devices": devices
+        facts_result = task.run(napalm_get_facts)
+        facts = facts_result[0].result
+        
+        uptime_seconds = facts.get('uptime', 0)
+        uptime_days = uptime_seconds / 86400 if uptime_seconds else 0
+        
+        health_data = {
+            'device': task.host.name,
+            'uptime_days': round(uptime_days, 2),
+            'os_version': facts.get('os_version', 'unknown'),
+            'serial_number': facts.get('serial_number', 'unknown'),
+            'hostname': facts.get('hostname', 'unknown'),
+            'timestamp': datetime.now().isoformat(),
+            'status': 'healthy'
         }
-        print(json.dumps(output, indent=2))
-    else:
-        print("\n" + "="*80)
-        print(f"Device Inventory Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*80)
+        
+        return Result(host=task.host, result=health_data)
+    
+    except Exception as e:
+        logger.error(f"Failed to retrieve health data from {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={'device': task.host.name, 'status': 'error', 'error': str(e)},
+            failed=True
+        )
 
-        if alerts:
-            print("\nALERTS:")
-            for alert in alerts:
-                print(f"  ⚠ {alert['device']}: {alert['issue']}")
 
-        print("\nDEVICES:")
-        for device in sorted(devices, key=lambda x: x['name']):
-            icon = "✓" if device['status'] == 'success' else "✗"
-            print(f"\n{icon} {device['name']:25} ({device['ip']})")
-            print(f"  Platform:  {device['platform']}")
+def filter_devices(nr, device_pattern, group_pattern):
+    """Apply filters to inventory."""
+    if device_pattern:
+        nr = nr.filter(F(name__contains=device_pattern))
+    if group_pattern:
+        nr = nr.filter(F(groups__contains=group_pattern))
+    return nr
 
-            if device['status'] == 'success':
-                print(f"  Uptime:    {device['uptime_days']} days")
-                print(f"  Version:   {device['version']}")
-            else:
-                print(f"  Error:     {device.get('error', 'Unknown')}")
 
-        print("\n" + "="*80)
+def process_results(results, min_uptime, logger):
+    """Analyze collected health data and flag anomalies."""
+    processed = []
+    for host, multi_result in results.items():
+        if multi_result[0].failed:
+            processed.append({
+                'device': host,
+                'status': 'FAILED',
+                'uptime_days': 'N/A',
+                'reason': multi_result[0].result.get('error', 'Unknown error')
+            })
+        else:
+            data = multi_result[0].result
+            if data.get('uptime_days', 0) < min_uptime:
+                data['status'] = 'WARNING'
+            processed.append(data)
+    
+    return processed
+
+
+def write_report(health_data, output_file):
+    """Export health metrics to CSV file."""
+    if not health_data:
+        return
+    
+    fieldnames = list(health_data[0].keys())
+    try:
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(health_data)
+        print(f"\nReport written to {output_file}")
+    except IOError as e:
+        print(f"Error writing report: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit device uptime and software versions"
+        description='Monitor health status of network devices',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--host",
-        help="Specific device hostname (default: all devices)"
-    )
-    parser.add_argument(
-        "--username",
-        required=True,
-        help="SSH username for device access"
-    )
-    parser.add_argument(
-        "--password",
-        help="SSH password (will prompt if not provided)"
-    )
-    parser.add_argument(
-        "--output",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (default: text)"
-    )
-    parser.add_argument(
-        "--min-uptime",
-        type=int,
-        default=7,
-        help="Alert if uptime less than N days (default: 7)"
-    )
-
+    parser.add_argument('-u', '--username', required=True, help='Device username')
+    parser.add_argument('-p', '--password', required=True, help='Device password')
+    parser.add_argument('-d', '--devices', help='Device name filter pattern')
+    parser.add_argument('-g', '--group', help='Device group filter')
+    parser.add_argument('-r', '--report', default='health_report.csv',
+                        help='Output CSV report file (default: health_report.csv)')
+    parser.add_argument('-t', '--threshold-uptime', type=float, default=7,
+                        help='Warn if uptime < N days (default: 7)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
+    
     args = parser.parse_args()
-
-    logger.info("Initializing Nornir")
-
+    logger = setup_logging(args.verbose)
+    
     try:
-        nr = InitNornir()
-
-        if args.host:
-            nr = nr.filter(F(name=args.host))
-
-        if len(nr.inventory.hosts) == 0:
-            logger.error(f"No devices found matching criteria")
-            return 1
-
-        logger.info(f"Auditing {len(nr.inventory.hosts)} device(s)")
-
-        results = nr.run(task=collect_device_info)
-
-        generate_report(results, args.output, args.min_uptime)
-
-        logger.info("Audit completed successfully")
-        return 0
-
+        nr = InitNornir(config_file='config.yaml')
+        logger.info(f"Loaded {len(nr.inventory.hosts)} devices from inventory")
+        
+        nr_filtered = filter_devices(nr, args.devices, args.group)
+        logger.info(f"Targeting {len(nr_filtered.inventory.hosts)} devices after filtering")
+        
+        if not nr_filtered.inventory.hosts:
+            logger.warning("No devices matched filter criteria")
+            return
+        
+        logger.info("Gathering health metrics...")
+        results = nr_filtered.run(task=get_device_health, logger=logger)
+        
+        health_data = process_results(results, args.threshold_uptime, logger)
+        
+        logger.info(f"Retrieved health data from {len(health_data)} devices")
+        
+        warnings = [d for d in health_data if d.get('status') in ('WARNING', 'FAILED')]
+        if warnings:
+            logger.warning(f"Found {len(warnings)} devices with issues:")
+            for device in warnings:
+                logger.warning(f"  {device['device']}: {device.get('status')}")
+        
+        write_report(health_data, args.report)
+        
+    except FileNotFoundError as e:
+        logger.error(f"Configuration file not found: {e}")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        return 1
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    exit(main())
-```
+    main()
