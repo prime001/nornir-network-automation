@@ -1,184 +1,189 @@
 ```python
 """
-Device Performance Metrics Collector - Network Device Monitoring
+Network Device Health Check and Diagnostics Tool
 
 Purpose:
-    Collects and analyzes performance metrics (CPU, memory, interface statistics)
-    from network devices via nornir using NAPALM drivers.
+    Performs health checks on network devices including connectivity tests,
+    uptime verification, and basic system diagnostics. Useful for identifying
+    failed or degraded devices in the network.
 
 Usage:
-    python device_performance_monitor.py --devices all --output json
-    python device_performance_monitor.py --device router1 --metrics cpu,memory
+    python health_check.py --devices all --output report.json
+    python health_check.py --devices router1,router2 --username admin --password pass
+    python health_check.py --failed-only
 
 Prerequisites:
-    - nornir with NAPALM plugin installed
-    - netmiko or paramiko for SSH connectivity
-    - NAPALM library compatible with target device types
-    - Inventory file with device definitions (config.yaml)
-    - SSH/API access to network devices with appropriate credentials
+    - Nornir installed with netmiko/napalm
+    - nornir inventory configured (config.yaml)
+    - Device SSH connectivity
 """
 
-import logging
 import argparse
 import json
-from typing import Dict, Any, List
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
 from nornir import InitNornir
-from nornir.core.filter import F
-from nornir.core.task import Task, Result
-from nornir_napalm.plugins.tasks import napalm_get
+from nornir.core.task import Result, Task
+from nornir.plugins.tasks.networking import napalm_get
 
 
-def setup_logging(level: str) -> logging.Logger:
-    """Configure logging with specified verbosity level."""
-    logger = logging.getLogger("perf_monitor")
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(getattr(logging, level.upper()))
-    return logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def collect_metrics(task: Task, metrics: List[str]) -> Result:
-    """Collect specified performance metrics from device."""
-    device_metrics = {"device": task.host.name}
-    
-    try:
-        if "cpu" in metrics or "memory" in metrics:
-            facts = task.run(napalm_get, getters=["facts"])
-            if facts.result:
-                device_metrics["uptime_seconds"] = (
-                    facts.result.get("facts", {}).get("uptime_seconds", 0)
-                )
-        
-        if "interface" in metrics:
-            interfaces = task.run(napalm_get, getters=["interfaces_counters"])
-            if interfaces.result:
-                iface_data = interfaces.result.get("interfaces_counters", {})
-                device_metrics["interfaces"] = _analyze_interfaces(iface_data)
-        
-        device_metrics["status"] = "success"
-        
-    except Exception as e:
-        device_metrics["status"] = "error"
-        device_metrics["error"] = str(e)
-    
-    return Result(host=task.host, result=device_metrics)
-
-
-def _analyze_interfaces(iface_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze interface statistics for issues."""
-    analysis = {
-        "total": len(iface_data),
-        "down_interfaces": [],
-        "high_error_rates": []
+def health_check(task: Task) -> Result:
+    """Perform health check on device including facts and interface status."""
+    health_status = {
+        "device": task.host.name,
+        "timestamp": datetime.now().isoformat(),
+        "reachable": False,
+        "uptime": None,
+        "facts": {},
+        "interfaces_up": 0,
+        "interfaces_down": 0
     }
     
-    for iface_name, stats in iface_data.items():
-        if stats.get("state") == "down":
-            analysis["down_interfaces"].append(iface_name)
-        
-        rx_errors = stats.get("rx_errors", 0) + stats.get("rx_discards", 0)
-        tx_errors = stats.get("tx_errors", 0) + stats.get("tx_discards", 0)
-        
-        if rx_errors > 100 or tx_errors > 100:
-            analysis["high_error_rates"].append({
-                "interface": iface_name,
-                "rx_errors": rx_errors,
-                "tx_errors": tx_errors
-            })
-    
-    return analysis
-
-
-def format_table_output(results: Dict[str, Any]) -> str:
-    """Format results as ASCII table."""
-    lines = []
-    header = f"{'Device':<20} {'Status':<12} {'Uptime (hrs)':<15} {'Issues':<15}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    
-    for device_name, result in results.items():
-        status = result.get("status", "unknown")
-        uptime_hrs = result.get("uptime_seconds", 0) // 3600 if result.get("uptime_seconds") else 0
-        
-        issues = 0
-        if "interfaces" in result:
-            issues += len(result["interfaces"].get("down_interfaces", []))
-            issues += len(result["interfaces"].get("high_error_rates", []))
-        
-        lines.append(
-            f"{device_name:<20} {status:<12} {uptime_hrs:<15} {issues:<15}"
+    try:
+        result = task.run(
+            napalm_get,
+            getters=["facts", "interfaces"],
+            platform=task.host.platform
         )
+        
+        if result and result[0].result:
+            health_status["reachable"] = True
+            facts = result[0].result.get("facts", {})
+            interfaces = result[0].result.get("interfaces", {})
+            
+            health_status["uptime"] = facts.get("uptime", 0)
+            health_status["facts"] = {
+                "model": facts.get("model", "Unknown"),
+                "os_version": facts.get("os_version", "Unknown"),
+                "serial_number": facts.get("serial_number", "Unknown"),
+                "total_interfaces": len(interfaces)
+            }
+            
+            for iface_name, iface_data in interfaces.items():
+                if iface_data.get("is_up"):
+                    health_status["interfaces_up"] += 1
+                else:
+                    health_status["interfaces_down"] += 1
+        
+        return Result(host=task.host, result=health_status)
     
-    return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Health check failed for {task.host.name}: {e}")
+        health_status["error"] = str(e)
+        return Result(host=task.host, result=health_status)
+
+
+def format_uptime(seconds: int) -> str:
+    """Convert uptime in seconds to human-readable format."""
+    if not seconds:
+        return "Unknown"
+    
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{days}d {hours}h {minutes}m"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect and analyze device performance metrics"
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        help="Target device name (if not specified, checks all devices)"
+        '--devices',
+        default='all',
+        help='Target devices (comma-separated list or "all")'
+    )
+    parser.add_argument('--username', help='Device username')
+    parser.add_argument('--password', help='Device password')
+    parser.add_argument(
+        '--output',
+        type=Path,
+        help='Output report file (JSON format)'
     )
     parser.add_argument(
-        "--metrics",
-        type=str,
-        default="cpu,memory,interface",
-        help="Comma-separated metrics to collect (cpu,memory,interface)"
+        '--failed-only',
+        action='store_true',
+        help='Display only failed/unreachable devices'
     )
     parser.add_argument(
-        "--output",
-        choices=["json", "table"],
-        default="table",
-        help="Output format (default: table)"
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["debug", "info", "warning", "error"],
-        default="info",
-        help="Logging level"
+        '--config',
+        default='config.yaml',
+        help='Nornir configuration file'
     )
     
     args = parser.parse_args()
-    logger = setup_logging(args.log_level)
     
     try:
-        metrics = [m.strip() for m in args.metrics.split(",")]
-        nr = InitNornir(config_file="config.yaml")
+        nr = InitNornir(config_file=args.config)
         
-        if args.device:
-            nr = nr.filter(F(name=args.device))
+        if args.devices != 'all':
+            device_list = [d.strip() for d in args.devices.split(',')]
+            nr = nr.filter(name__in=device_list)
         
-        if not nr.inventory.hosts:
-            logger.error("No devices found matching criteria")
-            return
+        logger.info(f"Starting health check on {len(nr.inventory.hosts)} devices")
+        results = nr.run(task=health_check)
         
-        logger.info(f"Collecting metrics from {len(nr.inventory.hosts)} device(s)")
-        logger.debug(f"Metrics: {', '.join(metrics)}")
+        health_report = []
+        failed_devices = []
         
-        results = nr.run(task=collect_metrics, metrics=metrics)
+        for host_name, task_results in results.items():
+            status = task_results[0].result
+            health_report.append(status)
+            
+            if not status["reachable"]:
+                failed_devices.append(host_name)
         
-        output_dict = {}
-        for host_name in nr.inventory.hosts.keys():
-            task_result = results[host_name]
-            if task_result[0].result:
-                output_dict[host_name] = task_result[0].result
+        print("\n" + "=" * 70)
+        print("NETWORK DEVICE HEALTH CHECK REPORT")
+        print("=" * 70)
+        print(f"Total Devices Checked: {len(health_report)}")
+        print(f"Reachable: {sum(1 for h in health_report if h['reachable'])}")
+        print(f"Unreachable: {len(failed_devices)}")
         
-        if args.output == "json":
-            print(json.dumps(output_dict, indent=2, default=str))
-        else:
-            print(format_table_output(output_dict))
+        if not args.failed_only:
+            print("\nDevice Status:")
+            for status in sorted(
+                health_report,
+                key=lambda x: (not x["reachable"], x["device"])
+            ):
+                if status["reachable"]:
+                    uptime = format_uptime(status.get("uptime", 0))
+                    print(
+                        f"  ✓ {status['device']:<20} | "
+                        f"Uptime: {uptime:<15} | "
+                        f"OS: {status['facts'].get('os_version', 'N/A'):<12} | "
+                        f"Interfaces: {status['interfaces_up']}/{status['facts'].get('total_interfaces', 0)}"
+                    )
+                else:
+                    print(f"  ✗ {status['device']:<20} | UNREACHABLE")
+                    if "error" in status:
+                        print(f"      Error: {status['error']}")
         
-        logger.info("Metrics collection completed successfully")
+        if failed_devices:
+            print(f"\nAlert: Failed Devices: {', '.join(failed_devices)}")
         
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(health_report, f, indent=2)
+            logger.info(f"Health report saved to {args.output}")
+        
+        sys.exit(0 if not failed_devices else 1)
+    
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
