@@ -1,216 +1,225 @@
-```
-"""
-Interface Error Counter Analyzer
-=================================
+interface_error_monitor.py - Interface Error and Drop Counter Analysis
+
 Purpose:
-    Collects interface error counters from IOS/IOS-XE/NX-OS devices via
-    Nornir and reports interfaces exceeding configurable thresholds. Useful
-    for catching degraded physical links (CRC storms, excessive drops) before
-    they cause service-impacting outages.
+    Collects interface error counters (CRC, input/output errors, drops, resets)
+    from network devices via Nornir/Netmiko and flags interfaces that exceed
+    configurable thresholds. Intended for proactive fault detection and
+    troubleshooting — distinct from basic interface status reporting.
 
 Usage:
-    python 042_interface_error_counters.py --host core-sw1 --username admin --password secret
-    python 042_interface_error_counters.py --group access --threshold 100 --csv errors.csv
-    python 042_interface_error_counters.py --host rtr1 --all-interfaces
+    python interface_error_monitor.py --hosts router1 router2 --username admin --password secret
+    python interface_error_monitor.py --hosts core-sw1 --threshold-errors 50 --threshold-drops 200
+    python interface_error_monitor.py --hosts fw1 --output-format json --output-file errors.json
 
 Prerequisites:
     pip install nornir nornir-netmiko nornir-utils
-    Inventory files: hosts.yaml, groups.yaml, defaults.yaml
+    Devices must be reachable via SSH and support 'show interfaces' with TextFSM parsing.
 """
 
 import argparse
-import csv
+import io
+import json
 import logging
-import re
 import sys
-from dataclasses import dataclass
-from typing import Dict, List
 
 from nornir import InitNornir
-from nornir.core.filter import F
+from nornir.core.inventory import Defaults, Groups, Host, Hosts, Inventory
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class InterfaceErrors:
-    name: str
-    input_errors: int = 0
-    output_drops: int = 0
-    crc_errors: int = 0
-    runts: int = 0
-    giants: int = 0
-
-    def total(self) -> int:
-        return self.input_errors + self.output_drops + self.crc_errors + self.runts + self.giants
-
-
-def parse_ios_errors(output: str) -> List[InterfaceErrors]:
-    interfaces: List[InterfaceErrors] = []
-    current = None
-
-    for line in output.splitlines():
-        m = re.match(r"^(\S+) is", line)
-        if m:
-            if current:
-                interfaces.append(current)
-            current = InterfaceErrors(name=m.group(1))
-            continue
-
-        if current is None:
-            continue
-
-        for pattern, attr in [
-            (r"(\d+)\s+input errors", "input_errors"),
-            (r"(\d+)\s+CRC", "crc_errors"),
-            (r"(\d+)\s+output drops", "output_drops"),
-            (r"(\d+)\s+runts", "runts"),
-            (r"(\d+)\s+giants", "giants"),
-        ]:
-            m = re.search(pattern, line)
-            if m:
-                setattr(current, attr, int(m.group(1)))
-
-    if current:
-        interfaces.append(current)
-    return interfaces
-
-
-def collect_errors(task: Task) -> Result:
-    r = task.run(
+def collect_interface_counters(task: Task) -> Result:
+    """Pull interface counters using TextFSM-parsed 'show interfaces'."""
+    result = task.run(
         task=netmiko_send_command,
         command_string="show interfaces",
-        use_textfsm=False,
+        use_textfsm=True,
     )
-    return Result(host=task.host, result=parse_ios_errors(r.result))
+    return Result(host=task.host, result=result.result)
 
 
-def write_csv(rows: List[Dict], path: str) -> None:
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
+def parse_error_counters(raw: list) -> list:
+    """Normalize TextFSM output rows into counter dicts with safe int coercion."""
+    counters = []
+    for iface in raw:
+        counters.append({
+            "interface": iface.get("interface", ""),
+            "link_status": iface.get("link_status", "unknown"),
+            "protocol_status": iface.get("protocol_status", "unknown"),
+            "input_errors": int(iface.get("input_errors", 0) or 0),
+            "output_errors": int(iface.get("output_errors", 0) or 0),
+            "crc": int(iface.get("crc", 0) or 0),
+            "input_drops": int(iface.get("input_drops", 0) or 0),
+            "output_drops": int(iface.get("output_drops", 0) or 0),
+            "resets": int(iface.get("resets", 0) or 0),
+        })
+    return counters
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Report interfaces exceeding error counter thresholds"
-    )
-    p.add_argument("--host", help="Target a specific host from inventory")
-    p.add_argument("--group", help="Target a device group from inventory")
-    p.add_argument("--username", help="Override inventory username")
-    p.add_argument("--password", help="Override inventory password")
-    p.add_argument(
-        "--threshold",
-        type=int,
-        default=0,
-        help="Minimum total errors to report (default: 0 = any errors)",
-    )
-    p.add_argument(
-        "--all-interfaces",
-        action="store_true",
-        help="Include zero-error interfaces",
-    )
-    p.add_argument("--csv", metavar="FILE", help="Write results to CSV")
-    p.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Nornir config file (default: config.yaml)",
-    )
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p
+def flag_troubled(counters: list, threshold_errors: int, threshold_drops: int) -> list:
+    """Return interfaces whose totals meet or exceed either threshold."""
+    result = []
+    for iface in counters:
+        total_errors = iface["input_errors"] + iface["output_errors"] + iface["crc"]
+        total_drops = iface["input_drops"] + iface["output_drops"]
+        if total_errors >= threshold_errors or total_drops >= threshold_drops:
+            result.append({**iface, "total_errors": total_errors, "total_drops": total_drops})
+    return result
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    try:
-        nr = InitNornir(config_file=args.config)
-    except Exception as exc:
-        logger.error("Nornir init failed: %s", exc)
-        sys.exit(1)
-
-    if args.username:
-        nr.inventory.defaults.username = args.username
-    if args.password:
-        nr.inventory.defaults.password = args.password
-
-    if args.host:
-        nr = nr.filter(F(name=args.host))
-    elif args.group:
-        nr = nr.filter(F(groups__contains=args.group))
-
-    if not nr.inventory.hosts:
-        print("No hosts matched.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Polling {len(nr.inventory.hosts)} host(s)...")
-    results = nr.run(task=collect_errors, name="collect_errors")
-
-    csv_rows: List[Dict] = []
-    total_flagged = 0
-
-    for host, multi in results.items():
-        if multi.failed:
-            print(f"[ERROR] {host}: {multi.exception}")
+def build_report(nr_results, threshold_errors: int, threshold_drops: int) -> dict:
+    """Aggregate per-host Nornir results into a structured report dict."""
+    report = {
+        "thresholds": {"errors": threshold_errors, "drops": threshold_drops},
+        "summary": {"total_devices": 0, "devices_with_issues": 0},
+        "devices": {},
+    }
+    for host, multi_result in nr_results.items():
+        report["summary"]["total_devices"] += 1
+        if multi_result.failed:
+            report["devices"][host] = {"error": str(multi_result.exception)}
             continue
 
-        ifaces: List[InterfaceErrors] = multi[0].result
-        flagged = [
-            i for i in ifaces
-            if args.all_interfaces or i.total() > args.threshold
-        ]
-
-        if not flagged:
-            print(f"{host}: no interfaces above threshold")
+        raw = multi_result[0].result
+        if not isinstance(raw, list):
+            report["devices"][host] = {"error": "TextFSM parse failed or unsupported platform"}
             continue
 
-        print(f"\n{'=' * 70}")
-        print(f"Host: {host}  ({len(flagged)} interface(s))")
-        print(f"{'=' * 70}")
-        print(
-            f"{'Interface':<32} {'InErr':>7} {'CRC':>7} {'OutDrop':>8}"
-            f" {'Runts':>6} {'Giants':>7} {'Total':>7}"
+        counters = parse_error_counters(raw)
+        troubled = flag_troubled(counters, threshold_errors, threshold_drops)
+        if troubled:
+            report["summary"]["devices_with_issues"] += 1
+
+        report["devices"][host] = {
+            "total_interfaces": len(counters),
+            "flagged_count": len(troubled),
+            "flagged": troubled,
+        }
+    return report
+
+
+def print_text_report(report: dict) -> None:
+    t = report["thresholds"]
+    s = report["summary"]
+    print(f"\n{'='*72}")
+    print("Interface Error & Drop Counter Report")
+    print(f"  Thresholds  —  errors >= {t['errors']}  |  drops >= {t['drops']}")
+    print(f"  Devices polled: {s['total_devices']}  |  devices with issues: {s['devices_with_issues']}")
+    print(f"{'='*72}")
+
+    for host, data in report["devices"].items():
+        if "error" in data:
+            print(f"\n[{host}] ERROR: {data['error']}")
+            continue
+
+        print(f"\n[{host}]  flagged: {data['flagged_count']}/{data['total_interfaces']} interfaces")
+        if not data["flagged"]:
+            print("  All interfaces within thresholds.")
+            continue
+
+        hdr = (
+            f"  {'Interface':<26} {'InErr':>7} {'OutErr':>7} {'CRC':>7}"
+            f" {'InDrop':>7} {'OutDrop':>8} {'Resets':>7}  Status"
         )
-        print("-" * 76)
-
-        for i in sorted(flagged, key=lambda x: x.total(), reverse=True):
+        print(hdr)
+        print(f"  {'-'*90}")
+        for iface in data["flagged"]:
+            status = f"{iface['link_status']}/{iface['protocol_status']}"
             print(
-                f"{i.name:<32} {i.input_errors:>7} {i.crc_errors:>7}"
-                f" {i.output_drops:>8} {i.runts:>6} {i.giants:>7} {i.total():>7}"
+                f"  {iface['interface']:<26}"
+                f" {iface['input_errors']:>7}"
+                f" {iface['output_errors']:>7}"
+                f" {iface['crc']:>7}"
+                f" {iface['input_drops']:>7}"
+                f" {iface['output_drops']:>8}"
+                f" {iface['resets']:>7}"
+                f"  {status}"
             )
-            csv_rows.append(
-                {
-                    "host": host,
-                    "interface": i.name,
-                    "input_errors": i.input_errors,
-                    "crc_errors": i.crc_errors,
-                    "output_drops": i.output_drops,
-                    "runts": i.runts,
-                    "giants": i.giants,
-                    "total_errors": i.total(),
-                }
-            )
-            total_flagged += 1
 
-    print(f"\nTotal interfaces reported: {total_flagged}")
+    print(f"\n{'='*72}\n")
 
-    if args.csv:
-        write_csv(csv_rows, args.csv)
-        print(f"Results saved to {args.csv}")
+
+def build_nornir(hosts, username, password, platform, port, num_workers):
+    host_objects = Hosts()
+    for h in hosts:
+        host_objects[h] = Host(
+            name=h,
+            hostname=h,
+            username=username,
+            password=password,
+            platform=platform,
+            port=port,
+        )
+    inventory = Inventory(hosts=host_objects, groups=Groups(), defaults=Defaults())
+    return InitNornir(
+        runner={"plugin": "threaded", "options": {"num_workers": num_workers}},
+        inventory=inventory,
+        logging={"enabled": False},
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Flag interfaces with elevated error or drop counters across network devices."
+    )
+    parser.add_argument("--hosts", nargs="+", required=True, help="Hostnames or IPs to poll")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--platform", default="cisco_ios", help="Netmiko platform (default: cisco_ios)")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument(
+        "--threshold-errors", type=int, default=0,
+        help="Flag interface when total error count >= N (default: 0 = flag any error)",
+    )
+    parser.add_argument(
+        "--threshold-drops", type=int, default=0,
+        help="Flag interface when total drop count >= N (default: 0 = flag any drop)",
+    )
+    parser.add_argument("--output-format", choices=["text", "json"], default="text")
+    parser.add_argument("--output-file", help="Write output to file instead of stdout")
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    nr = build_nornir(
+        args.hosts, args.username, args.password,
+        args.platform, args.port, args.num_workers,
+    )
+
+    logger.info("Polling %d device(s)", len(args.hosts))
+    results = nr.run(task=collect_interface_counters)
+
+    report = build_report(results, args.threshold_errors, args.threshold_drops)
+
+    if args.output_format == "json":
+        output = json.dumps(report, indent=2)
+        if args.output_file:
+            with open(args.output_file, "w") as f:
+                f.write(output)
+            print(f"Report written to {args.output_file}")
+        else:
+            print(output)
+    else:
+        if args.output_file:
+            buf = io.StringIO()
+            old_stdout, sys.stdout = sys.stdout, buf
+            print_text_report(report)
+            sys.stdout = old_stdout
+            with open(args.output_file, "w") as f:
+                f.write(buf.getvalue())
+            print(f"Report written to {args.output_file}")
+        else:
+            print_text_report(report)
+
+    sys.exit(1 if report["summary"]["devices_with_issues"] else 0)
 
 
 if __name__ == "__main__":
     main()
-```
