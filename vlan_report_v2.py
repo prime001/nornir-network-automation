@@ -1,155 +1,141 @@
 ```python
 """
-Route Summary Report
+Device Health Monitor - Nornir-based network device health checker.
 
-Gathers routing table information from network devices and generates a
-summary report showing total routes, routes by protocol, and optional
-filtering by VRF or protocol type.
-
-Prerequisites:
-- Nornir inventory configured with network device hosts
-- Devices must support 'show ip route' or equivalent command
-- SSH/Telnet connectivity to devices
+Purpose:
+    Monitors health metrics on network devices including uptime, interface
+    status, and system information. Generates a summary health report.
 
 Usage:
-    python route_summary.py --devices all --protocol bgp
-    python route_summary.py --devices switch1,switch2 --vrf mgmt
-    python route_summary.py --devices 192.168.1.1 --username admin --password pass
+    python device_health_monitor.py --inventory hosts.yaml --username admin \
+        --password secret --timeout 30
+
+Prerequisites:
+    - nornir with NAPALM plugin
+    - Network devices with SSH access
+    - Inventory file (YAML format)
+    - Valid device credentials
 """
 
-import argparse
 import logging
-from typing import Dict, Optional
+import argparse
 from nornir import InitNornir
-from nornir.core.task import Task, Result
-from nornir.plugins.tasks.networking import netmiko_send_command
-
+from nornir.core.task import Result, Task
+from nornir_napalm.plugins.tasks import napalm_get
 
 logger = logging.getLogger(__name__)
 
 
-def parse_routing_table(output: str) -> Dict[str, int]:
-    """Parse routing table output and count routes by protocol."""
-    routes = {"total": 0, "ospf": 0, "bgp": 0, "static": 0, "connected": 0}
+def get_device_health(task: Task) -> Result:
+    """Retrieve device health metrics using NAPALM."""
+    try:
+        facts_result = task.run(napalm_get, getters=['facts'])
+        interfaces_result = task.run(napalm_get, getters=['interfaces'])
+        
+        facts = facts_result[0].result['facts']
+        interfaces = interfaces_result[0].result.get('interfaces', {})
+        
+        up_interfaces = sum(1 for iface in interfaces.values() 
+                           if iface.get('is_up', False))
+        
+        health_data = {
+            'hostname': task.host.name,
+            'uptime': facts.get('uptime'),
+            'os_version': facts.get('os_version'),
+            'interfaces_up': up_interfaces,
+            'interfaces_total': len(interfaces),
+        }
+        
+        return Result(host=task.host, result=health_data)
+        
+    except Exception as e:
+        logger.error(f"Health check failed for {task.host.name}: {e}")
+        return Result(host=task.host, result=None, failed=True, exception=e)
+
+
+def print_report(results):
+    """Print formatted health report."""
+    print("\n" + "="*70)
+    print("DEVICE HEALTH REPORT")
+    print("="*70 + "\n")
     
-    if not output:
-        return routes
+    healthy, warnings, errors = 0, 0, 0
     
-    for line in output.split("\n"):
-        line = line.strip()
-        if not line or line.startswith(("Gateway", "Codes")):
+    for device_name, task_results in results.items():
+        result = task_results[0]
+        
+        if result.failed:
+            print(f"❌ {device_name}: ERROR - {result.exception}")
+            errors += 1
             continue
         
-        if line and line[0] in ("O", "B", "S", "C", "R", "E", "*"):
-            routes["total"] += 1
-            if line.startswith("O"):
-                routes["ospf"] += 1
-            elif line.startswith("B"):
-                routes["bgp"] += 1
-            elif line.startswith("S"):
-                routes["static"] += 1
-            elif line.startswith("C"):
-                routes["connected"] += 1
-    
-    return routes
-
-
-def get_route_summary(
-    task: Task, vrf: Optional[str] = None, protocol: Optional[str] = None
-) -> Result:
-    """Retrieve and summarize routing table from device."""
-    cmd = "show ip route"
-    if vrf:
-        cmd += f" vrf {vrf}"
-    if protocol:
-        cmd += f" {protocol}"
-    
-    try:
-        result = task.run(netmiko_send_command, command_string=cmd)
-        output = result[0].result if result else ""
-        summary = parse_routing_table(output)
+        data = result.result
+        uptime_hours = data['uptime'] // 3600 if data['uptime'] else 0
         
-        return Result(
-            host=task.host,
-            result={"command": cmd, "summary": summary, "output_lines": len(output.split("\n"))}
-        )
-    except Exception as e:
-        logger.error(f"Error on {task.host.name}: {e}")
-        return Result(host=task.host, failed=True, result=str(e))
+        print(f"✓ {device_name}")
+        print(f"  OS: {data['os_version']} | Uptime: {uptime_hours}h")
+        print(f"  Interfaces: {data['interfaces_up']}/{data['interfaces_total']} up\n")
+        
+        if uptime_hours < 1:
+            print(f"  ⚠ WARNING: Device recently rebooted\n")
+            warnings += 1
+        else:
+            healthy += 1
+    
+    print("="*70)
+    print(f"Summary: {healthy} healthy, {warnings} warnings, {errors} errors")
+    print("="*70 + "\n")
 
 
 def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Generate routing table summary from network devices"
+        description='Monitor network device health'
     )
-    parser.add_argument(
-        "--devices", default="all", help="Comma-separated device names or 'all'"
-    )
-    parser.add_argument("--username", help="Device username")
-    parser.add_argument("--password", help="Device password")
-    parser.add_argument("--vrf", help="Filter by VRF name")
-    parser.add_argument(
-        "--protocol",
-        choices=["bgp", "ospf", "rip", "eigrp", "static"],
-        help="Filter by routing protocol"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose logging"
-    )
+    parser.add_argument('--inventory', required=True, 
+                       help='Nornir inventory file (YAML)')
+    parser.add_argument('--username', required=True, help='Device username')
+    parser.add_argument('--password', required=True, help='Device password')
+    parser.add_argument('--timeout', type=int, default=30,
+                       help='Connection timeout (default: 30s)')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose logging')
     
     args = parser.parse_args()
     
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
     
+    logger.info("Initializing Nornir from inventory...")
     try:
-        nr = InitNornir(config_file="config.yaml")
-        
-        if args.devices != "all":
-            device_list = [d.strip() for d in args.devices.split(",")]
-            nr = nr.filter(name__in=device_list)
-        
-        if args.username:
-            for host in nr.inventory.hosts.values():
-                host.username = args.username
-        if args.password:
-            for host in nr.inventory.hosts.values():
-                host.password = args.password
-        
-        logger.info(f"Executing route summary on {len(nr.inventory.hosts)} devices")
-        
-        results = nr.run(
-            task=get_route_summary, vrf=args.vrf, protocol=args.protocol
+        nr = InitNornir(
+            inventory={
+                'plugin': 'nornir.plugins.inventory.yaml.YAMLInventory',
+                'options': {'host_file': args.inventory}
+            }
         )
-        
-        print("\n" + "=" * 70)
-        print("ROUTING TABLE SUMMARY REPORT")
-        print("=" * 70)
-        
-        for host_name, host_results in results.items():
-            res = host_results[0]
-            if res.failed:
-                print(f"\n[FAILED] {host_name}: {res.result}")
-            else:
-                summary = res.result["summary"]
-                print(f"\n{host_name}:")
-                print(f"  Command:         {res.result['command']}")
-                print(f"  Total Routes:    {summary['total']}")
-                print(f"  OSPF:            {summary['ospf']}")
-                print(f"  BGP:             {summary['bgp']}")
-                print(f"  Static:          {summary['static']}")
-                print(f"  Connected:       {summary['connected']}")
-        
-        print("\n" + "=" * 70)
-        return 0
-        
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error(f"Failed to load inventory: {e}")
         return 1
+    
+    for host in nr.inventory.hosts.values():
+        host.username = args.username
+        host.password = args.password
+    
+    logger.info(f"Running health checks on {len(nr.inventory.hosts)} devices...")
+    
+    try:
+        results = nr.run(task=get_device_health)
+        print_report(results)
+    except Exception as e:
+        logger.error(f"Task execution failed: {e}")
+        return 1
+    
+    return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     exit(main())
 ```
