@@ -1,277 +1,188 @@
 ```python
 """
-Device Reachability and Latency Monitor
+Device Uptime and Boot History Analyzer
 
-Performs reachability checks and measures response latency to network devices.
-Identifies unreachable hosts, analyzes response times, and generates connectivity
-reports for network diagnostic and monitoring purposes.
+Purpose: Collect device uptime data, detect unexpected reboots, and 
+         generate uptime/reliability reports.
 
 Usage:
-    python device_reachability.py --devices router1,router2 --count 4
-    python device_reachability.py --group access-layer --output csv
-    python device_reachability.py --timeout 5 --verbose
+    python device_uptime_analyzer.py --devices spine1,spine2 \
+                                     --username admin \
+                                     --password secret123 \
+                                     --baseline baseline.json
 
 Prerequisites:
-    - Nornir configured with inventory (hosts.yaml, groups.yaml, defaults.yaml)
-    - ICMP (ping) access to target devices
-    - Network connectivity to all target devices
-    - netmiko or paramiko for device connectivity (for DNS resolution fallback)
-
-Output:
-    Generates a reachability report in JSON or CSV format with:
-    - Device IP and hostname
-    - Reachability status (up/down)
-    - Average, min, max latency
-    - Packet loss percentage
-    - Last check timestamp
+    - Nornir installed
+    - NAPALM or device drivers configured
+    - Devices must support "facts" getter
 """
 
-import argparse
-import csv
-import json
 import logging
-import statistics
-import subprocess
-import sys
+import argparse
+import json
 from datetime import datetime
-from io import StringIO
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-
 from nornir import InitNornir
-from nornir.core.filter import F
 from nornir.core.task import Task, Result
-
+from nornir.plugins.tasks.napalm import napalm_get
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def ping_host(host: str, count: int = 4, timeout: int = 3) -> Dict[str, Any]:
-    """
-    Ping a host and collect latency metrics.
-    
-    Args:
-        host: IP address or hostname to ping
-        count: Number of ping packets to send
-        timeout: Timeout in seconds per packet
-    
-    Returns:
-        Dictionary with reachability status and latency metrics
-    """
+def collect_uptime(task: Task) -> Result:
+    """Collect device uptime and boot information."""
     try:
-        cmd = ["ping", "-c", str(count), "-W", str(timeout * 1000), host]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout * count + 5
+        facts_result = task.run(napalm_get, getters=["facts"])
+        
+        if facts_result.failed:
+            return Result(
+                host=task.host,
+                failed=True,
+                result="Failed to retrieve device facts"
+            )
+        
+        facts = facts_result.result.get("facts", {})
+        
+        uptime_data = {
+            "device": task.host.name,
+            "os_version": facts.get("os_version", "unknown"),
+            "uptime_seconds": facts.get("uptime", 0),
+            "uptime_days": facts.get("uptime", 0) // 86400,
+            "hostname": facts.get("hostname", "unknown"),
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        logger.info(
+            f"{task.host.name}: uptime {uptime_data['uptime_days']} days"
         )
         
-        if result.returncode != 0:
-            return {
-                "host": host,
-                "reachable": False,
-                "packet_loss": 100.0,
-                "avg_latency_ms": None,
-                "min_latency_ms": None,
-                "max_latency_ms": None,
-            }
-        
-        lines = result.stdout.split("\n")
-        stats_line = next((l for l in lines if "min/avg/max" in l), None)
-        
-        if not stats_line:
-            return {
-                "host": host,
-                "reachable": True,
-                "packet_loss": 0.0,
-                "avg_latency_ms": 0,
-                "min_latency_ms": 0,
-                "max_latency_ms": 0,
-            }
-        
-        parts = stats_line.split("=")[1].split("/")
-        latencies = [float(p.strip()) for p in parts[:3]]
-        
-        return {
-            "host": host,
-            "reachable": True,
-            "packet_loss": 0.0,
-            "avg_latency_ms": round(latencies[1], 2),
-            "min_latency_ms": round(latencies[0], 2),
-            "max_latency_ms": round(latencies[2], 2),
-        }
+        return Result(host=task.host, result=uptime_data)
     
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Ping timeout for {host}")
-        return {
-            "host": host,
-            "reachable": False,
-            "packet_loss": 100.0,
-            "avg_latency_ms": None,
-            "min_latency_ms": None,
-            "max_latency_ms": None,
-        }
     except Exception as e:
-        logger.error(f"Error pinging {host}: {e}")
-        return {
-            "host": host,
-            "reachable": False,
-            "packet_loss": 100.0,
-            "avg_latency_ms": None,
-            "min_latency_ms": None,
-            "max_latency_ms": None,
-            "error": str(e),
-        }
+        logger.error(f"Error collecting uptime from {task.host.name}: {e}")
+        return Result(host=task.host, failed=True, result=str(e))
 
 
-def check_reachability(task: Task, count: int, timeout: int) -> Result:
-    """Nornir task to check device reachability."""
-    host_ip = task.host.get("host", task.host.name)
+def analyze_uptime(nr, baseline_file=None):
+    """Collect and analyze device uptime data."""
+    logger.info("Collecting device uptime data...")
+    results = nr.run(task=collect_uptime)
     
-    logger.debug(f"Checking reachability for {task.host.name} ({host_ip})")
+    current_data = {}
+    for host, task_result in results.items():
+        if task_result[0].result:
+            current_data[host] = task_result[0].result
     
-    metrics = ping_host(host_ip, count, timeout)
-    metrics["device"] = task.host.name
-    metrics["timestamp"] = datetime.now().isoformat()
+    baseline_data = {}
+    if baseline_file:
+        try:
+            with open(baseline_file, 'r') as f:
+                baseline_data = json.load(f)
+        except FileNotFoundError:
+            logger.warning(f"Baseline file {baseline_file} not found")
     
-    return Result(host=task.host, result=metrics)
-
-
-def format_output(results: List[Dict[str, Any]], format_type: str) -> str:
-    """Format results as JSON, CSV, or text."""
-    if not results:
-        return "No results available"
+    output = "Device Uptime Report\n" + "=" * 60 + "\n"
+    reboot_alerts = []
     
-    if format_type == "json":
-        return json.dumps(results, indent=2, default=str)
-    
-    elif format_type == "csv":
-        output = StringIO()
-        if results:
-            fieldnames = list(results[0].keys())
-            writer = csv.DictWriter(output, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
-        return output.getvalue()
-    
-    else:
-        lines = []
-        for r in results:
-            lines.append(f"\nDevice: {r.get('device')}")
-            lines.append(f"  Host: {r.get('host')}")
-            lines.append(f"  Reachable: {r.get('reachable')}")
-            
-            if r.get("reachable"):
-                lines.append(f"  Avg Latency: {r.get('avg_latency_ms')} ms")
-                lines.append(f"  Min/Max: {r.get('min_latency_ms')}/{r.get('max_latency_ms')} ms")
-            else:
-                lines.append(f"  Status: UNREACHABLE")
-                if "error" in r:
-                    lines.append(f"  Error: {r.get('error')}")
+    for device, uptime_info in current_data.items():
+        output += f"\n{device}:\n"
+        output += f"  OS: {uptime_info.get('os_version', 'N/A')}\n"
+        output += f"  Uptime: {uptime_info.get('uptime_days', 0)} days "
+        output += f"({uptime_info.get('uptime_seconds', 0)} seconds)\n"
         
-        return "\n".join(lines)
+        if device in baseline_data:
+            baseline_uptime = baseline_data[device].get("uptime_seconds", 0)
+            current_uptime = uptime_info.get("uptime_seconds", 0)
+            
+            if current_uptime < baseline_uptime:
+                reboot_alerts.append(
+                    f"{device}: Possible reboot detected "
+                    f"(was {baseline_uptime}s, now {current_uptime}s)"
+                )
+                output += f"  ⚠ REBOOT DETECTED\n"
+    
+    if reboot_alerts:
+        output += "\n" + "=" * 60 + "\n"
+        output += "REBOOT ALERTS:\n"
+        for alert in reboot_alerts:
+            output += f"  • {alert}\n"
+    
+    return output, current_data
+
+
+def save_baseline(data, output_file):
+    """Save current uptime data as baseline."""
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Baseline saved to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to save baseline: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Check network device reachability and measure latency"
+        description="Analyze device uptime and detect reboots"
     )
     parser.add_argument(
         "--devices",
         type=str,
-        help="Comma-separated list of device names"
+        default="",
+        help="Comma-separated device names"
     )
     parser.add_argument(
-        "--group",
+        "--username",
         type=str,
-        help="Filter devices by group name"
+        help="Username for device access"
     )
     parser.add_argument(
-        "--count",
-        type=int,
-        default=4,
-        help="Number of ping packets per device (default: 4)"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=3,
-        help="Timeout per packet in seconds (default: 3)"
-    )
-    parser.add_argument(
-        "--output",
+        "--password",
         type=str,
-        default="reachability_report.json",
-        help="Output file path (default: reachability_report.json)"
+        help="Password for device access"
     )
     parser.add_argument(
-        "--format",
-        choices=["json", "csv", "text"],
-        default="json",
-        help="Output format (default: json)"
+        "--baseline",
+        type=str,
+        help="Baseline uptime file for comparison"
     )
     parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
+        "--save-baseline",
+        type=str,
+        help="Save current uptime as baseline to file"
     )
     
     args = parser.parse_args()
     
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
     try:
-        nr = InitNornir()
-        logger.info(f"Initialized Nornir with {len(nr.inventory.hosts)} hosts")
+        nr = InitNornir(config_file="config.yaml")
         
         if args.devices:
             device_list = [d.strip() for d in args.devices.split(",")]
-            nr = nr.filter(F(name__in=device_list))
-            logger.info(f"Filtered to {len(nr.inventory.hosts)} specified devices")
+            nr = nr.filter(name__in=device_list)
         
-        if args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-            logger.info(f"Filtered to {len(nr.inventory.hosts)} devices in group '{args.group}'")
+        if args.username:
+            for host in nr.inventory.hosts.values():
+                host.username = args.username
+        if args.password:
+            for host in nr.inventory.hosts.values():
+                host.password = args.password
         
-        if not nr.inventory.hosts:
-            logger.error("No devices found matching filters")
-            return 1
+        report, current_data = analyze_uptime(nr, baseline_file=args.baseline)
+        print(report)
         
-        results = []
-        for hostname, host_obj in nr.inventory.hosts.items():
-            task_result = check_reachability(
-                type('Task', (), {'host': host_obj})(),
-                args.count,
-                args.timeout
-            )
-            results.append(task_result.result)
+        if args.save_baseline:
+            save_baseline(current_data, args.save_baseline)
         
-        output = format_output(results, args.format)
-        
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(output)
-        
-        logger.info(f"Reachability report written to {output_path}")
-        print(output)
-        
-        reachable = sum(1 for r in results if r.get("reachable"))
-        total = len(results)
-        logger.info(f"Summary: {reachable}/{total} devices reachable")
-        
-        return 0 if reachable == total else 1
-    
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error(f"Fatal error: {e}")
         return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit(main())
 ```
