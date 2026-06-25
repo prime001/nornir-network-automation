@@ -1,239 +1,225 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Facts Collector
+Device Uptime and Reboot Monitor
 
-Gathers device inventory information including serial numbers, model,
-software version, interface counts, and configuration details across
-multiple network devices.
+Tracks device uptime across the network and alerts when devices have been
+recently rebooted unexpectedly. Useful for identifying hardware issues,
+scheduled maintenance completion, or unexpected restarts.
 
-Usage:
-    python device_facts_collector.py --devices router1,router2
-    python device_facts_collector.py --group core_routers --output json
-    python device_facts_collector.py --all --export inventory.json
+Purpose:
+  - Monitor device uptime trends
+  - Alert on devices with low uptime (recent reboot)
+  - Track reboots over time
+  - Generate device health status reports
 
 Prerequisites:
-    - nornir with netmiko plugin
-    - devices configured in inventory (hosts.yaml, groups.yaml)
-    - SSH credentials configured (credentials.yaml)
+  - Nornir with netmiko installed
+  - Network inventory configured with SSH credentials
+  - Devices supporting "show version" command output
 
-Output:
-    Device facts in table or JSON format with serial, model, version,
-    interface count, memory, and configuration details
+Usage:
+  python 060_uptime_monitor.py --hosts all
+  python 060_uptime_monitor.py --hosts core_routers --threshold 30
+  python 060_uptime_monitor.py --hosts branch --threshold 7 --verbose
+
+Author: Network Automation
+License: MIT
 """
 
 import argparse
 import logging
-import json
-from typing import Dict, Any
-from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir_netmiko.tasks import netmiko_send_command
-from nornir.core.filter import F
+import sys
+import re
+from datetime import timedelta
+from typing import Dict, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from nornir import InitNornir
+from nornir.core.filter import F
+from nornir.core.task import Task, Result
+from nornir.plugins.tasks.networking import netmiko_send_command
+
 logger = logging.getLogger(__name__)
 
 
-def collect_device_facts(task: Task) -> Result:
-    """Collect device facts via show commands."""
-    facts = {
-        'device': task.host.name,
-        'ip': task.host.get('ip', 'N/A'),
-        'hostname': None,
-        'model': None,
-        'serial': None,
-        'version': None,
-        'uptime': None,
-        'interface_count': 0,
-        'memory_total': None,
-        'error': None
-    }
-    
+def setup_logging(verbose: bool) -> None:
+    """Configure logging output."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+
+def extract_uptime(output: str) -> Optional[timedelta]:
+    """Extract uptime from show version command output."""
+    patterns = [
+        r"uptime is (\d+)\s*year[s]?\s*,\s*(\d+)\s*week[s]?\s*,\s*(\d+)\s*day[s]?\s*,\s*(\d+)\s*hour[s]?\s*,\s*(\d+)\s*minute[s]?",
+        r"uptime is (\d+)\s*day[s]?\s*,\s*(\d+)\s*hour[s]?\s*,\s*(\d+)\s*minute[s]?",
+        r"System uptime:\s*(\d+)\s*day[s]?\s*,\s*(\d+)\s*hour[s]?\s*,\s*(\d+)\s*minute[s]?",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            groups = [int(g) for g in match.groups()]
+
+            if len(groups) == 5:
+                years, weeks, days, hours, minutes = groups
+                return timedelta(
+                    days=years * 365 + weeks * 7 + days,
+                    hours=hours,
+                    minutes=minutes,
+                )
+            elif len(groups) == 3:
+                days, hours, minutes = groups
+                return timedelta(days=days, hours=hours, minutes=minutes)
+
+    return None
+
+
+def check_device_uptime(task: Task, threshold_days: int = 7) -> Result:
+    """Check and report device uptime."""
     try:
+        logger.debug(f"Fetching uptime from {task.host.name}")
+
         result = task.run(
             netmiko_send_command,
-            command_string='show version'
+            command_string="show version",
         )
-        version_output = result[0].result
-        
-        for line in version_output.split('\n'):
-            if 'Cisco' in line and 'IOS' in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    facts['model'] = parts[1]
-            if 'Processor board ID' in line or 'Serial Number' in line:
-                facts['serial'] = line.split(':')[-1].strip()
-            if 'Software Version' in line or 'IOS Software' in line:
-                facts['version'] = line.split(',')[0].strip()
-            if 'uptime' in line.lower():
-                facts['uptime'] = line.strip()
-        
-        result = task.run(
-            netmiko_send_command,
-            command_string='show interfaces summary'
+
+        uptime = extract_uptime(result.result)
+
+        if not uptime:
+            logger.warning(f"Could not parse uptime on {task.host.name}")
+            return Result(
+                host=task.host,
+                result={"error": "Unable to parse uptime"},
+                failed=True,
+            )
+
+        uptime_days = uptime.days
+        needs_alert = uptime_days < threshold_days
+        status = "ALERT" if needs_alert else "OK"
+
+        logger.info(
+            f"{task.host.name}: {status} - {uptime} ({uptime_days} days)"
         )
-        interfaces_output = result[0].result
-        
-        for line in interfaces_output.split('\n'):
-            if '*number of interfaces up' in line.lower():
-                parts = line.split()
-                if parts:
-                    try:
-                        facts['interface_count'] = int(parts[0])
-                    except ValueError:
-                        pass
-        
-        result = task.run(
-            netmiko_send_command,
-            command_string='show memory statistics'
+
+        return Result(
+            host=task.host,
+            result={
+                "uptime_days": uptime_days,
+                "uptime_formatted": str(uptime),
+                "needs_alert": needs_alert,
+                "status": status,
+            },
         )
-        memory_output = result[0].result
-        
-        for line in memory_output.split('\n'):
-            if 'Total' in line and 'Processor' in line:
-                parts = line.split()
-                if parts:
-                    try:
-                        facts['memory_total'] = f"{int(parts[-2]) // 1024} MB"
-                    except (ValueError, IndexError):
-                        pass
-        
-        result = task.run(
-            netmiko_send_command,
-            command_string='show running-config | include hostname'
-        )
-        hostname_output = result[0].result.strip()
-        if hostname_output:
-            facts['hostname'] = hostname_output.split()[-1]
-    
+
     except Exception as e:
-        facts['error'] = str(e)
-        logger.warning(f"Failed to collect facts from {task.host.name}: {e}")
-    
-    return Result(host=task.host, result=facts)
+        logger.error(f"Error checking {task.host.name}: {e}")
+        return Result(
+            host=task.host,
+            result={"error": str(e)},
+            failed=True,
+        )
 
 
-def format_table_output(results: Dict[str, Any]) -> None:
-    """Format results as human-readable table."""
-    print("\n" + "=" * 140)
-    print(f"{'Device':<15} {'IP':<15} {'Model':<20} {'Serial':<20} "
-          f"{'Version':<15} {'Interfaces':<12} {'Memory':<12}")
-    print("-" * 140)
-    
-    for host, task_results in results.items():
-        for task_result in task_results.values():
-            if task_result.ok:
-                f = task_result.result
-                model = f['model'] or 'Unknown'
-                serial = f['serial'] or 'N/A'
-                version = f['version'] or 'N/A'
-                iface_count = str(f['interface_count']) if f['interface_count'] else 'N/A'
-                memory = f['memory_total'] or 'N/A'
-                
-                print(f"{host:<15} {f['ip']:<15} {model:<20} {serial:<20} "
-                      f"{version:<15} {iface_count:<12} {memory:<12}")
-            else:
-                print(f"{host:<15} {'ERROR':<15} {str(task_result.exception):<20}")
-    
-    print("=" * 140 + "\n")
+def generate_report(results: Dict, threshold_days: int) -> str:
+    """Generate formatted uptime report."""
+    lines = ["=" * 60]
+    lines.append("DEVICE UPTIME REPORT")
+    lines.append(f"Alert Threshold: {threshold_days} days")
+    lines.append("=" * 60)
 
+    alert_devices = []
+    ok_devices = []
 
-def format_json_output(results: Dict[str, Any]) -> None:
-    """Format results as JSON."""
-    output_data = []
-    
-    for host, task_results in results.items():
-        for task_result in task_results.values():
-            if task_result.ok:
-                output_data.append(task_result.result)
-    
-    print(json.dumps(output_data, indent=2))
+    for host_name, task_results in sorted(results.items()):
+        task_result = task_results[0].result
+
+        if task_result.get("error"):
+            lines.append(f"{host_name:30} ERROR: {task_result['error']}")
+            continue
+
+        uptime_str = task_result["uptime_formatted"]
+        status = task_result["status"]
+        uptime_days = task_result["uptime_days"]
+
+        if status == "ALERT":
+            alert_devices.append(f"{host_name:30} {uptime_str:20} ({uptime_days} days)")
+        else:
+            ok_devices.append(f"{host_name:30} {uptime_str:20} ({uptime_days} days)")
+
+    if alert_devices:
+        lines.append("\n[ALERT] Devices with uptime below threshold:")
+        lines.append("-" * 60)
+        lines.extend(alert_devices)
+
+    lines.append("\n[OK] Devices with acceptable uptime:")
+    lines.append("-" * 60)
+    lines.extend(ok_devices if ok_devices else ["  None or all devices require attention"])
+
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 def main():
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description='Collect device inventory facts',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Examples:\n'
-               '  python %(prog)s --devices router1,router2\n'
-               '  python %(prog)s --group core_routers --output json\n'
-               '  python %(prog)s --all --export facts.json'
-    )
-    
-    parser.add_argument(
-        '--devices',
-        help='Comma-separated list of device names'
+        description="Monitor network device uptime and detect recent reboots",
+        epilog="Use --hosts to filter devices by name or group.",
     )
     parser.add_argument(
-        '--group',
-        help='Nornir group filter'
+        "--hosts",
+        default="all",
+        help="Host name or group to check (default: all)",
     )
     parser.add_argument(
-        '--all',
-        action='store_true',
-        help='Query all devices in inventory'
+        "--threshold",
+        type=int,
+        default=7,
+        help="Alert if uptime below N days (default: 7)",
     )
     parser.add_argument(
-        '--output',
-        choices=['table', 'json'],
-        default='table',
-        help='Output format (default: table)'
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging",
     )
-    parser.add_argument(
-        '--export',
-        help='Export results to JSON file'
-    )
-    
+
     args = parser.parse_args()
-    
+    setup_logging(args.verbose)
+
     try:
-        nr = InitNornir(config_file='config.yaml')
-        logger.info(f"Loaded {len(nr.inventory.hosts)} devices")
-        
-        if args.devices:
-            device_list = [d.strip() for d in args.devices.split(',')]
-            nr = nr.filter(F(name__in=device_list))
-        elif args.group:
-            nr = nr.filter(F(groups__contains=args.group))
-        elif not args.all:
-            logger.error("Specify --devices, --group, or --all")
-            return
-        
-        if len(nr.inventory.hosts) == 0:
-            logger.error("No devices matched filter criteria")
-            return
-        
-        logger.info(f"Collecting facts from {len(nr.inventory.hosts)} device(s)")
-        results = nr.run(task=collect_device_facts)
-        
-        if args.output == 'json' or args.export:
-            output_data = []
-            for host, task_results in results.items():
-                for task_result in task_results.values():
-                    if task_result.ok:
-                        output_data.append(task_result.result)
-            
-            if args.export:
-                with open(args.export, 'w') as f:
-                    json.dump(output_data, f, indent=2)
-                logger.info(f"Results exported to {args.export}")
-            else:
-                print(json.dumps(output_data, indent=2))
-        else:
-            format_table_output(results)
-        
-        logger.info("Device facts collection completed")
-    
-    except FileNotFoundError:
-        logger.error("config.yaml not found in current directory")
+        logger.info("Initializing Nornir inventory")
+        nr = InitNornir(config_file="config.yaml")
+
+        if args.hosts.lower() != "all":
+            nr = nr.filter(F(groups__contains=args.hosts) | F(name=args.hosts))
+
+        if not nr.inventory.hosts:
+            logger.error(f"No hosts matched filter: {args.hosts}")
+            sys.exit(1)
+
+        logger.info(f"Checking uptime on {len(nr.inventory.hosts)} devices")
+
+        results = nr.run(
+            task=check_device_uptime,
+            threshold_days=args.threshold,
+        )
+
+        report = generate_report(dict(results), args.threshold)
+        print(report)
+
+        failed_hosts = [h for h, r in results.items() if r[0].failed]
+        if failed_hosts:
+            logger.warning(f"Failed to check {len(failed_hosts)} host(s)")
+            sys.exit(1)
+
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
+        sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 ```
