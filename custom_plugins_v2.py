@@ -1,188 +1,194 @@
 ```python
+#!/usr/bin/env python3
 """
-Network Device Health Check and Diagnostics Tool
+Device Inventory and Health Report Script
 
 Purpose:
-    Performs health checks on network devices including connectivity tests,
-    uptime verification, and basic system diagnostics. Useful for identifying
-    failed or degraded devices in the network.
+    Gathers device facts, system information, and connectivity status from
+    network devices using Nornir and NAPALM. Generates a consolidated report
+    of device inventory (model, serial number, OS version, uptime).
 
 Usage:
-    python health_check.py --devices all --output report.json
-    python health_check.py --devices router1,router2 --username admin --password pass
-    python health_check.py --failed-only
+    python device_health_report.py --devices all --format table
+    python device_health_report.py --devices router1,router2 --format csv --output inventory.csv
 
 Prerequisites:
-    - Nornir installed with netmiko/napalm
-    - nornir inventory configured (config.yaml)
-    - Device SSH connectivity
+    - Nornir inventory configured (hosts.yaml, groups.yaml, defaults.yaml)
+    - Device SSH connectivity with credentials
+    - NAPALM library installed: pip install napalm
+    - Devices must support NAPALM get_facts call
 """
 
 import argparse
 import json
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
 
 from nornir import InitNornir
-from nornir.core.task import Result, Task
+from nornir.core.filter import F
 from nornir.plugins.tasks.networking import napalm_get
 
 
 logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def health_check(task: Task) -> Result:
-    """Perform health check on device including facts and interface status."""
-    health_status = {
-        "device": task.host.name,
-        "timestamp": datetime.now().isoformat(),
-        "reachable": False,
-        "uptime": None,
-        "facts": {},
-        "interfaces_up": 0,
-        "interfaces_down": 0
-    }
-    
+def gather_device_facts(task):
+    """Retrieve device facts using NAPALM get_facts."""
     try:
-        result = task.run(
-            napalm_get,
-            getters=["facts", "interfaces"],
-            platform=task.host.platform
-        )
-        
-        if result and result[0].result:
-            health_status["reachable"] = True
-            facts = result[0].result.get("facts", {})
-            interfaces = result[0].result.get("interfaces", {})
-            
-            health_status["uptime"] = facts.get("uptime", 0)
-            health_status["facts"] = {
-                "model": facts.get("model", "Unknown"),
-                "os_version": facts.get("os_version", "Unknown"),
-                "serial_number": facts.get("serial_number", "Unknown"),
-                "total_interfaces": len(interfaces)
-            }
-            
-            for iface_name, iface_data in interfaces.items():
-                if iface_data.get("is_up"):
-                    health_status["interfaces_up"] += 1
-                else:
-                    health_status["interfaces_down"] += 1
-        
-        return Result(host=task.host, result=health_status)
-    
+        result = task.run(napalm_get, getters=["facts"])
+        return result[0].result.get("facts", {})
     except Exception as e:
-        logger.warning(f"Health check failed for {task.host.name}: {e}")
-        health_status["error"] = str(e)
-        return Result(host=task.host, result=health_status)
+        logger.warning(f"{task.host.name}: Failed to gather facts - {e}")
+        return None
 
 
-def format_uptime(seconds: int) -> str:
-    """Convert uptime in seconds to human-readable format."""
+def format_uptime(seconds):
+    """Convert uptime seconds to human-readable format."""
     if not seconds:
-        return "Unknown"
-    
+        return "N/A"
     days = seconds // 86400
     hours = (seconds % 86400) // 3600
     minutes = (seconds % 3600) // 60
     return f"{days}d {hours}h {minutes}m"
 
 
+def format_table_report(devices_data):
+    """Format report as ASCII table."""
+    lines = ["\n" + "=" * 110]
+    lines.append(
+        f"{'Hostname':<20} {'Model':<25} {'Serial':<20} "
+        f"{'OS Version':<15} {'Uptime':<15}"
+    )
+    lines.append("=" * 110)
+
+    for hostname in sorted(devices_data.keys()):
+        info = devices_data[hostname]
+        if info is None:
+            lines.append(f"{hostname:<20} {'UNREACHABLE':<25}")
+        else:
+            lines.append(
+                f"{info.get('hostname', hostname):<20} "
+                f"{info.get('model', 'N/A'):<25} "
+                f"{info.get('serial_number', 'N/A'):<20} "
+                f"{info.get('os_version', 'N/A'):<15} "
+                f"{format_uptime(info.get('uptime_seconds', 0)):<15}"
+            )
+
+    lines.append("=" * 110 + "\n")
+    return "\n".join(lines)
+
+
+def format_csv_report(devices_data):
+    """Format report as CSV."""
+    lines = ["Hostname,Model,Serial,OS Version,Uptime,Vendor,Status"]
+
+    for hostname in sorted(devices_data.keys()):
+        info = devices_data[hostname]
+        if info is None:
+            lines.append(f"{hostname},,,,,,UNREACHABLE")
+        else:
+            uptime = format_uptime(info.get("uptime_seconds", 0))
+            lines.append(
+                f"{info.get('hostname', hostname)},"
+                f"{info.get('model', '')},"
+                f"{info.get('serial_number', '')},"
+                f"{info.get('os_version', '')},"
+                f"{uptime},"
+                f"{info.get('vendor', '')},OK"
+            )
+
+    return "\n".join(lines)
+
+
+def format_json_report(devices_data):
+    """Format report as JSON."""
+    return json.dumps(devices_data, indent=2, default=str)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--devices',
-        default='all',
-        help='Target devices (comma-separated list or "all")'
-    )
-    parser.add_argument('--username', help='Device username')
-    parser.add_argument('--password', help='Device password')
-    parser.add_argument(
-        '--output',
-        type=Path,
-        help='Output report file (JSON format)'
+        "-d",
+        "--devices",
+        type=str,
+        default="all",
+        help="Target devices: comma-separated list or 'all' (default: all)",
     )
     parser.add_argument(
-        '--failed-only',
-        action='store_true',
-        help='Display only failed/unreachable devices'
+        "-f",
+        "--format",
+        choices=["table", "csv", "json"],
+        default="table",
+        help="Output format (default: table)",
     )
     parser.add_argument(
-        '--config',
-        default='config.yaml',
-        help='Nornir configuration file'
+        "-o",
+        "--output",
+        type=str,
+        help="Output file path (default: stdout)",
     )
-    
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging",
+    )
+
     args = parser.parse_args()
-    
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     try:
-        nr = InitNornir(config_file=args.config)
-        
-        if args.devices != 'all':
-            device_list = [d.strip() for d in args.devices.split(',')]
-            nr = nr.filter(name__in=device_list)
-        
-        logger.info(f"Starting health check on {len(nr.inventory.hosts)} devices")
-        results = nr.run(task=health_check)
-        
-        health_report = []
-        failed_devices = []
-        
-        for host_name, task_results in results.items():
-            status = task_results[0].result
-            health_report.append(status)
-            
-            if not status["reachable"]:
-                failed_devices.append(host_name)
-        
-        print("\n" + "=" * 70)
-        print("NETWORK DEVICE HEALTH CHECK REPORT")
-        print("=" * 70)
-        print(f"Total Devices Checked: {len(health_report)}")
-        print(f"Reachable: {sum(1 for h in health_report if h['reachable'])}")
-        print(f"Unreachable: {len(failed_devices)}")
-        
-        if not args.failed_only:
-            print("\nDevice Status:")
-            for status in sorted(
-                health_report,
-                key=lambda x: (not x["reachable"], x["device"])
-            ):
-                if status["reachable"]:
-                    uptime = format_uptime(status.get("uptime", 0))
-                    print(
-                        f"  ✓ {status['device']:<20} | "
-                        f"Uptime: {uptime:<15} | "
-                        f"OS: {status['facts'].get('os_version', 'N/A'):<12} | "
-                        f"Interfaces: {status['interfaces_up']}/{status['facts'].get('total_interfaces', 0)}"
-                    )
-                else:
-                    print(f"  ✗ {status['device']:<20} | UNREACHABLE")
-                    if "error" in status:
-                        print(f"      Error: {status['error']}")
-        
-        if failed_devices:
-            print(f"\nAlert: Failed Devices: {', '.join(failed_devices)}")
-        
+        logger.info("Initializing Nornir inventory...")
+        nr = InitNornir(config_file="config.yaml")
+        logger.info(f"Loaded {len(nr.inventory.hosts)} hosts from inventory")
+
+        if args.devices != "all":
+            device_list = [d.strip() for d in args.devices.split(",")]
+            nr = nr.filter(F(name__in=device_list))
+            logger.info(f"Filtered to {len(nr.inventory.hosts)} target devices")
+
+        logger.info("Gathering device facts (this may take a moment)...")
+        results = nr.run(task=gather_device_facts)
+
+        devices_data = {}
+        for hostname in results.keys():
+            task_result = results[hostname]
+            if task_result.failed:
+                logger.warning(f"{hostname}: Task failed")
+                devices_data[hostname] = None
+            else:
+                facts = task_result[0].result
+                devices_data[hostname] = facts
+                logger.debug(f"{hostname}: Successfully gathered facts")
+
+        if args.format == "table":
+            output = format_table_report(devices_data)
+        elif args.format == "csv":
+            output = format_csv_report(devices_data)
+        else:
+            output = format_json_report(devices_data)
+
         if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(health_report, f, indent=2)
-            logger.info(f"Health report saved to {args.output}")
-        
-        sys.exit(0 if not failed_devices else 1)
-    
+            Path(args.output).write_text(output)
+            logger.info(f"Report written to {args.output}")
+        else:
+            print(output)
+
+    except FileNotFoundError as e:
+        logger.error(f"Configuration file not found: {e}")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error(f"Fatal error: {e}", exc_info=args.verbose)
         sys.exit(1)
 
 
