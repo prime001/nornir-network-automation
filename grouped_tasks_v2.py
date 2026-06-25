@@ -1,197 +1,199 @@
 ```python
 """
-Network Device Health Check and Facts Collection
+Interface Error Statistics and Health Report
 
-Purpose:
-    Collects device facts and validates health status across network devices.
-    Gathers hostname, uptime, model, OS version, serial number, and validates
-    critical configurations like NTP status.
+Collects and reports on interface error counters (CRC errors, input/output
+errors, discards) from network devices to identify potential connectivity
+issues and hardware problems.
 
 Usage:
-    python device_health_check.py --devices leaf01,leaf02 --username admin --password admin123
-    python device_health_check.py --devices all --username admin --password admin123 --check-ntp
-    python device_health_check.py --devices all --username admin --password admin123 --json
+    python interface_errors.py --inventory inventory.yaml --devices all
+    python interface_errors.py --inventory inv.yaml --devices router1,router2
 
 Prerequisites:
-    - nornir and plugins installed (pip install nornir nornir-netmiko nornir-napalm)
-    - Devices configured in inventory (hosts.yaml)
-    - Network devices accessible via SSH
-    - NAPALM driver available for device types
+    - Nornir installed with netmiko plugin
+    - SSH connectivity to all target devices
+    - Device support: Cisco IOS/IOS-XE/NXOS
 
-Output:
-    - Device facts and health status to stdout (formatted table by default)
-    - JSON output with --json flag
-    - Device health warnings for critical issues
+Examples:
+    Check interfaces with >5 errors: --error-threshold 5
+    Check specific interfaces: --interface-filter "Gig.*"
+    Save output: --output errors_report.txt
 """
 
-import argparse
-import json
 import logging
-from typing import Dict, Any
-
+import argparse
+import re
+from dataclasses import dataclass
+from typing import Dict
 from nornir import InitNornir
-from nornir.core.task import Result, Task
-from nornir.plugins.tasks.networking import napalm_get
+from nornir.core.task import Task, Result
+from nornir_netmiko.tasks import netmiko_send_command
 from nornir.core.filter import F
-
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def validate_device_health(task: Task, check_ntp: bool = False) -> Result:
-    """Validate device health and collect facts using NAPALM."""
-    host = task.host
-    health_status = {'device': host.name, 'checks': {}, 'warnings': []}
+@dataclass
+class InterfaceStats:
+    """Store interface error statistics."""
+    name: str
+    status: str
+    crc_errors: int = 0
+    input_errors: int = 0
+    output_errors: int = 0
+    discards: int = 0
 
+    @property
+    def total_errors(self) -> int:
+        return self.crc_errors + self.input_errors + self.output_errors + self.discards
+
+    def is_problematic(self, threshold: int) -> bool:
+        return self.total_errors >= threshold
+
+
+def parse_cisco_interfaces(output: str) -> Dict[str, InterfaceStats]:
+    """Parse Cisco 'show interfaces' output for error counters."""
+    interfaces = {}
+    current_if = None
+
+    for line in output.split('\n'):
+        match = re.match(r'^(\S+)\s+is\s+(\w+)', line)
+        if match:
+            current_if = match.group(1)
+            status = match.group(2).lower()
+            interfaces[current_if] = InterfaceStats(name=current_if, status=status)
+            continue
+
+        if not current_if:
+            continue
+
+        if 'CRC' in line:
+            num = re.search(r'(\d+)', line)
+            if num:
+                interfaces[current_if].crc_errors = int(num.group(1))
+        elif 'input error' in line.lower():
+            num = re.search(r'(\d+)', line)
+            if num:
+                interfaces[current_if].input_errors = int(num.group(1))
+        elif 'output error' in line.lower():
+            num = re.search(r'(\d+)', line)
+            if num:
+                interfaces[current_if].output_errors = int(num.group(1))
+        elif 'discards' in line.lower():
+            num = re.search(r'(\d+)', line)
+            if num:
+                interfaces[current_if].discards = int(num.group(1))
+
+    return interfaces
+
+
+def collect_interface_errors(task: Task, threshold: int, if_filter: str) -> Result:
+    """Gather interface error statistics from target device."""
     try:
-        facts_result = task.run(
-            napalm_get,
-            getters=['facts'],
-            severity_level=logging.WARNING
-        ).result
+        r = task.run(netmiko_send_command, command_string="show interfaces")
+        output = r[0].result
 
-        device_facts = facts_result.get('facts', {})
+        if 'cisco' in task.host.platform.lower():
+            interfaces = parse_cisco_interfaces(output)
+        else:
+            logger.warning(f"Platform {task.host.platform} not fully supported")
+            interfaces = {}
 
-        if not device_facts:
-            return Result(
-                host=host,
-                failed=True,
-                result="No facts retrieved"
-            )
+        if if_filter:
+            interfaces = {
+                k: v for k, v in interfaces.items()
+                if re.search(if_filter, k)
+            }
 
-        uptime_seconds = device_facts.get('uptime', 0)
-        if uptime_seconds < 3600:
-            health_status['warnings'].append('Device uptime < 1 hour')
+        problems = {
+            name: iface for name, iface in interfaces.items()
+            if iface.is_problematic(threshold)
+        }
 
-        uptime_hours = uptime_seconds // 3600
-        uptime_days = uptime_hours // 24
-
-        health_status['checks']['hostname'] = device_facts.get('hostname', 'N/A')
-        health_status['checks']['model'] = device_facts.get('model', 'N/A')
-        health_status['checks']['os_version'] = device_facts.get('os_version', 'N/A')
-        health_status['checks']['serial_number'] = device_facts.get('serial_number', 'N/A')
-        health_status['checks']['uptime_days'] = uptime_days
-        health_status['checks']['interface_count'] = device_facts.get('interface_count', 0)
-        health_status['checks']['vendor'] = device_facts.get('vendor', 'N/A')
-
-        if check_ntp:
-            try:
-                ntp_result = task.run(
-                    napalm_get,
-                    getters=['ntp'],
-                    severity_level=logging.WARNING
-                ).result
-                ntp_data = ntp_result.get('ntp', {})
-                ntp_enabled = ntp_data.get('enabled', False)
-                health_status['checks']['ntp_enabled'] = ntp_enabled
-                if not ntp_enabled:
-                    health_status['warnings'].append('NTP is not enabled')
-            except Exception as e:
-                logger.debug(f"{host.name}: NTP check unsupported - {e}")
-
-        return Result(host=host, result=health_status)
+        return Result(
+            host=task.host,
+            result={
+                'total': len(interfaces),
+                'problematic': len(problems),
+                'details': problems,
+            }
+        )
 
     except Exception as e:
-        logger.error(f"{host.name}: Health check failed - {e}")
-        return Result(host=host, failed=True, exception=e)
-
-
-def format_table_output(results: Dict[str, Any]) -> None:
-    """Display results in formatted table."""
-    for host_name, task_result in results.items():
-        if task_result[0].result:
-            health = task_result[0].result
-            print(f"\n{'='*70}")
-            print(f"Device: {health['device']}")
-            print(f"{'='*70}")
-            for check, value in health['checks'].items():
-                print(f"  {check:<25}: {value}")
-            if health['warnings']:
-                print(f"\n  ⚠️  Warnings:")
-                for warning in health['warnings']:
-                    print(f"    - {warning}")
-        elif task_result[0].failed:
-            print(f"\n❌ {host_name}: Health check failed")
-            if task_result[0].exception:
-                logger.error(f"Exception: {task_result[0].exception}")
-
-
-def format_json_output(results: Dict[str, Any]) -> None:
-    """Display results in JSON format."""
-    output = {}
-    for host_name, task_result in results.items():
-        if task_result[0].result:
-            output[host_name] = task_result[0].result
-        else:
-            output[host_name] = {'failed': True, 'error': str(task_result[0].exception)}
-    print(json.dumps(output, indent=2))
+        logger.error(f"{task.host.name}: {e}")
+        return Result(host=task.host, result=str(e), failed=True)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Collect device facts and validate network device health'
+        description='Collect interface error statistics from network devices'
     )
-    parser.add_argument(
-        '--devices',
-        required=True,
-        help='Comma-separated device names or "all" for all devices'
-    )
-    parser.add_argument(
-        '--username',
-        required=True,
-        help='Device username'
-    )
-    parser.add_argument(
-        '--password',
-        required=True,
-        help='Device password'
-    )
-    parser.add_argument(
-        '--check-ntp',
-        action='store_true',
-        help='Include NTP configuration validation'
-    )
-    parser.add_argument(
-        '--json',
-        action='store_true',
-        help='Output results in JSON format'
-    )
-    parser.add_argument(
-        '--inventory',
-        default='inventory',
-        help='Path to nornir inventory directory'
-    )
+    parser.add_argument('--inventory', default='inventory.yaml',
+                        help='Nornir inventory file')
+    parser.add_argument('--devices', default='all',
+                        help='Device list (comma-separated) or "all"')
+    parser.add_argument('--error-threshold', type=int, default=10,
+                        help='Error threshold for flagging (default: 10)')
+    parser.add_argument('--interface-filter', default=None,
+                        help='Regex to filter interface names')
+    parser.add_argument('--output', default=None,
+                        help='Write report to file')
 
     args = parser.parse_args()
 
     try:
-        nr = InitNornir(config_file=f"{args.inventory}/config.yaml")
+        nr = InitNornir(config_file=args.inventory)
 
         if args.devices.lower() != 'all':
-            device_list = [d.strip() for d in args.devices.split(',')]
-            nr = nr.filter(F(name__in=device_list))
+            devices = [d.strip() for d in args.devices.split(',')]
+            nr = nr.filter(F(name__in=devices))
 
-        for host in nr.inventory.hosts.values():
-            host.username = args.username
-            host.password = args.password
+        logger.info(f"Collecting errors from {len(nr.inventory.hosts)} device(s)")
 
-        logger.info(f"Running health check on {len(nr.inventory.hosts)} device(s)")
+        results = nr.run(
+            task=collect_interface_errors,
+            threshold=args.error_threshold,
+            if_filter=args.interface_filter
+        )
 
-        results = nr.run(task=validate_device_health, check_ntp=args.check_ntp)
+        lines = ["Interface Error Report", "=" * 50]
+        for host, task_results in results.items():
+            tr = task_results[0]
+            if tr.failed:
+                lines.append(f"\n{host}: ERROR - {tr.result}")
+                continue
 
-        if args.json:
-            format_json_output(results)
-        else:
-            format_table_output(results)
+            data = tr.result
+            lines.append(f"\n{host}:")
+            lines.append(f"  Total interfaces: {data['total']}")
+            lines.append(f"  Problematic: {data['problematic']}")
 
-        logger.info("Health check completed successfully")
+            for if_name, iface in data['details'].items():
+                lines.append(f"    {if_name} ({iface.status})")
+                if iface.crc_errors:
+                    lines.append(f"      CRC: {iface.crc_errors}")
+                if iface.input_errors:
+                    lines.append(f"      Input: {iface.input_errors}")
+                if iface.output_errors:
+                    lines.append(f"      Output: {iface.output_errors}")
+                if iface.discards:
+                    lines.append(f"      Discards: {iface.discards}")
+
+        report = "\n".join(lines)
+        print(report)
+
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(report)
+            logger.info(f"Report written to {args.output}")
 
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
         raise
 
 
